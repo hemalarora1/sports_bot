@@ -116,7 +116,7 @@ int main() {
 	//     bounce in practice).
 	sim->setCollisionRestitution(0.0);                           // global default
 	sim->setCollisionRestitution(0.6, ball_name);                // ball ↔ anything
-	sim->setCollisionRestitution(0.85, robot_name, "paddle_link"); // paddle face
+	sim->setCollisionRestitution(0.85, robot_name, "paddle_face"); // paddle striking surface
 
 	// A small amount of friction so the ball doesn't slide forever on contact.
 	sim->setCoeffFrictionStatic(0.4);
