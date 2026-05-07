@@ -18,12 +18,15 @@
 # Uses the Python NatNetClient.py library to establish a connection (by creating a NatNetClient),
 # and receive data via a NatNet connection and decode it using the NatNetClient library.
 
+import json
+import os
 import sys
 import time
 from NatNetClient import NatNetClient
 import DataDescriptions
 import MoCapData
-import redis 
+import numpy as np
+import redis
 import signal
 import sys
 
@@ -35,12 +38,69 @@ def signal_handler(sig, frame):
 
 redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
 
-# create redis pipeline 
+# create redis pipeline
 pipeline = redis_client.pipeline()
 n_skeletons = 2
 min_id = 1
-max_id = 51 
+max_id = 51
 indices = [5, 3, 2, 47, 50, 23, 32, 8, 27, 49, 45]
+
+
+# ---------- World-frame calibration -------------------------------------------
+#
+# OptiTrack publishes positions in its own room frame. The pickleball FSM and
+# the C++ controllers use a "world" frame anchored at the robot base (+X
+# forward, +Y lateral, +Z up; see sports_bot/state_machine/config.py).
+#
+# We apply a calibration transform T_world_optitrack to every rigid body before
+# publishing. The transform can be supplied via a JSON file next to this script
+# (`world_calibration.json`); if missing, identity is used and the OptiTrack
+# frame is treated as the world frame.
+#
+# Expected JSON schema (any field omitted falls back to identity):
+#   {
+#     "translation": [tx, ty, tz],
+#     "rotation":    [[r00, r01, r02],
+#                     [r10, r11, r12],
+#                     [r20, r21, r22]]
+#   }
+# t_world_p = R * t_optitrack_p + translation.
+
+_CALIBRATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "world_calibration.json")
+
+def _load_world_calibration(path):
+    R = np.eye(3)
+    t = np.zeros(3)
+    if not os.path.isfile(path):
+        print(f"[optitrack] no calibration file at {path}, using identity")
+        return R, t
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        if "rotation" in data:
+            R = np.array(data["rotation"], dtype=float)
+            assert R.shape == (3, 3), f"rotation must be 3x3, got {R.shape}"
+        if "translation" in data:
+            t = np.array(data["translation"], dtype=float)
+            assert t.shape == (3,), f"translation must be 3-vec, got {t.shape}"
+        print(f"[optitrack] loaded world calibration from {path}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[optitrack] failed to read {path}: {exc}; using identity")
+        R, t = np.eye(3), np.zeros(3)
+    return R, t
+
+R_WORLD_OPTI, T_WORLD_OPTI = _load_world_calibration(_CALIBRATION_FILE)
+
+def _opti_to_world_position(pos):
+    p = np.asarray(pos, dtype=float)
+    return (R_WORLD_OPTI @ p) + T_WORLD_OPTI
+
+def _opti_to_world_quat(rot):
+    # Motive streams quaternion as (qx, qy, qz, qw). We rotate by R_WORLD_OPTI,
+    # which is q_world = q_offset * q_optitrack. For now we publish the raw
+    # quaternion alongside the rotated one; the FSM only uses position.
+    return rot
 
 # This is a callback function that gets connected to the NatNet client
 # and called once per mocap frame.
@@ -59,10 +119,21 @@ def receive_new_frame(data_dict):
 
 RIGID_BODY_POS_KEY = "sai2::optitrack::rigid_body_pos::"
 RIGID_BODY_ORI_KEY = "sai2::optitrack::rigid_body_ori::"
+RIGID_BODY_RAW_POS_KEY = "sai2::optitrack::raw::rigid_body_pos::"
+RIGID_BODY_RAW_ORI_KEY = "sai2::optitrack::raw::rigid_body_ori::"
 def receive_rigid_body_frame( new_id, position, rotation ):
-    # pass
-    redis_client.set(RIGID_BODY_POS_KEY + str(new_id), '[' + str(position)[1:-1] + ']')
-    redis_client.set(RIGID_BODY_ORI_KEY + str(new_id), '[' + str(rotation)[1:-1] + ']')
+    # Publish raw OptiTrack values (room frame) for debugging.
+    redis_client.set(RIGID_BODY_RAW_POS_KEY + str(new_id),
+                     json.dumps([float(x) for x in position]))
+    redis_client.set(RIGID_BODY_RAW_ORI_KEY + str(new_id),
+                     json.dumps([float(x) for x in rotation]))
+    # Publish world-frame (calibrated) values that the FSM / controller consume.
+    world_pos = _opti_to_world_position(position)
+    world_rot = _opti_to_world_quat(rotation)
+    redis_client.set(RIGID_BODY_POS_KEY + str(new_id),
+                     json.dumps(world_pos.tolist()))
+    redis_client.set(RIGID_BODY_ORI_KEY + str(new_id),
+                     json.dumps([float(x) for x in world_rot]))
 
 def receive_skeleton_frame(new_id, skeleton):
     
@@ -221,7 +292,7 @@ if __name__ == "__main__":
 
     # Configure the streaming client to call our rigid body handler on the emulator to send data out.
     streaming_client.new_frame_listener = receive_new_frame
-    #streaming_client.rigid_body_listener = receive_rigid_body_frame
+    streaming_client.rigid_body_listener = receive_rigid_body_frame
     streaming_client.skeleton_listener = receive_skeleton_frame
     
     # Set print level

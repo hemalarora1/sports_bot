@@ -43,18 +43,22 @@ class CourtConfig:
 
 @dataclass
 class RacketConfig:
-    """Geometry of the 3D-printed racket mount on the panda flange."""
+    """Geometry of the MTEN MT-01 paddle as mounted on the panda flange.
 
-    # Sweet-spot offset in the flange (link7) frame. Default assumes the racket
-    # extends along the flange +Z by ~30 cm to the centre of the face.
+    Reference values (used by the C++ controller as the controlled-frame setup
+    for the paddle TCP); the FSM does not consume these directly.
+    """
+
+    # Sweet-spot offset in the link7 frame. Flange is at link7 +z = 0.107 m;
+    # paddle face center is another 0.261 m along link7 +z.
     sweet_spot_in_flange: np.ndarray = field(
-        default_factory=lambda: np.array([0.0, 0.0, 0.30])
+        default_factory=lambda: np.array([0.0, 0.0, 0.368])
     )
 
-    # Racket face normal in the flange frame. Default: face points along flange +Z
-    # (i.e. the racket face is perpendicular to the flange axis).
+    # Paddle face normal expressed in the link7 frame. Paddle is mounted so that
+    # link7 +x is the face-strike direction.
     face_normal_in_flange: np.ndarray = field(
-        default_factory=lambda: np.array([0.0, 0.0, 1.0])
+        default_factory=lambda: np.array([1.0, 0.0, 0.0])
     )
 
     # Distance to pull the racket back behind the strike point for the wind-up.
@@ -83,14 +87,16 @@ class ReadyPose:
     )
 
     # Racket orientation as a 3x3 rotation. Default: racket face normal points
-    # toward the opponent (+X), face vertical, ready for a forehand.
+    # toward the opponent (+X world), face vertical so the up-direction on the
+    # face is world up (+Z), face-right is +Y world.
     # Columns are [face_right, face_up, face_normal]_world.
     racket_orientation: np.ndarray = field(
         default_factory=lambda: np.array([
-            [0.0, 0.0, 1.0],   # face_normal (+X world)
-            [0.0, 1.0, 0.0],   # face_up     (+Y world)
-            [-1.0, 0.0, 0.0],  # face_right  (-Z world)
-        ]).T
+            # face_right  face_up  face_normal
+            [    0.0,       0.0,      1.0   ],   # row 0 (world X)
+            [    1.0,       0.0,      0.0   ],   # row 1 (world Y)
+            [    0.0,       1.0,      0.0   ],   # row 2 (world Z)
+        ])
     )
 
 

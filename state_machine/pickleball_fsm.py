@@ -95,14 +95,16 @@ class RobotRedisAdapter:
         orientation: np.ndarray,
         linear_velocity: Optional[np.ndarray] = None,
     ) -> None:
+        # Always publish a velocity goal so the controller doesn't see a stale
+        # impact velocity after a SWING transitions back to RECOVER / READY.
+        velocity = linear_velocity if linear_velocity is not None else np.zeros(3)
         if self._keys.robot_backend == "opensai":
             self._r.set(self._keys.opensai.goal_position, json.dumps(position.tolist()))
             self._r.set(self._keys.opensai.goal_orientation, json.dumps(orientation.tolist()))
-            if linear_velocity is not None:
-                self._r.set(
-                    self._keys.opensai.goal_linear_velocity,
-                    json.dumps(linear_velocity.tolist()),
-                )
+            self._r.set(
+                self._keys.opensai.goal_linear_velocity,
+                json.dumps(velocity.tolist()),
+            )
         else:
             self._r.set(
                 self._keys.cs225a.racket_goal_position,
@@ -112,11 +114,10 @@ class RobotRedisAdapter:
                 self._keys.cs225a.racket_goal_orientation,
                 json.dumps(orientation.tolist()),
             )
-            if linear_velocity is not None:
-                self._r.set(
-                    self._keys.cs225a.racket_goal_linear_velocity,
-                    json.dumps(linear_velocity.tolist()),
-                )
+            self._r.set(
+                self._keys.cs225a.racket_goal_linear_velocity,
+                json.dumps(velocity.tolist()),
+            )
 
     def write_base_goal(self, pose: np.ndarray) -> None:
         if self._keys.robot_backend == "cs225a":

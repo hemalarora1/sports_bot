@@ -1,77 +1,142 @@
 <?xml version="1.0" ?>
 
-<world name="demo_world" gravity="0.0 0.0 -9.81">
+<!--
+  World frame convention:
+    +X : forward, toward the net / opponent.
+    +Y : lateral.
+    +Z : up.
+  Robot base sits at world origin. Ground top surface at z=0.
+  Net (visual only) at x=6.71m (USA Pickleball baseline distance).
+  See sports_bot/state_machine/config.py for the FSM's matching conventions.
+-->
+
+<world name="pickleball_world" gravity="0.0 0.0 -9.81">
 
 	<robot name="mmp_panda">
-		<model dir="${CS225A_URDF_FOLDER}/mmp_panda" path="mmp_panda.urdf" name="mmp_panda" />
+		<model dir="${CS225A_URDF_FOLDER}/mmp_panda" path="mmp_panda_measured.urdf" name="mmp_panda" />
 	</robot>
 
-	<static_object name="Base">
-		<origin xyz="0.0 0.0 -0.35" rpy="0 0 0" />
-	    <visual>
-	        <origin xyz="0.0 0.0 -0.00635" rpy="0 0 0" />
-	        <geometry>
-				<box size="5 5 0.0127" />
-	        </geometry>
-	        <material name="material">
-		        <color rgba="0.1 0.1 0.1 1.0" />
-	        </material>
-	    </visual>
+	<!-- Floor: top surface at z=0 to match the robot base sitting on the ground. -->
+	<static_object name="floor">
+		<origin xyz="0.0 0.0 0.0" rpy="0 0 0" />
+		<visual>
+			<origin xyz="0.0 0.0 -0.005" rpy="0 0 0" />
+			<geometry>
+				<box size="14.0 8.0 0.01" />
+			</geometry>
+			<material name="court">
+				<color rgba="0.20 0.35 0.30 1.0" />
+			</material>
+		</visual>
 		<collision>
-	        <origin xyz="0.0 0.0 -0.00635" rpy="0 0 0" />
-	        <geometry>
-	            <box size="5 5 0.0127" />
-	        </geometry>
-	    </collision>
+			<origin xyz="0.0 0.0 -0.005" rpy="0 0 0" />
+			<geometry>
+				<box size="14.0 8.0 0.01" />
+			</geometry>
+		</collision>
 	</static_object>
 
-	<dynamic_object name="cup">
-		<origin xyz="1.0 0.0 1.0" rpy="0 0 0" />
+	<!-- Pickleball: 25 g, 74 mm dia, hollow plastic.
+	     Initial pose is harmless (parked above the opponent court);
+	     simviz.cpp listens on a redis key to teleport + relaunch the ball. -->
+	<dynamic_object name="ball">
+		<origin xyz="5.0 0.0 1.5" rpy="0 0 0" />
 		<inertial>
-        	<origin xyz="0 0 0" rpy="0 0 0" />
-        	<mass value="10" />
-        	<inertia ixx="1" iyy="1" izz="1" ixy="0" ixz="0" iyz="0" />
-      	</inertial>
-
-	    <visual>
-	        <origin xyz="0 0 0" rpy="0 0 0" />
-			<geometry>
-	            <mesh filename="${CS225A_URDF_FOLDER}/test_objects/meshes/visual/cup.obj" />
-	        </geometry>
-	    </visual>
-
+			<origin xyz="0 0 0" rpy="0 0 0" />
+			<mass value="0.025" />
+			<!-- Hollow sphere I = (2/3) m r^2 ~ 2.3e-5 -->
+			<inertia ixx="2.3e-5" iyy="2.3e-5" izz="2.3e-5" ixy="0" ixz="0" iyz="0" />
+		</inertial>
 		<visual>
-	        <origin xyz="0 0 0.06" rpy="0 0 0" />
-	        <geometry>
-	            <box size="0.1 0.1 0.15" />
-	        </geometry>
-	        <material name="material">
-		        <color rgba="1 1 1 1.0" />
-	        </material>
-	    </visual>
-
-	    <collision>
-	        <origin xyz="0 0 0.06" rpy="0 0 0" />
-	        <geometry>
-	            <box size="0.1 0.1 0.15" />
-	        </geometry>
-	    </collision>
+			<origin xyz="0 0 0" rpy="0 0 0" />
+			<geometry>
+				<sphere radius="0.037" />
+			</geometry>
+			<material name="ball_yellow">
+				<color rgba="0.95 0.85 0.10 1.0" />
+			</material>
+		</visual>
+		<collision>
+			<origin xyz="0 0 0" rpy="0 0 0" />
+			<geometry>
+				<sphere radius="0.037" />
+			</geometry>
+		</collision>
 	</dynamic_object>
 
-	<light name="light1" type="directional">
-		<position xyz="2.0 2.0 2.0" />
-		<lookat xyz="0.0 0.0 0.0" />
+	<!-- Net: visual only. Standard pickleball net is 0.864 m at the posts and
+	     0.86 m sagging at the center; we approximate as a thin slab. -->
+	<static_object name="net_tape">
+		<origin xyz="6.71 0.0 0.864" rpy="0 0 0" />
+		<visual>
+			<origin xyz="0 0 0" rpy="0 0 0" />
+			<geometry>
+				<box size="0.01 6.71 0.05" />
+			</geometry>
+			<material name="net_tape_white">
+				<color rgba="0.95 0.95 0.95 1.0" />
+			</material>
+		</visual>
+	</static_object>
+	<static_object name="net_mesh">
+		<origin xyz="6.71 0.0 0.482" rpy="0 0 0" />
+		<visual>
+			<origin xyz="0 0 0" rpy="0 0 0" />
+			<geometry>
+				<box size="0.005 6.71 0.74" />
+			</geometry>
+			<material name="net_mesh_dark">
+				<color rgba="0.10 0.10 0.10 0.6" />
+			</material>
+		</visual>
+	</static_object>
+	<static_object name="net_post_left">
+		<origin xyz="6.71 -3.355 0.432" rpy="0 0 0" />
+		<visual>
+			<origin xyz="0 0 0" rpy="0 0 0" />
+			<geometry>
+				<cylinder radius="0.025" length="0.864" />
+			</geometry>
+			<material name="net_post"><color rgba="0.6 0.6 0.6 1.0"/></material>
+		</visual>
+	</static_object>
+	<static_object name="net_post_right">
+		<origin xyz="6.71 3.355 0.432" rpy="0 0 0" />
+		<visual>
+			<origin xyz="0 0 0" rpy="0 0 0" />
+			<geometry>
+				<cylinder radius="0.025" length="0.864" />
+			</geometry>
+			<material name="net_post"><color rgba="0.6 0.6 0.6 1.0"/></material>
+		</visual>
+	</static_object>
+
+	<!-- Strike-plane visual marker: a thin line at x=0.60 (matches CourtConfig.strike_plane_x). -->
+	<static_object name="strike_plane_marker">
+		<origin xyz="0.60 0.0 0.001" rpy="0 0 0" />
+		<visual>
+			<origin xyz="0 0 0" rpy="0 0 0" />
+			<geometry>
+				<box size="0.02 4.0 0.002" />
+			</geometry>
+			<material name="strike_marker"><color rgba="0.95 0.20 0.20 1.0"/></material>
+		</visual>
+	</static_object>
+
+	<light name="key_light" type="directional">
+		<position xyz="3.0 2.0 4.0" />
+		<lookat xyz="2.0 0.0 0.5" />
 	</light>
 
-	<light name="light2" type="directional">
-		<position xyz="-2.0 -2.0 2.0" />
-		<lookat xyz="0.0 0.0 0.0" />
+	<light name="fill_light" type="directional">
+		<position xyz="-2.0 -2.0 3.0" />
+		<lookat xyz="0.0 0.0 0.5" />
 	</light>
 
 	<camera name="camera_fixed">
-		<position xyz="2.0 -0.8 1.0" />
+		<position xyz="-2.5 -1.5 1.6" />
 		<vertical xyz="0.0 0.0 1.0" />
-		<lookat xyz="0.0 0.0 0.5" />
+		<lookat xyz="1.5 0.0 0.8" />
 	</camera>
 
 </world>

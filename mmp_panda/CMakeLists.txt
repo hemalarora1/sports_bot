@@ -1,11 +1,11 @@
 set(MMP_PANDA_FOLDER "${CMAKE_CURRENT_SOURCE_DIR}")
 add_definitions(-DMMP_PANDA_FOLDER="${MMP_PANDA_FOLDER}")
 
-# create an executable
-set (CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CS225A_BINARY_DIR}/mmp_panda_example)
-ADD_EXECUTABLE (controller_mmp_panda controller.cpp ${CS225A_COMMON_SOURCE})
-ADD_EXECUTABLE (simviz_mmp_panda simviz.cpp ${CS225A_COMMON_SOURCE})
+# Targets are renamed (vs cs225a/project_starter/mmp_panda) so both trees can
+# be built side-by-side without target-name collisions.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CS225A_BINARY_DIR}/sports_bot_mmp_panda)
+add_executable(controller_sports_bot_mmp_panda controller.cpp ${CS225A_COMMON_SOURCE})
+add_executable(simviz_sports_bot_mmp_panda simviz.cpp ${CS225A_COMMON_SOURCE})
 
-# and link the library against the executable
-TARGET_LINK_LIBRARIES (controller_mmp_panda ${CS225A_COMMON_LIBRARIES})
-TARGET_LINK_LIBRARIES (simviz_mmp_panda ${CS225A_COMMON_LIBRARIES})
+target_link_libraries(controller_sports_bot_mmp_panda ${CS225A_COMMON_LIBRARIES})
+target_link_libraries(simviz_sports_bot_mmp_panda ${CS225A_COMMON_LIBRARIES})
