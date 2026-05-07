@@ -5,9 +5,10 @@
  *
  * Reads the desired racket sweet-spot pose / linear velocity and the desired
  * base [x, y, theta] from redis (see redis_keys.h), regulates them with a
- * hierarchical SAI task stack (racket pose > base > posture nullspace), and
+ * hierarchical SAI task stack (base > racket pose > posture damping), and
  * publishes the current racket and base state back so the python FSM can close
- * its outer loop.
+ * its outer loop. Base goes first so lateral ball-chasing happens through the
+ * wheels rather than through arm reach (which jiggles).
  *
  * Controlled frame:
  *   The MotionForceTask is parameterized on link7 with a compliant_frame that
@@ -54,7 +55,7 @@ static Matrix3d paddleControlFrameRotation() {
 }
 
 int main() {
-	static const string robot_file = string(CS225A_URDF_FOLDER) + "/mmp_panda/mmp_panda_measured.urdf";
+	static const string robot_file = string(PICKLEBALL_FOLDER) + "/urdf/mmp_panda/mmp_panda_measured.urdf";
 
 	auto redis_client = SaiCommon::RedisClient();
 	redis_client.connect();
@@ -79,23 +80,41 @@ int main() {
 	compliant_frame.linear() = paddleControlFrameRotation();
 	auto racket_task = std::make_shared<SaiPrimitives::MotionForceTask>(
 		robot, control_link, compliant_frame, "racket_task");
-	racket_task->setPosControlGains(400.0, 40.0, 0.0);
-	racket_task->setOriControlGains(400.0, 40.0, 0.0);
+	racket_task->setPosControlGains(300.0, 35.0, 0.0);
+	racket_task->setOriControlGains(300.0, 35.0, 0.0);
+	// SAI's internal OTG defaults (0.3 m/s linear, 2 m/s^2 accel) are far too
+	// slow for pickleball — the racket lags behind the planned strike pose and
+	// balls end up hitting the handle/wrist instead of the face. Bump to limits
+	// matched to a real swing.
+	racket_task->enableInternalOtgAccelerationLimited(
+		/*max_lin_vel=*/   6.0,            // m/s
+		/*max_lin_accel=*/ 30.0,           // m/s^2
+		/*max_ang_vel=*/   4.0 * M_PI,     // rad/s
+		/*max_ang_accel=*/ 20.0 * M_PI);   // rad/s^2
 
-	// Base partial-joint task on (x, y, yaw) of the mobile base.
+	// Base partial-joint task on (x, y, yaw) of the mobile base. Putting the
+	// base task ABOVE the racket task means lateral chase motions go through
+	// the wheels first (low arm jiggle), and the racket task only handles the
+	// fine-grain pose error left in the base nullspace.
 	MatrixXd base_selection = MatrixXd::Zero(3, dof);
 	base_selection(0, 0) = 1.0;
 	base_selection(1, 1) = 1.0;
 	base_selection(2, 2) = 1.0;
 	auto base_task = std::make_shared<SaiPrimitives::JointTask>(robot, base_selection);
-	base_task->setGains(200.0, 30.0, 0.0);
+	base_task->setGains(80.0, 20.0, 0.0);
 
-	// Posture / nullspace joint task to keep the arm away from singularities.
+	// Posture / nullspace joint task. Small P-gain keeps the redundant joint
+	// (1 DOF after base+racket use 9 of the 10 robot DOFs) close to q_posture
+	// so the arm doesn't drift into joint limits in the racket task's
+	// nullspace. Too high here will fight the cartesian task when the arm
+	// needs to lift / lower to ball height — 8 P / 6 D is the working range.
 	auto joint_task = std::make_shared<SaiPrimitives::JointTask>(robot);
-	joint_task->setGains(40.0, 12.0, 0.0);
+	joint_task->setGains(8.0, 6.0, 0.0);
 	VectorXd q_posture(dof);
 	q_posture.setZero();
-	q_posture.tail(7) << -30.0, -15.0, -15.0, -105.0, 0.0, 90.0, 45.0;
+	// joint 1 = -90° aligns the arm with world +X (forward to opponent).
+	// Must match simviz's initial_q so the controller starts at zero error.
+	q_posture.tail(7) << -90.0, -15.0, 0.0, -100.0, 0.0, 90.0, 0.0;
 	q_posture.tail(7) *= M_PI / 180.0;
 	joint_task->setGoalPosition(q_posture);
 
@@ -136,20 +155,20 @@ int main() {
 		racket_task->setGoalOrientation(racket_goal_ori);
 		racket_task->setGoalLinearVelocity(racket_goal_vel);
 
-		VectorXd base_goal_full = VectorXd::Zero(dof);
-		base_goal_full.head(3) = base_goal_pose;
-		base_task->setGoalPosition(base_goal_full);
+		// JointTask with a 3-row selection expects a 3-vector goal.
+		base_task->setGoalPosition(base_goal_pose);
 
 		// ---- Compute hierarchical torques ------------------------------------
-		// Racket pose has top priority; base position runs in the racket's
-		// nullspace; arm posture runs in the base+racket nullspace.
+		// Base has top priority for bulk lateral motion when chasing balls;
+		// racket pose runs in the base nullspace for fine cartesian tracking;
+		// arm posture damps the residual nullspace.
 		N_prec.setIdentity();
-		racket_task->updateTaskModel(N_prec);
-		base_task->updateTaskModel(racket_task->getTaskAndPreviousNullspace());
-		joint_task->updateTaskModel(base_task->getTaskAndPreviousNullspace());
+		base_task->updateTaskModel(N_prec);
+		racket_task->updateTaskModel(base_task->getTaskAndPreviousNullspace());
+		joint_task->updateTaskModel(racket_task->getTaskAndPreviousNullspace());
 
-		command_torques = racket_task->computeTorques()
-						+ base_task->computeTorques()
+		command_torques = base_task->computeTorques()
+						+ racket_task->computeTorques()
 						+ joint_task->computeTorques();
 
 		// ---- Publish current state to the FSM --------------------------------

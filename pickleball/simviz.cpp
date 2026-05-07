@@ -55,10 +55,13 @@ vector<Affine3d> object_poses;
 vector<VectorXd> object_velocities;
 const int n_objects = object_names.size();
 
-// initial joint posture (radians) — non-singular, easy reach for the home pose.
+// initial joint posture (radians). joint 1 = -90° aligns the arm with world
+// +X (toward the opponent). joint 7 stays at 0 — full ±π wrist roll is outside
+// the Franka limits, so the FSM's home orientation is matched to whatever
+// face_up direction this posture happens to produce (see config.py).
 static VectorXd initial_q(int dof) {
 	VectorXd q = VectorXd::Zero(dof);
-	q.tail(7) << -30.0, -15.0, -15.0, -105.0, 0.0, 90.0, 45.0;
+	q.tail(7) << -90.0, -15.0, 0.0, -100.0, 0.0, 90.0, 0.0;
 	q.tail(7) *= M_PI / 180.0;
 	return q;
 }
@@ -67,9 +70,15 @@ static VectorXd initial_q(int dof) {
 void simulation(std::shared_ptr<SaiSimulation::SaiSimulation> sim);
 
 int main() {
-	SaiModel::URDF_FOLDERS["CS225A_URDF_FOLDER"] = string(CS225A_URDF_FOLDER);
-	static const string robot_file = string(CS225A_URDF_FOLDER) + "/mmp_panda/mmp_panda_measured.urdf";
-	static const string world_file = string(MMP_PANDA_FOLDER) + "/world_mmp_panda.urdf";
+	// Make our in-repo URDF tree (sports_bot/pickleball/urdf/) discoverable to
+	// SAI under the ${PICKLEBALL_URDF_FOLDER} substitution variable used by
+	// world_mmp_panda.urdf. Keep the old CS225A_URDF_FOLDER too so any future
+	// world references to project_starter assets still resolve.
+	SaiModel::URDF_FOLDERS["CS225A_URDF_FOLDER"]      = string(CS225A_URDF_FOLDER);
+	SaiModel::URDF_FOLDERS["PICKLEBALL_URDF_FOLDER"]  = string(PICKLEBALL_FOLDER) + "/urdf";
+
+	static const string robot_file = string(PICKLEBALL_FOLDER) + "/urdf/mmp_panda/mmp_panda_measured.urdf";
+	static const string world_file = string(PICKLEBALL_FOLDER) + "/world_mmp_panda.urdf";
 	std::cout << "Loading URDF world model file: " << world_file << endl;
 
 	// start redis client

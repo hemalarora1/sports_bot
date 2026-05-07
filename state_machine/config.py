@@ -81,21 +81,26 @@ class ReadyPose:
         default_factory=lambda: np.array([0.0, 0.0, 0.0])
     )
 
-    # Racket sweet-spot position in world frame.
+    # Racket sweet-spot position in world frame. Pinned to the controller's
+    # natural rest pose at the configured arm posture so INIT settles at zero
+    # cartesian error. The FSM's APPROACH state drives the racket UP to the
+    # predicted ball intercept (typically z>1 m); the controller's OTG limits
+    # (6 m/s, 30 m/s^2) traverse that in well under the ball flight time.
     racket_position: np.ndarray = field(
-        default_factory=lambda: np.array([0.45, 0.0, 0.95])
+        default_factory=lambda: np.array([0.675, 0.0, 0.753])
     )
 
-    # Racket orientation as a 3x3 rotation. Default: racket face normal points
-    # toward the opponent (+X world), face vertical so the up-direction on the
-    # face is world up (+Z), face-right is +Y world.
-    # Columns are [face_right, face_up, face_normal]_world.
+    # Racket orientation as a 3x3 rotation. Columns are
+    # [face_right, face_up, face_normal] in world. Tuned to match the
+    # controller's wrist orientation at the configured posture: face_normal ≈
+    # +X (toward opponent), face_up ≈ -Z (paddle hanging down from wrist —
+    # joint 7 limits don't allow a clean +Z face_up at this posture; the
+    # cartesian controller still drives the TCP wherever the FSM commands).
     racket_orientation: np.ndarray = field(
         default_factory=lambda: np.array([
-            # face_right  face_up  face_normal
-            [    0.0,       0.0,      1.0   ],   # row 0 (world X)
-            [    1.0,       0.0,      0.0   ],   # row 1 (world Y)
-            [    0.0,       1.0,      0.0   ],   # row 2 (world Z)
+            [ 0.0,    0.077,  0.997 ],   # row 0 (world X components)
+            [-1.0,    0.0,    0.0   ],   # row 1 (world Y components)
+            [ 0.0,   -0.997,  0.077 ],   # row 2 (world Z components)
         ])
     )
 
@@ -130,9 +135,9 @@ class FsmConfig:
     """Top-level FSM tuning."""
 
     control_dt: float = 0.01           # 100 Hz loop
-    pos_tol: float = 0.02              # meters
-    ori_tol: float = 0.05              # Frobenius norm of (R_des - R_now)
-    base_pos_tol: float = 0.03
+    pos_tol: float = 0.05              # meters — loose enough that base+racket settle in finite time
+    ori_tol: float = 0.20              # Frobenius norm of (R_des - R_now); ~10° all-axis
+    base_pos_tol: float = 0.05
 
     # If we lose the ball for this long during TRACK / APPROACH we abort.
     ball_timeout_s: float = 0.40
@@ -142,6 +147,12 @@ class FsmConfig:
 
     # After SWING, the time we hold the follow-through pose before recovering.
     follow_through_hold_s: float = 0.20
+
+    # Hard cap on RECOVER duration. If the racket+base haven't settled within
+    # tolerance by then, force-transition back to READY anyway — better to be
+    # ready for the next ball than to deadlock chasing sub-cm convergence on a
+    # 64 kg base.
+    recover_max_s: float = 1.5
 
     # Verbose state-transition prints.
     verbose: bool = True

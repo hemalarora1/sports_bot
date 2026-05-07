@@ -101,7 +101,14 @@ class BallTracker:
         if pos is None or pos.shape != (3,):
             return None
 
-        # Reject blatant jumps (OptiTrack dropout / mis-labeled marker).
+        # Drop stale samples FIRST so a teleporting ball (sim relaunch /
+        # OptiTrack regaining lock after a long dropout) doesn't get its
+        # samples rejected forever against a frozen-old "last" position.
+        while self._history and (now - self._history[0].t) > self._cfg.history_max_age_s:
+            self._history.popleft()
+
+        # Reject blatant jumps (OptiTrack mis-labeled marker, etc.) — but only
+        # against a recent sample.
         if self._history:
             last = self._history[-1]
             if np.linalg.norm(pos - last.pos) > self._cfg.max_position_jump:
@@ -110,10 +117,6 @@ class BallTracker:
         sample = BallSample(t=now, pos=pos.astype(float))
         self._history.append(sample)
         self._last_seen_t = now
-
-        # Drop stale samples from the front of the window.
-        while self._history and (now - self._history[0].t) > self._cfg.history_max_age_s:
-            self._history.popleft()
 
         return sample
 

@@ -82,7 +82,7 @@ python -m sports_bot.state_machine.pickleball_fsm \
 
 ### `--robot-backend cs225a`
 
-Uses the joint-level keys exposed by `sports_bot/mmp_panda/controller.cpp`
+Uses the joint-level keys exposed by `sports_bot/pickleball/controller.cpp`
 (`sai::sim::mmp_panda::sensors::q`, etc.) plus a small set of high-level keys
 the FSM expects the controller to read/write:
 
@@ -97,7 +97,7 @@ the FSM expects the controller to read/write:
 | `sports_bot::state::base::current_pose`          | ctrl → FSM     | `[x, y, theta]` |
 | `sports_bot::fsm::state`                         | FSM → world    | string          |
 
-Adding the racket and base goals to `sports_bot/mmp_panda/controller.cpp` is
+Adding the racket and base goals to `sports_bot/pickleball/controller.cpp` is
 the bridge between this FSM and the cs225a low-level controller, and the same
 contract works for the real robot driver.
 
