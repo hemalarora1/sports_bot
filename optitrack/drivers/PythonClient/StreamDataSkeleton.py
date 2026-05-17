@@ -26,6 +26,7 @@ import MoCapData
 import redis 
 import signal
 import sys
+import socket
 
 is_looping = True
 def signal_handler(sig, frame):
@@ -190,8 +191,20 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
 
     optionsDict = {}
-    optionsDict["clientAddress"] = "172.24.68.64"
-    optionsDict["serverAddress"] = "172.24.68.48"
+    # Default server address provided by the team (Motive/streaming server)
+    optionsDict["serverAddress"] = "172.24.69.102" # changed from 172.24.68.67
+
+    # Attempt to auto-detect the client IP on the same network as the server.
+    # This opens a temporary UDP socket to the server and reads the local IP.
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect((optionsDict["serverAddress"], 80))
+        local_ip = sock.getsockname()[0]
+        sock.close()
+        optionsDict["clientAddress"] = local_ip
+    except Exception:
+        # Fallback: localhost (user should replace with their SRC-assigned IP if needed)
+        optionsDict["clientAddress"] = "127.0.0.1"
     optionsDict["use_multicast"] = False
 
     # This will create a new NatNet client
