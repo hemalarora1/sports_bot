@@ -1,0 +1,5 @@
+Double check motive project file saving
+Make project calibration file for optitrack
+Double check trajectories / interception point in robot frame
+
+> Then probably understand the robot fsm in more detail... make a claude guide
