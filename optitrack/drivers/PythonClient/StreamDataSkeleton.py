@@ -48,7 +48,7 @@ def receive_new_frame(data_dict):
             if key in data_dict :
                 out_string += str(data_dict[key]) + " "
             out_string+="/"
-        print(out_string)
+        # print(out_string)
 
 RIGID_BODY_POS_KEY = "sai2::optitrack::rigid_body_pos::"
 RIGID_BODY_ORI_KEY = "sai2::optitrack::rigid_body_ori::"
@@ -56,6 +56,7 @@ def receive_rigid_body_frame( new_id, position, rotation ):
     # pass
     redis_client.set(RIGID_BODY_POS_KEY + str(new_id), '[' + str(position)[1:-1] + ']')
     redis_client.set(RIGID_BODY_ORI_KEY + str(new_id), '[' + str(rotation)[1:-1] + ']')
+    print(f"Rigid body {new_id:3d}  x={position[0]:+.4f}  y={position[1]:+.4f}  z={position[2]:+.4f}") # added this print statement
 
 def receive_skeleton_frame(new_id, skeleton):
     # Iterate over each rigid body in the skeleton's rigid body list
@@ -190,8 +191,8 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
 
     optionsDict = {}
-    optionsDict["clientAddress"] = "172.24.68.64"
-    optionsDict["serverAddress"] = "172.24.68.48"
+    optionsDict["clientAddress"] = "10.32.78.187"
+    optionsDict["serverAddress"] = "172.24.69.102"
     optionsDict["use_multicast"] = False
 
     # This will create a new NatNet client
@@ -204,7 +205,7 @@ if __name__ == "__main__":
 
     # Configure the streaming client to call our rigid body handler on the emulator to send data out.
     streaming_client.new_frame_listener = receive_new_frame
-    #streaming_client.rigid_body_listener = receive_rigid_body_frame
+    streaming_client.rigid_body_listener = receive_rigid_body_frame
     streaming_client.skeleton_listener = receive_skeleton_frame
     
     # Set print level
