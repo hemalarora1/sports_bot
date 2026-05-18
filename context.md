@@ -134,7 +134,34 @@ Published by `StreamDataSkeleton.py` (per rigid body per frame, ~120 Hz):
 World transform is `R_WORLD_OPTI · p_opti + T_WORLD_OPTI`, loaded from
 `sports_bot/optitrack/world_calibration.json`. If the file is missing, identity
 is used and the printout `[optitrack] no calibration file …, using identity`
-fires at startup. **Currently missing — positions are in Motive room frame.**
+fires at startup.
+
+**Frame conventions:**
+- OptiTrack (Motive) **streaming** frame: configured to **Z-up**, right-handed
+  (see gotcha below — this is independent of Motive's *display* Up Axis).
+- World frame (what the FSM, controllers, and URDF use): **Z-up**, right-handed,
+  origin at robot home. +X = toward opponent, +Y = robot's left, +Z = up. The
+  FSM constants in `state_machine/config.py` all assume this convention.
+- `world_calibration.json` is just yaw + translation — both frames are Z-up so
+  no axis swap is needed.
+
+**Critical Motive gotcha — display vs streaming Up Axis are independent.**
+Motive has *two* "Up Axis" settings:
+1. `View → Up Axis` controls what the 3D perspective view shows. Cosmetic.
+2. `Edit → Application Settings → Streaming → Up Axis` controls what the NatNet
+   stream actually publishes. **This is the one that matters for Redis.**
+
+These can disagree silently — the perspective view will happily show Y-up while
+streaming emits Z-up, and nothing in the UI warns you. Always confirm the
+*streaming* setting at session start; if someone flipped it, the world
+calibration will silently produce garbage. The cleanest sanity check is to
+place the ball on the origin floor marker and read
+`sai2::optitrack::raw::rigid_body_pos::8` — the vertical component should be
+the small one (~ball radius), and the other two should be ~2.5 m and ~1.2 m.
+
+**Current calibration (2026-05-17, SRC Kitchen):** 2D Procrustes from the
+3 floor markers, assuming Motive streaming Z-up. Max horizontal residual 0.34 mm,
+max vertical residual 1.87 mm (floor unevenness, not noise).
 
 Consumed by `pickleball_fsm.py` via `BallTracker`:
 
@@ -179,9 +206,17 @@ Other relevant keys (for full system integration):
 
 ## Open items for integration
 
-- [ ] `world_calibration.json` for whichever bay we end up using — translates
-      Motive room frame to robot base frame. Record by driving the base to known
-      OptiTrack markers and solving for `R, t`.
+- [x] ~~`world_calibration.json` for whichever bay we end up using~~ — done for
+      SRC Kitchen 2026-05-17. Re-do per bay (and after any Motive ground-plane
+      or camera recalibration).
+- [ ] **Daily calibration sanity check.** Place a marker at the origin floor
+      mark, read `sai2::optitrack::raw::rigid_body_pos::<id>` and run it through
+      `R, t`; expect world-frame `(0, 0, 0)` within ~5 mm. If it drifts,
+      re-solve. (Better: group the 3 floor markers into a single `FloorRef`
+      rigid body and read its world pose each session.)
+- [ ] **`_opti_to_world_quat()` is a passthrough.** Position is calibrated;
+      orientation isn't. Fine for the ball (sphere). Fix before relying on
+      OptiTrack for the cart's heading.
 - [ ] Make the FSM write to `hb1::desired_pose` instead of
       `sports_bot::cmd::base::goal_pose` (or add a one-line bridge).
 - [ ] Decide PickleBall's permanent Streaming ID — easier to standardize on `1`
@@ -220,3 +255,12 @@ ifconfig en0 | awk '/inet / {print $2}'
   Kitchen bay by switching Motive to Unicast. Confirmed PickleBall = Streaming
   ID 8. Identified VRPN port (3883) vs NatNet (1511) confusion in Motive UI.
   Streamer + Redis end-to-end verified; FSM and robot integration untouched.
+- 2026-05-17 — added `world_calibration.json` for SRC Kitchen. Constrained
+  Procrustes from 3 taped floor markers (origin / 1 m forward / 1 m right).
+  Motive is Y-up, our world is Z-up; the calibration absorbs the axis swap so
+  FSM/sim/URDF stay Z-up unchanged.
+- 2026-05-17 — discovered Motive's *streaming* Up Axis was Z, not Y (the View
+  Up Axis was Y, which is what we'd been looking at). Re-solved
+  `world_calibration.json` for Z-up streaming: now just yaw + translation, no
+  axis swap. Added the "display vs streaming Up Axis" gotcha to the conventions
+  section.

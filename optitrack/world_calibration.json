@@ -1,0 +1,26 @@
+{
+  "rotation": [
+    [ 0.99863, -0.05223,  0.00000],
+    [ 0.05223,  0.99863,  0.00000],
+    [ 0.00000,  0.00000,  1.00000]
+  ],
+  "translation": [2.52782, -1.06202, -0.00686],
+
+  "comment": "Motive streaming convention: Z-up, right-handed. World: Z-up, RH; +X forward, +Y left, +Z up. Transform is yaw + translation only.",
+  "calibrated_at": "2026-05-17",
+  "bay": "SRC Kitchen",
+  "method": "2d_procrustes_3_floor_markers_zup",
+  "motive_streaming_up_axis": "Z",
+  "markers": {
+    "origin":  {"world_m": [0, 0, 0],        "opti_m_zup": [-2.46874,  1.19241, 0.00873]},
+    "forward": {"world_m": [0.91218, 0, 0],  "opti_m_zup": [-1.55778,  1.14530, 0.00680]},
+    "right":   {"world_m": [0, -0.91238, 0], "opti_m_zup": [-2.51690,  0.28131, 0.00504]}
+  },
+  "residual_mm_max": 1.87,
+  "residual_mm_max_horizontal": 0.34,
+  "notes": [
+    "Motive has TWO independent Up Axis settings: display (View) and streaming. The streaming one is what matters for Redis. Verify at startup with Edit -> Application Settings -> Streaming -> Up Axis = Z.",
+    "Vertical residual is floor unevenness (~3.7 mm across the three markers), not noise.",
+    "If anyone flips streaming to Y-up, this calibration breaks silently. Re-solve or flip back."
+  ]
+}
