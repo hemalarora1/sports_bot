@@ -233,7 +233,13 @@ def run(
     print()
 
     dt = 1.0 / rate_hz
-    prev_goal_raw = None
+    # Seed prev_goal_raw with whatever is in Redis NOW so we don't immediately
+    # forward a stale goal left over from a previous bridge / test run. New
+    # goals (written after startup) will still differ from this seed and fire.
+    prev_goal_raw = r.get(FSM_BASE_GOAL)
+    if prev_goal_raw is not None:
+        print(f"[base_bridge] ignoring pre-existing {FSM_BASE_GOAL} = {prev_goal_raw}")
+        print(f"              (will only forward goals written from here on)")
     last_sanity = 0.0
 
     while True:
