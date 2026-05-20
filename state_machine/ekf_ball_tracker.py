@@ -69,7 +69,19 @@ from typing import Deque, Optional, Tuple
 import numpy as np
 import redis
 
-from .ball_tracker import BallSample, Intercept
+from .ball_tracker import (
+    BallSample,
+    Intercept,
+    REJECT_INFINITE_TTI,
+    REJECT_INSUFFICIENT_HISTORY,
+    REJECT_NONE,
+    REJECT_NOT_INCOMING,
+    REJECT_ON_FLOOR,
+    REJECT_PAST_PLANE,
+    REJECT_TTI_TOO_LONG,
+    REJECT_TTI_TOO_SHORT,
+    REJECT_WOULD_BOUNCE,
+)
 from .config import BallTrackerConfig, EKFConfig
 from .redis_keys import RedisKeys
 
@@ -172,10 +184,13 @@ def _apply_bounce(
 
 def _ekf_propagate_to_plane(
     x: np.ndarray, P: np.ndarray, target_x: float, cfg: BallTrackerConfig,
-) -> Optional[Tuple[float, np.ndarray, np.ndarray, np.ndarray, int]]:
+):
     """Propagate ``(x, P)`` forward (with bounces) to ``px = target_x``.
 
-    Returns ``(t_total, x_at_plane, P_at_plane, _, n_bounces)`` or None.
+    Returns ``(t_total, x_at_plane, P_at_plane, v_at_plane, n_bounces)`` on
+    success, or a ``REJECT_*`` string code on failure (same convention as
+    ``ball_tracker._propagate_to_plane`` so the offline analyzer can surface
+    a precise rejection reason).
 
     The implementation mirrors ``ball_tracker._propagate_to_plane`` exactly
     for the mean trajectory; the only difference is that we also evolve P
@@ -189,13 +204,13 @@ def _ekf_propagate_to_plane(
 
     for n_bounces in range(cfg.max_bounces + 1):
         if x[3] >= 0:  # not moving toward plane
-            return None
+            return REJECT_NOT_INCOMING
         t_to_target = (target_x - x[0]) / x[3]
         if t_to_target < 0:
-            return None
+            return REJECT_PAST_PLANE
         # Stuck on floor with no rebound velocity — model breaks down.
         if x[2] <= cfg.floor_epsilon and x[5] <= 0:
-            return None
+            return REJECT_ON_FLOOR
 
         disc = x[5] * x[5] + 2.0 * g * x[2]
         if disc < 0:
@@ -211,7 +226,7 @@ def _ekf_propagate_to_plane(
             return t_total, x_final, P_final, x_final[3:6].copy(), n_bounces
 
         if n_bounces >= cfg.max_bounces:
-            return None
+            return REJECT_WOULD_BOUNCE
 
         x, P = _propagate_segment(x, P, t_to_ground, cfg)
         # The integrated dynamics can leave x[2] slightly above or below 0
@@ -220,7 +235,7 @@ def _ekf_propagate_to_plane(
         x, P = _apply_bounce(x, P, cfg)
         t_total += t_to_ground
 
-    return None
+    return REJECT_WOULD_BOUNCE
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +274,16 @@ class EKFBallTracker:
         self._seed: list[BallSample] = []
         self._history: Deque[BallSample] = deque(maxlen=cfg.history_size)
 
+        # Optional pre-filter raw-buffer for the median filter (mirrors
+        # BallTracker). Disabled if cfg.median_filter_window < 2.
+        med_w = max(1, cfg.median_filter_window)
+        self._raw_buffer: Deque[np.ndarray] = deque(maxlen=med_w)
+
         self._t0 = time.perf_counter()
         self._last_seen_t: Optional[float] = None
+
+        # Diagnostic — set by predict_intercept whenever it returns None.
+        self.last_reject_reason: str = REJECT_NONE
 
     # ----- redis I/O (mirrors BallTracker exactly) ----------------------
 
@@ -306,6 +329,16 @@ class EKFBallTracker:
         """Filter + history update for one measurement. Returns None if the
         sample was rejected (stale duplicate, position jump, or Mahalanobis
         outlier against the current posterior)."""
+        pos = pos.astype(float)
+
+        # Optional 3-sample (default) per-axis median filter on raw OptiTrack
+        # positions before they hit the filter / history. Same as
+        # BallTracker — kills single-sample mislabel outliers.
+        if self._cfg.median_filter_window >= 2:
+            self._raw_buffer.append(pos.copy())
+            if len(self._raw_buffer) >= self._cfg.median_filter_window:
+                pos = np.median(np.stack(self._raw_buffer), axis=0)
+
         # Drop stale samples from the (small) rolling history first, like the
         # LS tracker, so a teleporting ball doesn't get rejected forever
         # against a frozen-old "last" position.
@@ -317,7 +350,7 @@ class EKFBallTracker:
             if np.linalg.norm(pos - last.pos) > self._cfg.max_position_jump:
                 return None
 
-        sample = BallSample(t=float(t), pos=pos.astype(float))
+        sample = BallSample(t=float(t), pos=pos)
 
         # Two regimes: seeding (filter not initialized yet) vs filtering.
         if self._x is None:
@@ -462,7 +495,9 @@ class EKFBallTracker:
         self._t_last = None
         self._seed = []
         self._history.clear()
+        self._raw_buffer.clear()
         self._last_seen_t = None
+        self.last_reject_reason = REJECT_NONE
 
     # ----- LS-tracker-shaped query interface ---------------------------
 
@@ -483,20 +518,29 @@ class EKFBallTracker:
         return bool(self._x[3] < -self._cfg.min_incoming_speed)
 
     def predict_intercept(self, strike_plane_x: float) -> Optional[Intercept]:
+        self.last_reject_reason = REJECT_NONE
         if self._x is None or self._P is None:
+            self.last_reject_reason = REJECT_INSUFFICIENT_HISTORY
             return None
         if self._x[3] >= -self._cfg.min_incoming_speed:
+            self.last_reject_reason = REJECT_NOT_INCOMING
             return None
 
         result = _ekf_propagate_to_plane(
             self._x, self._P, strike_plane_x, self._cfg,
         )
-        if result is None:
+        if isinstance(result, str):
+            self.last_reject_reason = result
             return None
         t_impact, x_final, P_final, v_final, n_bounces = result
         if not np.isfinite(t_impact):
+            self.last_reject_reason = REJECT_INFINITE_TTI
             return None
-        if t_impact < self._cfg.min_lookahead or t_impact > self._cfg.max_lookahead:
+        if t_impact < self._cfg.min_lookahead:
+            self.last_reject_reason = REJECT_TTI_TOO_SHORT
+            return None
+        if t_impact > self._cfg.max_lookahead:
+            self.last_reject_reason = REJECT_TTI_TOO_LONG
             return None
 
         return Intercept(

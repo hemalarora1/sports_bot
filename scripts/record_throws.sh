@@ -53,6 +53,26 @@ if ! redis-cli ping >/dev/null 2>&1; then
 fi
 echo "[startup] redis OK"
 
+# -------- Reap stale streamers ---------------------------------------------
+# A prior streamer can stick around in two ways: (a) the script that spawned
+# it died ungracefully and the SIGTERM never fired, (b) the streamer is in a
+# socket-retry loop and ignored a plain `kill`. Either way we end up with a
+# zombie holding UDP port 1511, and the next streamer's bind() fails with
+# "Address already in use." Always reap before bringing one up.
+stale_pids="$(pgrep -f 'StreamDataSkeleton\.py' || true)"
+if [[ -n "$stale_pids" ]]; then
+    echo "[startup] reaping stale StreamDataSkeleton process(es): $stale_pids"
+    # SIGTERM first, escalate to SIGKILL — Python in a retry loop ignores TERM.
+    kill $stale_pids 2>/dev/null || true
+    sleep 0.5
+    still_alive="$(pgrep -f 'StreamDataSkeleton\.py' || true)"
+    if [[ -n "$still_alive" ]]; then
+        echo "[startup] SIGTERM didn't take, escalating to SIGKILL: $still_alive"
+        kill -9 $still_alive 2>/dev/null || true
+        sleep 0.3
+    fi
+fi
+
 # Clear stale OptiTrack keys so an old, dead streamer's positions can't masquerade as live.
 n_stale=$(redis-cli --scan --pattern 'sai2::optitrack::*' | wc -l | tr -d ' ')
 if [[ "$n_stale" -gt 0 ]]; then
@@ -65,6 +85,27 @@ fi
 # We just deleted the key, so check whether anything writes to it within 1 s.
 streamer_pid=""
 sleep 1
+
+cleanup() {
+    if [[ -n "$streamer_pid" ]]; then
+        echo "[cleanup] stopping streamer pid=$streamer_pid"
+        kill "$streamer_pid" 2>/dev/null || true
+        # Don't block forever on a stuck Python child — give it half a
+        # second to exit, then SIGKILL.
+        for _ in 1 2 3 4 5; do
+            kill -0 "$streamer_pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 "$streamer_pid" 2>/dev/null; then
+            echo "[cleanup] streamer pid=$streamer_pid didn't exit, SIGKILL"
+            kill -9 "$streamer_pid" 2>/dev/null || true
+        fi
+        wait "$streamer_pid" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+# -------- Streamer ----------------------------------------------------------
 if [[ -n "$(redis-cli get "$KEY" 2>/dev/null || true)" ]]; then
     echo "[startup] streamer already running (saw $KEY appear)"
 else
@@ -91,29 +132,27 @@ else
     streamer_pid=$!
     echo "[startup] streamer pid=$streamer_pid"
 
-    # Wait up to 10 s for the first sample
+    # Wait up to 10 s for the first sample. The cleanup trap above will reap
+    # the streamer on any exit path — including a failure here.
     for _ in $(seq 1 20); do
         if [[ -n "$(redis-cli get "$KEY" 2>/dev/null || true)" ]]; then
             echo "[startup] streamer publishing on $KEY"
             break
         fi
+        # Bail early if the streamer died before publishing — e.g. socket
+        # bind error. No point waiting the full 10 s.
+        if ! kill -0 "$streamer_pid" 2>/dev/null; then
+            echo "[startup] streamer pid=$streamer_pid exited before publishing." >&2
+            echo "[startup] check $STREAMER_LOG" >&2
+            exit 1
+        fi
         sleep 0.5
     done
     if [[ -z "$(redis-cli get "$KEY" 2>/dev/null || true)" ]]; then
         echo "[startup] streamer did not publish $KEY within 10 s. Check $STREAMER_LOG"
-        kill "$streamer_pid" 2>/dev/null || true
         exit 1
     fi
 fi
-
-cleanup() {
-    if [[ -n "$streamer_pid" ]]; then
-        echo "[cleanup] stopping streamer pid=$streamer_pid"
-        kill "$streamer_pid" 2>/dev/null || true
-        wait "$streamer_pid" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT
 
 # -------- Recorder ----------------------------------------------------------
 echo "[startup] starting recorder (Ctrl-C to stop and save)"

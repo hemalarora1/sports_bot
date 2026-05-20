@@ -618,10 +618,80 @@ Hardened `record_throws.sh` cleanup along the way: reap stale
 SIGKILL if a Python child is stuck in a socket-retry loop, and bail
 early if the streamer dies before publishing rather than waiting the
 full 10 s.
+- 2026-05-19 — **diagnostic + filtering pass on the LS tracker** ahead of
+the OptiTrack 240 Hz bump. Three changes, all behind config flags so
+the existing FSM path is unchanged unless explicitly overridden:
+   1. **Rejection reasons surfaced.** `BallTracker.predict_intercept`
+      and `EKFBallTracker.predict_intercept` now set
+      ``self.last_reject_reason`` to one of
+      ``insufficient_history / not_incoming / past_plane / on_floor /
+      would_bounce / tti_too_short / tti_too_long`` whenever they
+      return `None`. The FSM ignores this; the analyzer surfaces it in
+      a new GUI text panel ("reject reason") and color-codes the
+      recorded trajectory by per-tick reason
+      (green = OK, red = volley filter, amber = not incoming, blue =
+      tti too long, etc.). New checkbox "Trajectory: color by
+      rejection reason" in the Display folder; legend folder lists
+      the color → reason mapping. Internals: ``_propagate_to_plane``
+      now returns a `REJECT_*` string on failure instead of bare
+      `None` so the caller can distinguish bounce-blocked from
+      past-plane.
+   2. **Per-axis median filter on raw OptiTrack samples** before they
+      enter `_history`. New `BallTrackerConfig.median_filter_window`
+      (default 3, 0/1 disables); applies to both LS and EKF trackers.
+      Kills single-sample marker swaps / reflection artifacts at the
+      cost of ~1 sample of lag in reported "current" position. On
+      clean recordings the effect is in the noise (3.3 → 4.0 cm at
+      commit on the test recording — slight regression because there
+      were no outliers to filter); on real-cart data with marker
+      occlusion, expected to be a clear win. Analyzer override flags:
+      `--median-filter-window N` and `--no-median-filter`.
+   3. **History defaults retuned for 240 Hz prep.** Previous
+      `history_size = 8, history_max_age_s = 0.20` (120 Hz sweet
+      spot) gives a 33 ms LS window at 240 Hz — too short, throws
+      away the sample-rate benefit. New: `history_size = 12,
+      history_max_age_s = 0.15`. At 240 Hz that gives 50 ms / 12
+      samples (size-binding); at 120 Hz it gives 100 ms / 12 samples
+      (slightly longer than the 67 ms 120 Hz optimum, but commit-
+      moment error only regresses 5.3 → 5.8 cm across the recording
+      set). Briefly tried `age = 0.07` to bind purely by time —
+      catastrophic on recordings with sparse / bursty sample
+      density (3-sample windows → noisy `v_z` → 65 cm dz bias on
+      otherwise-clean throws). Lesson: `history_max_age_s` is a
+      safety floor for sample density; `history_size` should remain
+      the typical binding cap. Re-sweep on real 240 Hz cart data
+      once it's live.
+
+   Also updated `_ReplayTracker` (in the analyzer) to apply the same
+   median filter and initialize `last_reject_reason`, and propagated
+   `position_cov / last_reject_reason` through the new `TickAnalysis`
+   fields so the viser overlay can read them.
+- 2026-05-19 — **tuned `BallTrackerConfig.history_size` for fast
+volleys**. After the first SRC Kitchen recording session showed
+"meaningful predictions only at ~400 ms to impact," swept window
+sizes 4–20 across 22 throws (mix of fully-tracked + ones with
+mid-flight OptiTrack dropouts). The 167 ms window (size=20) was
+introducing window-average lag in the LS velocity estimate — i.e.,
+the fit's `v` was biased toward older samples, so forward
+propagation aimed slightly off the true intercept. Shrinking to 8
+samples (~67 ms at 120 Hz) drops commit-moment mean error
+(tti ∈ [0.10, 0.20) s) from ~10 cm → ~7 cm and earlier-flight
+buckets stay within 1 cm of the size-20 result. Post-commit buckets
+(tti < 0.10 s) are slightly *worse* (size-20 had a 3 cm edge there)
+but the FSM has already frozen the plan by then, so those don't
+matter. Also added `--segment-min-incoming-speed` to
+the analyzer (default `cfg.tracker.min_incoming_speed`) so its
+segmentation matches the FSM's gating exactly: a segment is
+"incoming" iff signed `v_x < -min_incoming_speed`. Carry-around /
+sideways-wave samples are now trimmed away in viser so the throw
+trajectory dominates the visualization. `_replay` also resets the
+tracker on slow→fast transitions (5+ non-incoming samples followed
+by an incoming one) so the LS history doesn't span the carry-prefix.
 - 2026-05-19 — **switched the production tracker to volley-only mode**
 for SRC Kitchen bring-up. `BallTrackerConfig` defaults changed:
-`max_bounces = 0`, `online_bounce_pruning = False`, `history_size = 20`,
-`history_max_age_s = 0.50`. With `max_bounces = 0` the LS predictor
+`max_bounces = 0`, `online_bounce_pruning = False`, `history_size = 8`
+(originally bumped to 20 in the same session, then dialed back after a
+sweep — see below), `history_max_age_s = 0.20`. With `max_bounces = 0` the LS predictor
 rejects any propagation that would cross `z = 0` before the strike
 plane, so groundstrokes return `None` and the FSM stays in READY —
 volley filtering is enforced *at the predictor*, no FSM changes

@@ -25,6 +25,21 @@ from .config import BallTrackerConfig
 from .redis_keys import RedisKeys
 
 
+# Reasons predict_intercept can return None. Exposed via
+# BallTracker.last_reject_reason so the offline analyzer can render a
+# colored overlay showing *why* a given tick failed to produce a swing
+# prediction. The FSM doesn't use this — it just sees None.
+REJECT_NONE = ""                                # success, no rejection
+REJECT_INSUFFICIENT_HISTORY = "insufficient_history"  # <3 samples → no LS fit yet
+REJECT_NOT_INCOMING = "not_incoming"             # v_x ≥ -min_incoming_speed
+REJECT_PAST_PLANE = "past_plane"                 # ball already past x = strike_plane_x
+REJECT_ON_FLOOR = "on_floor"                     # ball at z≤0 and not rising
+REJECT_WOULD_BOUNCE = "would_bounce"             # propagation would hit floor before plane
+REJECT_INFINITE_TTI = "infinite_tti"             # discriminant fail / numeric
+REJECT_TTI_TOO_SHORT = "tti_too_short"           # t_impact < min_lookahead
+REJECT_TTI_TOO_LONG = "tti_too_long"             # t_impact > max_lookahead
+
+
 @dataclass
 class BallSample:
     t: float                # seconds since tracker start
@@ -50,10 +65,16 @@ def _propagate_to_plane(
     v0: np.ndarray,
     target_x: float,
     cfg: "BallTrackerConfig",
-) -> Optional[Tuple[float, np.ndarray, np.ndarray, int]]:
+):
     """Propagate a ballistic point with optional bouncing to where it crosses
-    x = target_x. Returns (t_total, p_at_target, v_at_target, n_bounces) or
-    None if no valid intercept exists within the bounce budget.
+    x = target_x.
+
+    Returns ``(t_total, p_at_target, v_at_target, n_bounces)`` on success.
+    Returns one of the ``REJECT_*`` *string* codes on failure (caller uses
+    isinstance check to discriminate). Failure-string return is so
+    ``predict_intercept`` can surface a precise rejection reason via
+    ``tracker.last_reject_reason`` for offline diagnostics, without changing
+    the success path or callers that only care about the success tuple.
 
     Physics: between bounces, free-fall in z + constant velocity in xy. On
     contact with z=0, v_z reflects with -cfg.bounce_restitution and v_xy
@@ -68,15 +89,15 @@ def _propagate_to_plane(
     # reach the plane without bouncing again.
     for n_bounces in range(cfg.max_bounces + 1):
         if v[0] >= 0:
-            return None  # not moving toward plane
+            return REJECT_NOT_INCOMING  # not moving toward plane
         t_to_target = (target_x - p[0]) / v[0]
         if t_to_target < 0:
-            return None  # already past
+            return REJECT_PAST_PLANE
         # At-or-below-floor and not rising → ball is stuck on the ground, the
         # ballistic model can't predict anything useful. After our own
         # simulated bounce p[2]==0 with v[2]>0, which must be allowed.
         if p[2] <= cfg.floor_epsilon and v[2] <= 0:
-            return None
+            return REJECT_ON_FLOOR
 
         # Solve 0.5*g*t² - v_z*t - p_z = 0 for the positive root.
         discriminant = v[2] * v[2] + 2.0 * g * p[2]
@@ -98,7 +119,7 @@ def _propagate_to_plane(
 
         # Ground first; bounce if budget remains.
         if n_bounces >= cfg.max_bounces:
-            return None  # would need another bounce we're not allowed
+            return REJECT_WOULD_BOUNCE
         t_total += t_to_ground
         x_at_ground = p[0] + v[0] * t_to_ground
         y_at_ground = p[1] + v[1] * t_to_ground
@@ -110,7 +131,7 @@ def _propagate_to_plane(
             -cfg.bounce_restitution * v_z_before,
         ])
 
-    return None
+    return REJECT_WOULD_BOUNCE
 
 
 class BallTracker:
@@ -129,8 +150,18 @@ class BallTracker:
         self._keys = keys
         self._cfg = cfg
         self._history: Deque[BallSample] = deque(maxlen=cfg.history_size)
+        # Small raw-sample buffer used by the optional median filter (see
+        # cfg.median_filter_window). Holds the most recent N raw OptiTrack
+        # positions *before* the median is applied; the median is what
+        # actually goes into `_history`.
+        med_w = max(1, cfg.median_filter_window)
+        self._raw_buffer: Deque[np.ndarray] = deque(maxlen=med_w)
         self._t0 = time.perf_counter()
         self._last_seen_t: Optional[float] = None
+        # Diagnostic — set by predict_intercept whenever it returns None.
+        # Used by the offline analyzer to render rejection reasons; the FSM
+        # ignores it.
+        self.last_reject_reason: str = REJECT_NONE
 
     # ------------------------------------------------------------------ I/O
 
@@ -173,6 +204,18 @@ class BallTracker:
         pos = self._read_position()
         if pos is None or pos.shape != (3,):
             return None
+        pos = pos.astype(float)
+
+        # Optional 3-sample (default) median filter, applied per-axis on raw
+        # OptiTrack positions before they hit `_history`. Single-sample
+        # outliers (marker mislabels, brief reflection artifacts) get
+        # replaced by the median of recent neighbors — at the cost of a
+        # roughly 1-sample-of-lag bias in the reported "current" position.
+        # Disabled if median_filter_window < 2.
+        if self._cfg.median_filter_window >= 2:
+            self._raw_buffer.append(pos.copy())
+            if len(self._raw_buffer) >= self._cfg.median_filter_window:
+                pos = np.median(np.stack(self._raw_buffer), axis=0)
 
         # Drop stale samples FIRST so a teleporting ball (sim relaunch /
         # OptiTrack regaining lock after a long dropout) doesn't get its
@@ -187,7 +230,7 @@ class BallTracker:
             if np.linalg.norm(pos - last.pos) > self._cfg.max_position_jump:
                 return None
 
-        sample = BallSample(t=now, pos=pos.astype(float))
+        sample = BallSample(t=now, pos=pos)
         self._history.append(sample)
         self._last_seen_t = now
 
@@ -241,7 +284,9 @@ class BallTracker:
 
     def reset(self) -> None:
         self._history.clear()
+        self._raw_buffer.clear()
         self._last_seen_t = None
+        self.last_reject_reason = REJECT_NONE
 
     # ----------------------------------------------------------- estimation
 
@@ -293,24 +338,37 @@ class BallTracker:
         incoming, the predicted intercept would require more than the allowed
         number of bounces, or the time-to-impact is outside the configured
         lookahead window.
+
+        Side effect: sets ``self.last_reject_reason`` to one of the
+        ``REJECT_*`` codes when returning None (empty string on success).
+        Used by the offline analyzer; the FSM ignores it.
         """
+        self.last_reject_reason = REJECT_NONE
         fit = self._fit_state()
         if fit is None:
+            self.last_reject_reason = REJECT_INSUFFICIENT_HISTORY
             return None
         p0, v0, _ = fit
 
         # Need a non-trivial -X velocity to define a future intercept.
         if v0[0] >= -self._cfg.min_incoming_speed:
+            self.last_reject_reason = REJECT_NOT_INCOMING
             return None
 
         result = _propagate_to_plane(p0, v0, strike_plane_x, self._cfg)
-        if result is None:
+        if isinstance(result, str):
+            self.last_reject_reason = result
             return None
         t_impact, p_impact, v_impact, n_bounces = result
 
         if not np.isfinite(t_impact):
+            self.last_reject_reason = REJECT_INFINITE_TTI
             return None
-        if t_impact < self._cfg.min_lookahead or t_impact > self._cfg.max_lookahead:
+        if t_impact < self._cfg.min_lookahead:
+            self.last_reject_reason = REJECT_TTI_TOO_SHORT
+            return None
+        if t_impact > self._cfg.max_lookahead:
+            self.last_reject_reason = REJECT_TTI_TOO_LONG
             return None
 
         return Intercept(

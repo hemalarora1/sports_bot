@@ -205,17 +205,32 @@ class BallTrackerConfig:
 
     gravity: float = 9.81
 
-    # Sliding window size (samples) used to fit the ballistic trajectory.
-    # Longer than the bounce-mode default of 12 because there's no bounce
-    # in this mode to straddle — more samples → smoother local v estimate.
-    # Reset to 12 if switching back to bounce mode (a long window across a
-    # bounce mixes pre- and post-bounce velocities and corrupts the fit).
-    history_size: int = 20
-
-    # Reject samples older than this when fitting. Bumped from 0.30 → 0.50
-    # for the same reason as history_size — clean volley arcs benefit from
-    # a longer fit window. Reset to 0.30 in bounce mode.
-    history_max_age_s: float = 0.50
+    # Sliding window for the LS fit. Two caps interact:
+    #   - history_size: max samples kept (binding at high sample rates)
+    #   - history_max_age_s: max sample age (binding at low / sparse rates)
+    # We pick values such that the *typical* window is dominated by
+    # ``history_size`` at OptiTrack's 120 / 240 Hz rates, while
+    # ``history_max_age_s`` is permissive enough to keep the fit robust
+    # when the sample stream becomes sparse (carry-around periods,
+    # occlusion-induced low effective Hz).
+    #
+    # Sweep across all 2026-05-19 SRC Kitchen recordings (12 sessions, 22
+    # throws) at the commit-moment bucket (tti ∈ [0.00, 0.15) s):
+    #   size= 8 / age=0.20 : 5.3 cm  (the previously-best 120 Hz setting)
+    #   size=10 / age=0.15 : 5.4 cm
+    #   size=12 / age=0.15 : 5.8 cm  ◀ chosen — small regression at 120 Hz
+    #   size=16 / age=0.10 : 13.7 cm (age too tight → noisy v on sparse stretches)
+    #   size=16 / age=0.15 : 6.6 cm
+    # The "longer window = smoother fit" intuition is wrong: the LS velocity
+    # is a window-average, so a longer window adds lag against the true
+    # current v. ``size=12`` is chosen to anticipate the 240 Hz upgrade —
+    # at 240 Hz this gives a 50 ms window (richer than size=8's 33 ms),
+    # while at 120 Hz it gives 100 ms (slightly long but acceptable). When
+    # 240 Hz is live, re-sweep on real cart data and fine-tune. Reset to
+    # ``size=12, age=0.30`` if switching back to bounce mode (longer
+    # window needed to span clean post-bounce arcs).
+    history_size: int = 12
+    history_max_age_s: float = 0.15
 
     # Minimum forward speed (m/s, world -X direction) for a ball to be
     # considered "incoming". Below this we ignore it.
@@ -224,6 +239,14 @@ class BallTrackerConfig:
     # Reject jumps in position larger than this between consecutive samples
     # (m). Filters out OptiTrack glitches / dropouts.
     max_position_jump: float = 0.5
+
+    # Per-axis median filter applied to raw OptiTrack positions *before* they
+    # hit the rolling history. Smooths out single-sample mislabels / marker
+    # swaps / brief reflection artifacts at the cost of ~1 sample of lag in
+    # the reported "current" position (which is below sensor noise at
+    # 120/240 Hz). Set to 0 or 1 to disable; 3 is a sensible default
+    # (single-outlier rejection without smearing real velocity).
+    median_filter_window: int = 3
 
     # Time horizon (s) within which a predicted intercept is considered usable.
     max_lookahead: float = 1.5

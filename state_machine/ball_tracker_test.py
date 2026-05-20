@@ -50,10 +50,35 @@ from typing import List, Optional, Tuple
 import numpy as np
 import redis
 
-from .ball_tracker import BallSample, BallTracker
+from .ball_tracker import (
+    BallSample,
+    BallTracker,
+    REJECT_INSUFFICIENT_HISTORY,
+    REJECT_NONE,
+    REJECT_NOT_INCOMING,
+    REJECT_ON_FLOOR,
+    REJECT_PAST_PLANE,
+    REJECT_TTI_TOO_LONG,
+    REJECT_TTI_TOO_SHORT,
+    REJECT_WOULD_BOUNCE,
+)
 from .config import PickleballConfig
 from .ekf_ball_tracker import EKFBallTracker
 from .redis_keys import RedisKeys
+
+
+# Color palette for rejection reasons in the viser per-tick overlay. Keep in
+# sync with the panel legend in `_run_viser`.
+REJECT_COLORS: dict = {
+    REJECT_NONE: (0, 220, 60),                    # green — prediction OK
+    REJECT_INSUFFICIENT_HISTORY: (200, 200, 200), # grey — warming up
+    REJECT_NOT_INCOMING: (255, 200, 0),           # amber — v_x not negative enough
+    REJECT_PAST_PLANE: (140, 60, 200),            # purple — already past
+    REJECT_ON_FLOOR: (140, 80, 40),               # brown — stuck low
+    REJECT_WOULD_BOUNCE: (220, 60, 60),           # red — volley filter fired
+    REJECT_TTI_TOO_LONG: (60, 100, 220),          # blue — too far ahead
+    REJECT_TTI_TOO_SHORT: (200, 60, 200),         # magenta — basically at plane
+}
 
 
 # =============================================================================
@@ -210,6 +235,11 @@ class TickAnalysis:
     # Set only by the EKF tracker. 3x3 position covariance at the predicted
     # intercept — diagonal sqrt entries are the per-axis position 1σ.
     intercept_pos_cov: Optional[np.ndarray] = None
+    # Why predict_intercept returned None at this tick (empty string when
+    # it returned a real Intercept). One of the REJECT_* codes from
+    # ball_tracker.py. Surfaced in the viser GUI panel and color-coded on
+    # the trajectory overlay so you can see which gate is firing where.
+    reject_reason: str = REJECT_NONE
 
 
 @dataclass
@@ -361,12 +391,23 @@ class _ReplayTracker(BallTracker):
         self._keys = None
         self._cfg = cfg
         self._history = collections.deque(maxlen=cfg.history_size)
+        # Mirror BallTracker.__init__: median-filter buffer + reject reason.
+        med_w = max(1, cfg.median_filter_window)
+        self._raw_buffer = collections.deque(maxlen=med_w)
         self._t0 = 0.0
         self._last_seen_t = None
+        self.last_reject_reason = REJECT_NONE
 
     def ingest(self, t: float, pos: np.ndarray) -> Optional[BallSample]:
         if pos is None or pos.shape != (3,):
             return None
+        pos = pos.astype(float)
+        # Mirror BallTracker.update()'s median filter so the replay exercises
+        # the same pre-history pipeline the FSM sees.
+        if self._cfg.median_filter_window >= 2:
+            self._raw_buffer.append(pos.copy())
+            if len(self._raw_buffer) >= self._cfg.median_filter_window:
+                pos = np.median(np.stack(self._raw_buffer), axis=0)
         # Drop stale samples first — same order as update().
         while self._history and (t - self._history[0].t) > self._cfg.history_max_age_s:
             self._history.popleft()
@@ -374,7 +415,7 @@ class _ReplayTracker(BallTracker):
             last = self._history[-1]
             if np.linalg.norm(pos - last.pos) > self._cfg.max_position_jump:
                 return None
-        sample = BallSample(t=float(t), pos=pos.astype(float))
+        sample = BallSample(t=float(t), pos=pos)
         self._history.append(sample)
         self._last_seen_t = float(t)
         # Mirror BallTracker.update()'s bounce-pruning step so the replay
@@ -468,6 +509,9 @@ def _replay(
                 rec.fit_v0 = v0
                 rec.is_incoming = bool(v0[0] < -tracker._cfg.min_incoming_speed)
             intercept = tracker.predict_intercept(strike_plane_x)
+            # last_reject_reason is set by predict_intercept on every call.
+            # Empty string means it returned an Intercept (no rejection).
+            rec.reject_reason = getattr(tracker, "last_reject_reason", REJECT_NONE)
             if intercept is not None:
                 rec.intercept_pos = intercept.position
                 rec.intercept_vel = intercept.velocity
@@ -722,6 +766,10 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         cfg.tracker.history_size = args.history_size
     if args.history_max_age_s is not None:
         cfg.tracker.history_max_age_s = args.history_max_age_s
+    if args.no_median_filter:
+        cfg.tracker.median_filter_window = 0
+    if args.median_filter_window is not None:
+        cfg.tracker.median_filter_window = args.median_filter_window
     if args.max_position_jump is not None:
         cfg.tracker.max_position_jump = args.max_position_jump
     if args.min_incoming_speed is not None:
@@ -757,7 +805,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
           f"max_jump={cfg.tracker.max_position_jump:.3f}m, "
           f"min_incoming={cfg.tracker.min_incoming_speed:.2f}m/s, "
           f"lookahead=[{cfg.tracker.min_lookahead:.2f}, {cfg.tracker.max_lookahead:.2f}]s, "
-          f"g={cfg.tracker.gravity:.2f}m/s^2")
+          f"g={cfg.tracker.gravity:.2f}m/s^2, "
+          f"median_filter={cfg.tracker.median_filter_window}")
     print(f"[analyze] bounce model: e={cfg.tracker.bounce_restitution:.3f}, "
           f"μ_t={cfg.tracker.bounce_tangential_damping:.3f}, "
           f"max_bounces={cfg.tracker.max_bounces}, "
@@ -900,6 +949,21 @@ def _run_viser(throws: List[Throw], cfg: PickleballConfig, port: int) -> None:
         show_fit_curve = server.gui.add_checkbox("Current fit ballistic curve", True)
         show_fit_window = server.gui.add_checkbox("Current fit-window samples", True)
         show_bounces = server.gui.add_checkbox("Detected bounces (orange)", True)
+        show_reject_overlay = server.gui.add_checkbox(
+            "Trajectory: color by rejection reason", True,
+        )
+
+    with server.gui.add_folder("Rejection legend"):
+        # Static reference for the colored trajectory overlay. Keep in sync
+        # with REJECT_COLORS at module top.
+        server.gui.add_text("● green",   "prediction OK",        disabled=True)
+        server.gui.add_text("● grey",    "insufficient_history", disabled=True)
+        server.gui.add_text("● amber",   "not_incoming",         disabled=True)
+        server.gui.add_text("● red",     "would_bounce",         disabled=True)
+        server.gui.add_text("● blue",    "tti_too_long",         disabled=True)
+        server.gui.add_text("● magenta", "tti_too_short",        disabled=True)
+        server.gui.add_text("● purple",  "past_plane",           disabled=True)
+        server.gui.add_text("● brown",   "on_floor",             disabled=True)
 
     with server.gui.add_folder("Tick info"):
         info_t = server.gui.add_text("t (s)", "—", disabled=True)
@@ -907,6 +971,7 @@ def _run_viser(throws: List[Throw], cfg: PickleballConfig, port: int) -> None:
         info_v0 = server.gui.add_text("fit v0", "—", disabled=True)
         info_pred = server.gui.add_text("pred. intercept", "—", disabled=True)
         info_tti = server.gui.add_text("t to impact", "—", disabled=True)
+        info_reject = server.gui.add_text("reject reason", "—", disabled=True)
 
     with server.gui.add_folder("Ground truth"):
         info_actual = server.gui.add_text("actual crossing", "—", disabled=True)
@@ -931,15 +996,33 @@ def _run_viser(throws: List[Throw], cfg: PickleballConfig, port: int) -> None:
                 line_width=2.0,
             )
 
-        # All recorded sample positions as faint dots (so user can see sampling density).
-        handles["samples"] = server.scene.add_point_cloud(
-            "/throw/samples",
-            points=throw.positions.astype(np.float32),
-            colors=np.tile(np.array([120, 120, 120], dtype=np.uint8),
-                           (len(throw.positions), 1)),
-            point_size=0.008,
-            point_shape="circle",
-        )
+        # All recorded sample positions. With the rejection overlay on (the
+        # default), each sample is colored by which gate `predict_intercept`
+        # hit at that tick — green = prediction OK, red = volley-filter
+        # rejected, amber = not incoming, etc. Lets you scan the trajectory
+        # visually and see where each gate fires. With the overlay off, just
+        # faint grey for sampling density.
+        if show_reject_overlay.value:
+            n = len(throw.positions)
+            colors_arr = np.zeros((n, 3), dtype=np.uint8)
+            for j, tk in enumerate(throw.ticks):
+                colors_arr[j] = REJECT_COLORS.get(tk.reject_reason, (120, 120, 120))
+            handles["samples"] = server.scene.add_point_cloud(
+                "/throw/samples",
+                points=throw.positions.astype(np.float32),
+                colors=colors_arr,
+                point_size=0.015,
+                point_shape="circle",
+            )
+        else:
+            handles["samples"] = server.scene.add_point_cloud(
+                "/throw/samples",
+                points=throw.positions.astype(np.float32),
+                colors=np.tile(np.array([120, 120, 120], dtype=np.uint8),
+                               (len(throw.positions), 1)),
+                point_size=0.008,
+                point_shape="circle",
+            )
 
         # Current ball position.
         handles["ball"] = server.scene.add_icosphere(
@@ -1107,6 +1190,7 @@ def _run_viser(throws: List[Throw], cfg: PickleballConfig, port: int) -> None:
             info_v0.value = "[{:+.2f}, {:+.2f}, {:+.2f}] m/s".format(*tick.fit_v0.tolist())
         else:
             info_v0.value = "—"
+        info_reject.value = tick.reject_reason if tick.reject_reason else "(prediction OK)"
         if tick.intercept_pos is not None and tick.time_to_impact is not None:
             bounce_suffix = (
                 f"  (via {tick.n_bounces_in_prediction} bounce)"
@@ -1167,6 +1251,10 @@ def _run_viser(throws: List[Throw], cfg: PickleballConfig, port: int) -> None:
         _redraw()
 
     @show_bounces.on_update
+    def _(_):
+        _redraw()
+
+    @show_reject_overlay.on_update
     def _(_):
         _redraw()
 
@@ -1238,6 +1326,15 @@ def main() -> int:
                     help="Override BallTrackerConfig.history_size.")
     an.add_argument("--history-max-age-s", type=float, default=None,
                     help="Override BallTrackerConfig.history_max_age_s.")
+    an.add_argument("--median-filter-window", type=int, default=None,
+                    help="Override BallTrackerConfig.median_filter_window. "
+                         "Per-axis median of the last N raw OptiTrack samples "
+                         "before they enter the rolling history. 0 or 1 = off, "
+                         "3 (default) kills single-sample outliers.")
+    an.add_argument("--no-median-filter", action="store_true",
+                    help="Shortcut for --median-filter-window 0 — useful for "
+                         "A/B comparing the filter against raw data on the "
+                         "same recording.")
     an.add_argument("--max-position-jump", type=float, default=None,
                     help="Override BallTrackerConfig.max_position_jump.")
     an.add_argument("--min-incoming-speed", type=float, default=None,
