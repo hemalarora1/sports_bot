@@ -222,6 +222,19 @@ it for now.
 - `**set_use_multicast(False)` is not enough** if Motive itself is in Multicast
 mode — the client requests unicast but Motive just doesn't send it. Both sides
 have to agree.
+- **macOS multicast bind silently drops frames** (patched 2026-05-19). The
+vendored NatNet client used to bind the data socket to
+`(self.local_ip_address, 1511)`. On BSD-derived stacks (macOS) that prevents
+delivery of multicast packets even though the IGMP join succeeds — `NAT_CONNECT`
+on the command port handshakes fine, server version arrives, but no data
+frames ever do. Fixed by binding to `('', 1511)` (INADDR_ANY) instead — the
+`IP_ADD_MEMBERSHIP` `setsockopt` above the bind still pins which interface
+joins the group, so we don't lose any selectivity. Patch is in
+`drivers/PythonClient/NatNetClient.py:__create_data_socket`. Symptom if it
+ever regresses: streamer log shows `resetting requested version to 4 2 0 0
+from 0 0 0 0` (= command handshake worked) but no rigid-body Redis keys
+appear; switch to `STREAMER_MODE=u` (with Motive flipped to Unicast) to
+confirm.
 - **`sports_bot/` is its own git repo nested inside OpenSai.** So
 `git rev-parse --show-toplevel` from anywhere under `sports_bot/` returns
 `<OpenSai>/sports_bot`, not `<OpenSai>`. Helper scripts that need the OpenSai
@@ -594,6 +607,17 @@ default is now `STREAMER_MODE=m`; flip to `STREAMER_MODE=u` if
 Motive is ever switched back. Also made `MY_IP` env-overridable for
 the rare case `en0` isn't the SRC interface. No calibration impact —
 the world-frame transform is independent of transmission type.
+First multicast run hit a macOS-specific bug in the vendored NatNet
+client (data socket bound to `(local_ip, 1511)` doesn't receive
+multicast on BSD stacks — command channel handshakes but no frames
+arrive). Patched `NatNetClient.__create_data_socket` to bind to
+`('', 1511)` instead; `IP_ADD_MEMBERSHIP` still pins the interface
+joining the group. Multicast confirmed end-to-end the same day.
+Hardened `record_throws.sh` cleanup along the way: reap stale
+`StreamDataSkeleton.py` processes at startup, escalate SIGTERM →
+SIGKILL if a Python child is stuck in a socket-retry loop, and bail
+early if the streamer dies before publishing rather than waiting the
+full 10 s.
 - 2026-05-19 — **switched the production tracker to volley-only mode**
 for SRC Kitchen bring-up. `BallTrackerConfig` defaults changed:
 `max_bounces = 0`, `online_bounce_pruning = False`, `history_size = 20`,

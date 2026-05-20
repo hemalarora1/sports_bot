@@ -418,16 +418,40 @@ def _replay(
 
     out: List[TickAnalysis] = []
     last_t: Optional[float] = None
+    last_pos: Optional[np.ndarray] = None
     # Gap above which we consider the tracker to have "lost the ball" — same
     # threshold the FSM uses to bail to RECOVER. Reset the tracker explicitly
     # so the EKF doesn't carry a 3 s dt step into the next throw (the LS
     # tracker is self-resetting via history_max_age_s, so this only changes
     # EKF behavior in practice — but applying it uniformly keeps the A/B fair).
     reset_gap_s = max(cfg.tracker.history_max_age_s, 0.3)
+    # Detect "new-throw-starts-here" transitions inside a single segment
+    # (= the carry-prefix didn't open a time gap). Reset the tracker on the
+    # leading edge so the LS history isn't polluted by carry samples right
+    # before the throw. Mirror the FSM's gate: a sample counts as part of a
+    # throw iff its signed x-velocity is below -min_incoming_speed (i.e.,
+    # moving toward the robot). When we see a fresh "incoming" sample after
+    # a streak of non-incoming samples, treat it as the start of a new
+    # throw and reset.
+    min_incoming = cfg.tracker.min_incoming_speed
+    not_incoming_streak = 0
+    NOT_INCOMING_STREAK = 5
     for t, pos in zip(timestamps, positions):
-        if last_t is not None and (t - last_t) > reset_gap_s:
-            tracker.reset()
+        if last_t is not None:
+            dt = float(t) - last_t
+            if dt > reset_gap_s:
+                tracker.reset()
+                not_incoming_streak = 0
+            elif last_pos is not None and dt > 1e-6:
+                v_x = float((pos[0] - last_pos[0]) / dt)  # signed
+                if v_x >= -min_incoming:
+                    not_incoming_streak += 1
+                else:
+                    if not_incoming_streak >= NOT_INCOMING_STREAK:
+                        tracker.reset()
+                    not_incoming_streak = 0
         last_t = float(t)
+        last_pos = pos
         accepted = tracker.ingest(float(t), pos) is not None
         rec = TickAnalysis(
             t=float(t),
@@ -489,6 +513,52 @@ class Throw:
     bounces: List[Bounce] = field(default_factory=list)
 
 
+def _trim_segment_to_throw(
+    a: int,
+    b: int,
+    timestamps: np.ndarray,
+    positions: np.ndarray,
+    min_incoming_speed: float,
+    lead_pad_samples: int,
+) -> Optional[Tuple[int, int]]:
+    """Trim a gap-based segment ``[a, b)`` to just the incoming-ball portion.
+
+    The min-movement record filter creates gaps only when the ball is truly
+    stationary; *slowly* moving the ball (walking with it, checking the live
+    feed, etc.) still produces samples and shows up as one long segment that
+    contains a "carry" prefix and a real "throw" suffix. Even fast hand-waves
+    in random directions show up as samples but aren't throws.
+
+    Mirror the FSM's gate: a sample is part of a throw iff the ball's
+    *signed* x-velocity is below ``-min_incoming_speed`` (i.e., moving
+    toward the robot at at least that speed). Find the first / last such
+    sample in the segment and keep that range plus a lead-pad on each side
+    so the LS tracker has some history to fit on at the start of flight.
+
+    Returns the trimmed (a', b') range, or None if no sample in the segment
+    is incoming fast enough (= not a throw, drop it).
+    """
+    n = b - a
+    if n < 3:
+        # too short to compute velocities; pass through unchanged.
+        return (a, b)
+    ts = timestamps[a:b]
+    ps = positions[a:b]
+    dts = np.diff(ts)
+    dx = np.diff(ps[:, 0])
+    # v_x is signed; negative = moving toward the robot in world frame.
+    vx = dx / np.maximum(dts, 1e-6)  # length n-1
+    incoming = vx < -min_incoming_speed
+    if not incoming.any():
+        return None
+    idx = np.where(incoming)[0]
+    # vx[i] corresponds to motion between samples i and i+1; bracket
+    # the incoming region with samples [idx[0], idx[-1]+1].
+    i_lo = max(0, int(idx[0]) - lead_pad_samples)
+    i_hi = min(n, int(idx[-1]) + 1 + lead_pad_samples + 1)
+    return (a + i_lo, a + i_hi)
+
+
 def _segment_throws(
     timestamps: np.ndarray,
     positions: np.ndarray,
@@ -498,12 +568,22 @@ def _segment_throws(
     min_samples: int,
     detect_bounces: bool = True,
     bounce_gravity: float = 9.81,
+    min_incoming_speed: float = 0.0,
+    lead_pad_samples: int = 20,
 ) -> List[Throw]:
     """Split into per-throw segments by time gaps in the recorded stream.
 
     With the recorder's min-movement filter, a stationary ball produces no
     samples — so two throws separated by a "ball at rest" period show up as
-    a single time gap larger than gap_s.
+    a single time gap larger than ``gap_s``.
+
+    Slowly *moving* the ball between throws (walking around, holding it
+    while you sanity-check Redis, etc.) still produces samples, so the
+    gap-based segmenter merges the carry prefix into the throw. When
+    ``min_incoming_speed > 0``, each gap-based segment is post-trimmed to
+    the incoming-ball portion using the same gate the FSM uses
+    (signed ``v_x < -min_incoming_speed``); segments with no incoming
+    samples at all are dropped entirely.
     """
     if len(timestamps) == 0:
         return []
@@ -519,6 +599,15 @@ def _segment_throws(
     for a, b in segments:
         if b - a < min_samples:
             continue
+        if min_incoming_speed > 0:
+            trimmed = _trim_segment_to_throw(
+                a, b, timestamps, positions, min_incoming_speed, lead_pad_samples,
+            )
+            if trimmed is None:
+                continue
+            a, b = trimmed
+            if b - a < min_samples:
+                continue
         ts = timestamps[a:b]
         ps = positions[a:b]
         crossings = _find_crossings(ts, ps, strike_plane_x)
@@ -683,6 +772,11 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     print(f"[analyze] strike_plane_x = {cfg.court.strike_plane_x:.3f}")
 
     ticks = _replay(timestamps, positions, cfg, tracker_kind=args.tracker)
+    seg_min_incoming = (
+        args.segment_min_incoming_speed
+        if args.segment_min_incoming_speed is not None
+        else cfg.tracker.min_incoming_speed
+    )
     throws = _segment_throws(
         timestamps, positions, ticks,
         cfg.court.strike_plane_x,
@@ -690,6 +784,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         min_samples=args.segment_min_samples,
         detect_bounces=not args.no_bounce_detection,
         bounce_gravity=cfg.tracker.gravity,
+        min_incoming_speed=seg_min_incoming,
+        lead_pad_samples=args.segment_lead_pad,
     )
     print(f"[analyze] segmented into {len(throws)} throw(s)")
 
@@ -1122,6 +1218,19 @@ def main() -> int:
                     help="Time gap that separates one throw from the next.")
     an.add_argument("--segment-min-samples", type=int, default=5,
                     help="Drop segments shorter than this many samples.")
+    an.add_argument("--segment-min-incoming-speed", type=float, default=None,
+                    help="After gap-based segmentation, trim each segment to "
+                         "the incoming-ball portion using the same gate the "
+                         "FSM uses: signed v_x < -threshold (m/s, world frame, "
+                         "ball moving toward the robot). Drops samples that "
+                         "are stationary, moving away, or moving sideways. "
+                         "Default: cfg.tracker.min_incoming_speed (0.5 m/s). "
+                         "Set to 0 to disable trimming (raw gap-only "
+                         "segmentation, useful for debugging).")
+    an.add_argument("--segment-lead-pad", type=int, default=20,
+                    help="Samples to keep on each side of the trimmed throw "
+                         "window so the LS fit has some history at the very "
+                         "start. 20 ≈ 100 ms at 200 Hz polling.")
 
     an.add_argument("--strike-plane-x", type=float, default=None,
                     help="Override CourtConfig.strike_plane_x.")

@@ -278,8 +278,19 @@ class NatNetClient:
                                   0)    # UDP
             result.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             result.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton(self.multicast_address) + socket.inet_aton(self.local_ip_address))
+            # Bind to INADDR_ANY rather than the local interface address. On
+            # macOS (and other BSD-derived stacks), binding a multicast-
+            # receiving socket to a specific interface IP can silently prevent
+            # delivery — the kernel sees the multicast on the interface but
+            # doesn't deliver to a socket bound to that interface's *unicast*
+            # IP. IP_ADD_MEMBERSHIP above still pins which interface joins the
+            # group, so we don't lose any selectivity. Linux is permissive
+            # either way, so this is portable. (Original NaturalPoint code
+            # bound to self.local_ip_address; that works on Windows but breaks
+            # silently on macOS — no data frames arrive even though NAT_CONNECT
+            # succeeds on the command port.)
             try:
-                result.bind( (self.local_ip_address, port) )
+                result.bind( ('', port) )
             except socket.error as msg:
                 print("ERROR: data socket error occurred:\n%s" %msg)
                 print("  Check Motive/Server mode requested mode agreement.  You requested Multicast ")
