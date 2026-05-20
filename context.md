@@ -504,6 +504,87 @@ re-measuring after every ~50 new throws to tighten the estimate.
 
 ---
 
+## Base frame calibration (FSM goals → TidyBot driver)
+
+The FSM speaks world frame W (floor tape). The TidyBot driver speaks robot
+odometry frame R (origin = wherever the cart was parked when
+`redis_driver.py` started; re-anchors every driver restart). `base_bridge.py`
+sits between them. To do its job it needs the per-session transform
+`T_W_R`. We split that into two pieces.
+
+**Four frames, two unknown transforms:**
+
+| frame | what / where |
+|---|---|
+| W | world; floor tape origin; FSM speaks this |
+| B | OptiTrack rigid-body local frame, glued to the markers on the cart; pose in W comes from `sai2::optitrack::rigid_body_pos::<id>` + `…ori::<id>` |
+| C | TidyBot odometry control-point frame, glued to the cart at whatever pivot the firmware tracks; pose in R comes from `hb1::current_pose` |
+| R | robot odometry origin; floor-fixed for the session |
+
+`T_W_B(t)` and `T_R_C(t)` are streamed live. The two unknowns are
+`T_B_C` (static — depends on where the markers sit on the cart vs.
+the firmware's odometry pivot) and `T_W_R` (static per session — depends on
+where the cart was parked at driver start). They satisfy
+
+```
+T_W_B(t) ⊕ T_B_C  =  T_W_R ⊕ T_R_C(t)        for all t
+```
+
+(same point on the cart, two ways to express its world pose).
+
+**Why split:** `T_B_C` is geometric and persists across sessions; `T_W_R`
+re-anchors every driver restart and is meaningless tomorrow. So we
+calibrate `T_B_C` once (the slow drive-around) and back-solve `T_W_R` from
+one stationary snapshot every session (the fast bringup).
+
+**Files:**
+
+| Path | Purpose |
+|---|---|
+| `sports_bot/utils/frames.py` | SE(2) algebra, quat ↔ R, projection-based yaw extraction, 2D hand-eye AX=XB solver, calibration file I/O. |
+| `sports_bot/scripts/calibrate_robot_marker.py` | Interactive N-waypoint capture; solves `(T_B_C, T_W_R)` jointly via Levenberg-Marquardt; persists only `T_B_C`. |
+| `sports_bot/optitrack/robot_marker_calibration.json` | Persisted `T_B_C`. Re-solve only when markers are re-stuck. |
+| `sports_bot/base_bridge.py` | Loads `T_B_C`, snapshots `(T_W_B, T_R_C)` for 1 s, derives `T_W_R = T_W_B ⊕ T_B_C ⊕ T_R_C⁻¹`, forwards goals, prints OT-vs-odom cross-check every 2 s. |
+
+**One-time `T_B_C` calibration** (re-run when markers get re-stuck):
+
+```bash
+conda activate opensai
+# 1. start redis, OptiTrack streamer, TidyBot driver
+# 2. drive cart to 5 waypoints — mix translation AND rotation between them
+python sports_bot/scripts/calibrate_robot_marker.py --robot-rigid-body-id <ID>
+```
+
+Each waypoint: hold the cart still, press Enter, 1 s average is captured.
+Aim for ≥30 cm translation and ≥30° rotation span across the set —
+the script warns if diversity is poor. Residual RMS should land under
+~1 cm / 0.5°; the script flags higher values. Persists to
+`sports_bot/optitrack/robot_marker_calibration.json`. Commit it.
+
+**Per-session bringup:**
+
+```bash
+python sports_bot/base_bridge.py --robot-rigid-body-id <ID>
+```
+
+2-second pose snapshot (cart sits still) → derives `T_W_R` → runs the
+bridge. Every ~2 s it prints a sanity line comparing `T_W_C` computed two
+ways:
+
+```
+[base_bridge] sanity  W_via_OT=[+1.234, +0.567, +12.3°]  W_via_odom=[+1.235, +0.566, +12.2°]  Δ=[+1.0, -1.0] mm, -0.1°
+```
+
+Growing Δ over time ≈ wheel slip or marker shift. Free runtime watchdog;
+not load-bearing, but useful for debugging.
+
+**Quat passthrough is fixed**: `_opti_to_world_quat()` now actually
+rotates the quaternion through `R_WORLD_OPTI`, so
+`sai2::optitrack::rigid_body_ori::<id>` is genuinely in W. Both the
+calibration script and the bridge read this world-frame key directly.
+
+---
+
 ## Open items for integration
 
 - ~~`world_calibration.json` for whichever bay we end up using~~ — done for
@@ -514,9 +595,12 @@ mark, read `sai2::optitrack::raw::rigid_body_pos::<id>` and run it through
 `R, t`; expect world-frame `(0, 0, 0)` within ~5 mm. If it drifts,
 re-solve. (Better: group the 3 floor markers into a single `FloorRef`
 rigid body and read its world pose each session.)
-- `**_opti_to_world_quat()` is a passthrough.** Position is calibrated;
-orientation isn't. Fine for the ball (sphere). Fix before relying on
-OptiTrack for the cart's heading.
+- ~~`_opti_to_world_quat()` is a passthrough~~ — fixed 2026-05-19. The
+function now applies `R_WORLD_OPTI` to the quaternion via
+`sports_bot.utils.frames.rotate_quat`, so `sai2::optitrack::rigid_body_ori::<id>`
+is honestly in world frame. Downstream consumers (base bridge, marker
+calibration) read this key directly instead of re-rotating raw OptiTrack
+quats themselves.
 - Make the FSM write to `hb1::desired_pose` instead of
 `sports_bot::cmd::base::goal_pose` (or add a one-line bridge).
 - Decide PickleBall's permanent Streaming ID — easier to standardize on `1`
@@ -556,6 +640,24 @@ ifconfig en0 | awk '/inet / {print $2}'
 ---
 
 ## Change log
+
+- 2026-05-19 — **base-frame calibration system landed.** Split the
+  FSM↔TidyBot frame problem into two unknowns: `T_B_C` (geometric,
+  marker-vs-odometry-pivot offset; persisted in
+  `sports_bot/optitrack/robot_marker_calibration.json`) and `T_W_R`
+  (per-session, where the cart was parked at driver start; derived from
+  a 1-s snapshot at bridge startup). New `sports_bot/utils/frames.py`
+  carries SE(2) algebra + a 2D AX=XB hand-eye solver via
+  Levenberg-Marquardt — solver verified to machine precision against
+  synthetic ground truth. New interactive
+  `sports_bot/scripts/calibrate_robot_marker.py` captures N waypoints
+  (default 5; mix rotation+translation) and reports per-waypoint
+  residuals. Refactored `sports_bot/base_bridge.py` to load `T_B_C`,
+  back-solve `T_W_R`, and print a periodic OT-vs-odom cross-check
+  residual as a wheel-slip / marker-drift watchdog. Also fixed
+  `_opti_to_world_quat()` in `StreamDataSkeleton.py` (was a passthrough)
+  via `sports_bot.utils.frames.rotate_quat`, so
+  `sai2::optitrack::rigid_body_ori::<id>` is now honestly world-frame.
 
 - 2026-05-17 — first draft. Got OptiTrack streaming working from Stanford wifi to
 Kitchen bay by switching Motive to Unicast. Confirmed PickleBall = Streaming

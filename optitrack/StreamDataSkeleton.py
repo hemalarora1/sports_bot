@@ -30,6 +30,14 @@ import redis
 import signal
 import sys
 
+# Pull in the shared frame helpers (single source of truth for quat<->R math).
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_SPORTS_BOT_DIR = os.path.dirname(_THIS_DIR)
+_OPENSAI_DIR = os.path.dirname(_SPORTS_BOT_DIR)
+if _OPENSAI_DIR not in sys.path:
+    sys.path.insert(0, _OPENSAI_DIR)
+from sports_bot.utils.frames import rotate_quat  # noqa: E402
+
 is_looping = True
 def signal_handler(sig, frame):
     is_looping = False
@@ -97,10 +105,12 @@ def _opti_to_world_position(pos):
     return (R_WORLD_OPTI @ p) + T_WORLD_OPTI
 
 def _opti_to_world_quat(rot):
-    # Motive streams quaternion as (qx, qy, qz, qw). We rotate by R_WORLD_OPTI,
-    # which is q_world = q_offset * q_optitrack. For now we publish the raw
-    # quaternion alongside the rotated one; the FSM only uses position.
-    return rot
+    # Motive streams quaternion as (qx, qy, qz, qw). Rotate it into the world
+    # frame so that the published world-frame ori key is consistent with the
+    # world-frame pos key — i.e. both describe the body's pose in W.
+    # Equivalent to building R_W_B = R_WORLD_OPTI @ R_M_B(rot) and converting
+    # back to a quaternion; see sports_bot.utils.frames.rotate_quat.
+    return rotate_quat(R_WORLD_OPTI, rot)
 
 # This is a callback function that gets connected to the NatNet client
 # and called once per mocap frame.
