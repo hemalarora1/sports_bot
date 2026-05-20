@@ -38,6 +38,79 @@ class Intercept:
     position: np.ndarray    # 3-vector, world frame, on x = strike_plane_x
     velocity: np.ndarray    # 3-vector ball velocity at intercept (world frame)
     time_to_impact: float   # seconds from "now" to predicted impact
+    n_bounces: int = 0      # bounces simulated before reaching the strike plane
+    # Optional 3x3 position covariance at the intercept. Populated by
+    # probabilistic estimators (EKF); None for the production least-squares
+    # tracker, which has no notion of uncertainty.
+    position_cov: Optional[np.ndarray] = None
+
+
+def _propagate_to_plane(
+    p0: np.ndarray,
+    v0: np.ndarray,
+    target_x: float,
+    cfg: "BallTrackerConfig",
+) -> Optional[Tuple[float, np.ndarray, np.ndarray, int]]:
+    """Propagate a ballistic point with optional bouncing to where it crosses
+    x = target_x. Returns (t_total, p_at_target, v_at_target, n_bounces) or
+    None if no valid intercept exists within the bounce budget.
+
+    Physics: between bounces, free-fall in z + constant velocity in xy. On
+    contact with z=0, v_z reflects with -cfg.bounce_restitution and v_xy
+    scales by cfg.bounce_tangential_damping. Up to cfg.max_bounces bounces.
+    """
+    p = p0.astype(float).copy()
+    v = v0.astype(float).copy()
+    g = cfg.gravity
+    t_total = 0.0
+
+    # +1 so we get one extra "no bounce remaining" iteration that can still
+    # reach the plane without bouncing again.
+    for n_bounces in range(cfg.max_bounces + 1):
+        if v[0] >= 0:
+            return None  # not moving toward plane
+        t_to_target = (target_x - p[0]) / v[0]
+        if t_to_target < 0:
+            return None  # already past
+        # At-or-below-floor and not rising → ball is stuck on the ground, the
+        # ballistic model can't predict anything useful. After our own
+        # simulated bounce p[2]==0 with v[2]>0, which must be allowed.
+        if p[2] <= cfg.floor_epsilon and v[2] <= 0:
+            return None
+
+        # Solve 0.5*g*t² - v_z*t - p_z = 0 for the positive root.
+        discriminant = v[2] * v[2] + 2.0 * g * p[2]
+        if discriminant < 0:
+            t_to_ground = float("inf")
+        else:
+            t_to_ground = (v[2] + np.sqrt(discriminant)) / g
+
+        if t_to_target <= t_to_ground:
+            # Reach plane before the next bounce.
+            t_total += t_to_target
+            p_final = np.array([
+                target_x,
+                p[1] + v[1] * t_to_target,
+                p[2] + v[2] * t_to_target - 0.5 * g * t_to_target * t_to_target,
+            ])
+            v_final = np.array([v[0], v[1], v[2] - g * t_to_target])
+            return t_total, p_final, v_final, n_bounces
+
+        # Ground first; bounce if budget remains.
+        if n_bounces >= cfg.max_bounces:
+            return None  # would need another bounce we're not allowed
+        t_total += t_to_ground
+        x_at_ground = p[0] + v[0] * t_to_ground
+        y_at_ground = p[1] + v[1] * t_to_ground
+        v_z_before = v[2] - g * t_to_ground
+        p = np.array([x_at_ground, y_at_ground, 0.0])
+        v = np.array([
+            v[0] * cfg.bounce_tangential_damping,
+            v[1] * cfg.bounce_tangential_damping,
+            -cfg.bounce_restitution * v_z_before,
+        ])
+
+    return None
 
 
 class BallTracker:
@@ -118,7 +191,45 @@ class BallTracker:
         self._history.append(sample)
         self._last_seen_t = now
 
+        # 3a: if a floor bounce is now clearly inside the rolling window, drop
+        # pre-bounce samples so the next _fit_state runs on the post-bounce arc
+        # only. Predictions during the few ticks straddling a bounce go from
+        # garbage (averaged pre/post velocity) to "no prediction yet" (history
+        # too short) and then to clean post-bounce predictions.
+        if self._cfg.online_bounce_pruning:
+            self._try_prune_pre_bounce()
+
         return sample
+
+    def _try_prune_pre_bounce(self) -> bool:
+        """Look for a floor bounce inside the rolling history. If one is
+        clearly present, drop all samples before it. Returns True on prune.
+
+        Detection is intentionally conservative — we want zero false positives
+        on clean arcs, since dropping samples truncates the fit window. A
+        bounce is "clearly present" when there's a local-min z below the
+        floor threshold with strictly-greater z two samples on each side.
+        """
+        if len(self._history) < 6:
+            return False
+        samples = list(self._history)
+        n = len(samples)
+        zs = np.fromiter((s.pos[2] for s in samples), dtype=float, count=n)
+        z_thr = self._cfg.online_bounce_z_threshold
+        # Earliest bounce wins — that's the one whose pre-bounce data is
+        # poisoning the fit right now.
+        for i in range(2, n - 2):
+            if zs[i] >= z_thr:
+                continue
+            if not (zs[i] <= zs[i - 1] and zs[i] <= zs[i + 1]):
+                continue
+            # Clear v-shape: z[i±2] strictly above the local min.
+            if zs[i - 2] <= zs[i] or zs[i + 2] <= zs[i]:
+                continue
+            for _ in range(i):
+                self._history.popleft()
+            return True
+        return False
 
     def time_since_last_seen(self) -> float:
         if self._last_seen_t is None:
@@ -176,36 +287,35 @@ class BallTracker:
     def predict_intercept(self, strike_plane_x: float) -> Optional[Intercept]:
         """Solve for ball state at x = strike_plane_x.
 
-        Returns None if the fit is unusable, the ball is not incoming, the
-        intercept lies in the past, or the time-to-impact is outside the
-        configured lookahead window.
+        Propagates the fitted ballistic state forward, simulating up to
+        cfg.max_bounces floor bounces if z would hit 0 before x reaches the
+        strike plane. Returns None if the fit is unusable, the ball is not
+        incoming, the predicted intercept would require more than the allowed
+        number of bounces, or the time-to-impact is outside the configured
+        lookahead window.
         """
         fit = self._fit_state()
         if fit is None:
             return None
         p0, v0, _ = fit
 
-        # Need a non-trivial -X velocity to define a future intercept on the plane.
+        # Need a non-trivial -X velocity to define a future intercept.
         if v0[0] >= -self._cfg.min_incoming_speed:
             return None
 
-        # Solve x0 + vx * t = strike_plane_x.
-        t_impact = (strike_plane_x - p0[0]) / v0[0]
+        result = _propagate_to_plane(p0, v0, strike_plane_x, self._cfg)
+        if result is None:
+            return None
+        t_impact, p_impact, v_impact, n_bounces = result
+
         if not np.isfinite(t_impact):
             return None
         if t_impact < self._cfg.min_lookahead or t_impact > self._cfg.max_lookahead:
             return None
 
-        x = p0[0] + v0[0] * t_impact
-        y = p0[1] + v0[1] * t_impact
-        z = p0[2] + v0[2] * t_impact - 0.5 * self._cfg.gravity * t_impact * t_impact
-
-        vx = v0[0]
-        vy = v0[1]
-        vz = v0[2] - self._cfg.gravity * t_impact
-
         return Intercept(
-            position=np.array([x, y, z]),
-            velocity=np.array([vx, vy, vz]),
-            time_to_impact=t_impact,
+            position=p_impact,
+            velocity=v_impact,
+            time_to_impact=float(t_impact),
+            n_bounces=int(n_bounces),
         )
