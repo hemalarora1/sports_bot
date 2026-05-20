@@ -54,7 +54,7 @@ def receive_new_frame(data_dict):
 RIGID_BODY_POS_KEY = "sai2::optitrack::rigid_body_pos::"
 RIGID_BODY_ORI_KEY = "sai2::optitrack::rigid_body_ori::"
 def receive_rigid_body_frame( new_id, position, rotation ):
-    # pass
+    print(f"Received rigid body {new_id}: pos={position} ori={rotation}")
     redis_client.set(RIGID_BODY_POS_KEY + str(new_id), '[' + str(position)[1:-1] + ']')
     redis_client.set(RIGID_BODY_ORI_KEY + str(new_id), '[' + str(rotation)[1:-1] + ']')
 
@@ -217,8 +217,9 @@ if __name__ == "__main__":
 
     # Configure the streaming client to call our rigid body handler on the emulator to send data out.
     streaming_client.new_frame_listener = receive_new_frame
-    #streaming_client.rigid_body_listener = receive_rigid_body_frame
-    streaming_client.skeleton_listener = receive_skeleton_frame
+    streaming_client.rigid_body_listener = receive_rigid_body_frame
+    # If you're streaming skeleton data instead, uncomment the next line.
+    # streaming_client.skeleton_listener = receive_skeleton_frame
     
     # Set print level
     streaming_client.set_print_level(0)

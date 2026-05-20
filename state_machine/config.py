@@ -65,7 +65,7 @@ class RacketConfig:
     wind_up_offset: float = 0.25
 
     # Distance to push the racket past the strike point on follow-through.
-    follow_through_offset: float = 0.25
+    follow_through_offset: float = 0.10
 
     # Desired racket linear speed at impact (m/s). Pickleball returns are
     # typically 5-10 m/s; start conservative for sim bring-up.
@@ -81,26 +81,35 @@ class ReadyPose:
         default_factory=lambda: np.array([0.0, 0.0, 0.0])
     )
 
-    # Racket sweet-spot position in world frame. Pinned to the controller's
-    # natural rest pose at the configured arm posture so INIT settles at zero
-    # cartesian error. The FSM's APPROACH state drives the racket UP to the
-    # predicted ball intercept (typically z>1 m); the controller's OTG limits
-    # (6 m/s, 30 m/s^2) traverse that in well under the ball flight time.
+    # Racket sweet-spot position in world frame (x=forward/net, y=lateral, z=up).
+    # The arm base is mounted with a 90° Z-rotation (rpy="0 0 1.5708" in URDF),
+    # so joint 1 = 0° extends the arm in world +Y. Setting y < 0 puts the arm
+    # on the robot's RIGHT side (when facing the net, right = world -Y).
+    # y = -0.80 is further out than q_posture (~0.675 m) so the IK resolves to a
+    # more extended configuration, giving the "arm straight out to the right" look.
+    # If the arm goes to the wrong side in the sim, flip the sign of y.
     racket_position: np.ndarray = field(
-        default_factory=lambda: np.array([0.675, 0.0, 0.753])
+        default_factory=lambda: np.array([0.0, -0.80, 0.70])
     )
 
     # Racket orientation as a 3x3 rotation. Columns are
-    # [face_right, face_up, face_normal] in world. Tuned to match the
-    # controller's wrist orientation at the configured posture: face_normal ≈
-    # +X (toward opponent), face_up ≈ -Z (paddle hanging down from wrist —
-    # joint 7 limits don't allow a clean +Z face_up at this posture; the
-    # cartesian controller still drives the TCP wherever the FSM commands).
+    # [face_right, face_up, face_normal] in world frame.
+    # face_normal = +X (toward net/opponent); face_up = +Y so the paddle edge
+    # points along the arm extension axis, letting joint-1 swing the face
+    # equally fast up or down through the ball intercept.
     racket_orientation: np.ndarray = field(
         default_factory=lambda: np.array([
-            [ 0.0,    0.077,  0.997 ],   # row 0 (world X components)
-            [-1.0,    0.0,    0.0   ],   # row 1 (world Y components)
-            [ 0.0,   -0.997,  0.077 ],   # row 2 (world Z components)
+            [ 0.0,  0.0,  1.0 ],   # row 0 (world X components)
+            [ 0.0,  1.0,  0.0 ],   # row 1 (world Y components)
+            [-1.0,  0.0,  0.0 ],   # row 2 (world Z components)
+        ])
+    )
+
+    # Hardcoded joint positions (robot frame, radians) to command on startup
+    # and after each hit instead of solving IK from racket_position/orientation.
+    joint_positions: np.ndarray = field(
+        default_factory=lambda: np.array([
+            -2.00486, 0.570955, 0.191096, -1.42844, 0.64624, 2.14713, -0.668075
         ])
     )
 
@@ -137,6 +146,7 @@ class FsmConfig:
     control_dt: float = 0.01           # 100 Hz loop
     pos_tol: float = 0.05              # meters — loose enough that base+racket settle in finite time
     ori_tol: float = 0.20              # Frobenius norm of (R_des - R_now); ~10° all-axis
+    joint_tol: float = 0.05           # radians per joint (~3°) for joint-space settling check
     base_pos_tol: float = 0.05
 
     # If we lose the ball for this long during TRACK / APPROACH we abort.

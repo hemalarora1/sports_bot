@@ -123,6 +123,30 @@ class RobotRedisAdapter:
         if self._keys.robot_backend == "cs225a":
             self._r.set(self._keys.cs225a.base_goal_pose, json.dumps(pose.tolist()))
 
+    def read_joint_positions(self) -> Optional[np.ndarray]:
+        if self._keys.robot_backend != "opensai":
+            return None
+        try:
+            q = np.array(json.loads(self._r.get(self._keys.opensai.joint_current_position)))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return q if q.shape == (7,) else None
+
+    def switch_to_joint_controller(self) -> None:
+        if self._keys.robot_backend != "opensai":
+            return
+        self._r.set(self._keys.opensai.active_controller, self._keys.opensai.joint_controller_name)
+
+    def switch_to_cartesian_controller(self) -> None:
+        if self._keys.robot_backend != "opensai":
+            return
+        self._r.set(self._keys.opensai.active_controller, self._keys.opensai.controller_name)
+
+    def write_joint_goal(self, positions: np.ndarray) -> None:
+        if self._keys.robot_backend != "opensai":
+            return
+        self._r.set(self._keys.opensai.joint_goal_position, json.dumps(positions.tolist()))
+
     def publish_state(self, state: State) -> None:
         if self._keys.robot_backend == "cs225a":
             self._r.set(self._keys.cs225a.fsm_state, state.name)
@@ -156,6 +180,10 @@ class RobotRedisAdapter:
 
 
 # ---------- Helpers ------------------------------------------------------------
+
+def joints_close(q_now: np.ndarray, q_goal: np.ndarray, tol: float) -> bool:
+    return bool(np.max(np.abs(q_now - q_goal)) < tol)
+
 
 def pose_close(
     pos_now: np.ndarray, pos_goal: np.ndarray,
@@ -205,6 +233,10 @@ class PickleballFSM:
         self._state = new_state
         self._t_state_entered = time.perf_counter()
         self._robot.publish_state(new_state)
+        if new_state == State.RECOVER:
+            self._robot.switch_to_joint_controller()
+        elif new_state in (State.APPROACH, State.SWING):
+            self._robot.switch_to_cartesian_controller()
 
     def _time_in_state(self) -> float:
         return time.perf_counter() - self._t_state_entered
@@ -214,13 +246,10 @@ class PickleballFSM:
     def _step_init(self, racket_pos: np.ndarray, racket_rot: np.ndarray) -> None:
         ready = self._cfg.ready
         self._robot.write_base_goal(ready.base_pose)
-        self._robot.write_racket_goal(ready.racket_position, ready.racket_orientation)
+        self._robot.write_joint_goal(ready.joint_positions)
 
-        if pose_close(
-            racket_pos, ready.racket_position,
-            racket_rot, ready.racket_orientation,
-            self._cfg.fsm.pos_tol, self._cfg.fsm.ori_tol,
-        ):
+        q = self._robot.read_joint_positions()
+        if q is not None and joints_close(q, ready.joint_positions, self._cfg.fsm.joint_tol):
             self._enter(State.READY)
 
     def _step_ready(self) -> None:
@@ -299,15 +328,18 @@ class PickleballFSM:
                 plan.strike_velocity,
             )
 
-        # After the predicted impact, push the follow-through goal.
+        # After impact, start heading to the ready pose immediately so the arm
+        # decelerates toward home rather than arcing through a follow-through point.
         if (
             self._t_predicted_impact is not None
             and time.perf_counter() >= self._t_predicted_impact
         ):
+            ready = self._cfg.ready
             self._robot.write_racket_goal(
-                plan.follow_position,
-                plan.follow_orientation,
+                ready.racket_position,
+                ready.racket_orientation,
             )
+            self._robot.write_base_goal(ready.base_pose)
 
         # Hold the follow-through briefly, then recover.
         if self._time_in_state() >= self._cfg.fsm.follow_through_hold_s + max(
@@ -322,13 +354,10 @@ class PickleballFSM:
     def _step_recover(self, racket_pos: np.ndarray, racket_rot: np.ndarray) -> None:
         ready = self._cfg.ready
         self._robot.write_base_goal(ready.base_pose)
-        self._robot.write_racket_goal(ready.racket_position, ready.racket_orientation)
+        self._robot.write_joint_goal(ready.joint_positions)
 
-        settled = pose_close(
-            racket_pos, ready.racket_position,
-            racket_rot, ready.racket_orientation,
-            self._cfg.fsm.pos_tol, self._cfg.fsm.ori_tol,
-        )
+        q = self._robot.read_joint_positions()
+        settled = q is not None and joints_close(q, ready.joint_positions, self._cfg.fsm.joint_tol)
         timed_out = self._time_in_state() >= self._cfg.fsm.recover_max_s
 
         if settled or timed_out:
@@ -357,6 +386,7 @@ class PickleballFSM:
         init_time = time.perf_counter_ns() * 1e-9
         self._t_state_entered = time.perf_counter()
         self._robot.publish_state(self._state)
+        self._robot.switch_to_joint_controller()
 
         while self._running:
             loop_time += dt

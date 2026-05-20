@@ -112,9 +112,11 @@ int main() {
 	joint_task->setGains(8.0, 6.0, 0.0);
 	VectorXd q_posture(dof);
 	q_posture.setZero();
-	// joint 1 = -90° aligns the arm with world +X (forward to opponent).
+	// joint 1 = 0° extends the arm along world +Y (sideways). Joint-1 rotation
+	// then drives the swing — lower joints have higher velocity headroom on the
+	// Franka and are less likely to lock during a fast hit.
 	// Must match simviz's initial_q so the controller starts at zero error.
-	q_posture.tail(7) << -90.0, -15.0, 0.0, -100.0, 0.0, 90.0, 0.0;
+	q_posture.tail(7) << 0.0, -15.0, 90.0, -80.0, 0.0, 90.0, 0.0;
 	q_posture.tail(7) *= M_PI / 180.0;
 	joint_task->setGoalPosition(q_posture);
 

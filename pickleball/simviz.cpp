@@ -55,13 +55,13 @@ vector<Affine3d> object_poses;
 vector<VectorXd> object_velocities;
 const int n_objects = object_names.size();
 
-// initial joint posture (radians). joint 1 = -90° aligns the arm with world
-// +X (toward the opponent). joint 7 stays at 0 — full ±π wrist roll is outside
-// the Franka limits, so the FSM's home orientation is matched to whatever
-// face_up direction this posture happens to produce (see config.py).
+// initial joint posture (radians). joint 1 = 0° extends the arm along world
+// +Y (sideways) so that joint-1 rotation drives the swing — the lower joints
+// have higher velocity headroom on the Franka and won't lock during a fast hit.
+// Must stay in sync with q_posture in controller.cpp.
 static VectorXd initial_q(int dof) {
 	VectorXd q = VectorXd::Zero(dof);
-	q.tail(7) << -90.0, -15.0, 0.0, -100.0, 0.0, 90.0, 0.0;
+	q.tail(7) << 0.0, -15.0, 90.0, -80.0, 0.0, 90.0, 0.0;
 	q.tail(7) *= M_PI / 180.0;
 	return q;
 }

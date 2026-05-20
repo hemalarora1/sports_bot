@@ -34,9 +34,11 @@ class OpenSaiCartesianKeys:
     written for it.
     """
 
-    robot_name: str = "Panda"
+    robot_name: str = "FrankaRobot"
     controller_name: str = "cartesian_controller"
     task_name: str = "cartesian_task"
+    joint_controller_name: str = "joint_controller"
+    joint_task_name: str = "joint_task"
 
     @property
     def goal_position(self) -> str:
@@ -65,6 +67,14 @@ class OpenSaiCartesianKeys:
     @property
     def active_controller(self) -> str:
         return f"opensai::controllers::{self.robot_name}::active_controller_name"
+
+    @property
+    def joint_goal_position(self) -> str:
+        return f"opensai::controllers::{self.robot_name}::{self.joint_controller_name}::{self.joint_task_name}::goal_position"
+
+    @property
+    def joint_current_position(self) -> str:
+        return f"opensai::controllers::{self.robot_name}::{self.joint_controller_name}::{self.joint_task_name}::current_position"
 
     @property
     def config_file_name(self) -> str:

@@ -51,7 +51,7 @@ def _rotation_from_normal(face_normal: np.ndarray, world_up: Optional[np.ndarray
     close as possible to `world_up`."""
     n = _normalize(face_normal)
     if world_up is None:
-        world_up = np.array([0.0, 0.0, 1.0])
+        world_up = np.array([0.0, 1.0, 0.0])
     # Project world_up onto the plane orthogonal to n.
     up_proj = world_up - np.dot(world_up, n) * n
     if np.linalg.norm(up_proj) < 1e-6:
