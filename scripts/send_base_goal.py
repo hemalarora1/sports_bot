@@ -100,10 +100,12 @@ def main() -> None:
                         help="Print current world+odom pose and exit; don't send a goal.")
     parser.add_argument("--watch", type=float, default=10.0,
                         help="Seconds to poll for convergence (default 10).")
-    parser.add_argument("--pos-tol-mm", type=float, default=30.0,
-                        help="Position tolerance to declare arrival (default 30 mm).")
-    parser.add_argument("--yaw-tol-deg", type=float, default=2.0,
-                        help="Yaw tolerance to declare arrival (default 2°).")
+    parser.add_argument("--pos-tol-mm", type=float, default=100.0,
+                        help="Position tolerance to declare arrival (default 100 mm). "
+                             "Loose enough to absorb odom drift accumulated since the "
+                             "bridge's startup snapshot; restart the bridge for tighter.")
+    parser.add_argument("--yaw-tol-deg", type=float, default=5.0,
+                        help="Yaw tolerance to declare arrival (default 5°).")
     parser.add_argument("--robot-marker-calibration", type=str, default=None,
                         help="Path to T_B_C calibration JSON. Default: "
                              "sports_bot/optitrack/robot_marker_calibration.json")

@@ -583,6 +583,118 @@ rotates the quaternion through `R_WORLD_OPTI`, so
 `sai2::optitrack::rigid_body_ori::<id>` is genuinely in W. Both the
 calibration script and the bridge read this world-frame key directly.
 
+**Goals are in C-frame, not B-frame.** `sports_bot::cmd::base::goal_pose`
+is the desired world pose of the cart's **odometry control point C** (the
+pivot the TidyBot firmware reports about), not the marker centroid B. The
+bridge converts via `goal_R = T_W_R⁻¹ ⊕ goal_W` so the cart's C lands at
+`goal_W` in world. Reading the cart's "current world pose" for relative
+goals or convergence checks must therefore use
+`T_W_C = T_W_B ⊕ T_B_C`, **not** raw `sai2::optitrack::rigid_body_pos::<id>`
+(which is `T_W_B`). `send_base_goal.py` and the bridge's sanity print
+already do this; anything else querying "where is the cart in world" for
+control purposes should too.
+
+**Odom drift is the dominant accuracy limit across long sessions.**
+`T_W_R` is fixed at the bridge's startup snapshot. Wheel slip during
+extended driving (5+ m of cumulative travel) accumulates a few cm of
+drift between odom and OT, which shows up as a constant world-frame
+position offset on commanded goals. Fix is to either (a) restart the
+bridge mid-session (cheap), or (b) re-derive `T_W_R` per goal /
+continuously in the bridge (proper, not yet implemented — see "Open
+items"). The runtime sanity print Δ is exactly this drift; when it
+exceeds a few cm, restart the bridge for tighter accuracy.
+
+---
+
+## Day-to-day bringup (SRC Kitchen, TidyBot on `tidybot01`)
+
+Three machines/contexts in play, but they're all on the same Redis. As
+of 2026-05-19 the working setup is **Redis + streamer + driver + bridge
+all on the cart's mini-PC `tidybot01`** (so everything defaults to
+`localhost`).
+
+Known IDs:
+- PickleBall = Motive Streaming ID **8**
+- TidyBot rigid body = Motive Streaming ID **11**
+
+**Step 1 — Redis.**
+```bash
+redis-server
+# sanity: redis-cli ping → PONG
+```
+
+**Step 2 — OptiTrack streamer.**
+```bash
+cd ~/OpenSai/sports_bot/optitrack
+conda activate opensai
+PYTHONPATH=drivers/PythonClient python -u StreamDataSkeleton.py \
+    172.24.69.102 <tidybot01-IP> m
+# 'm' = multicast (default in Motive). 'u' = unicast if Motive ever flipped.
+```
+
+Sanity:
+```bash
+redis-cli get sai2::optitrack::rigid_body_pos::8     # ball
+redis-cli get sai2::optitrack::rigid_body_pos::11    # cart
+redis-cli get sai2::optitrack::rigid_body_ori::11    # cart quat in world
+```
+
+**Step 3 — TidyBot driver** (lives in `~/tidybot2/redis_driver.py`, its
+own conda env `tidybot2`):
+```bash
+cd ~/tidybot2
+conda activate tidybot2
+python redis_driver.py
+```
+
+The driver writes `hb1::desired_pose := hb1::current_pose` on startup,
+so the cart sits still until something writes a new goal.
+
+**Step 4 — base bridge.**
+```bash
+cd ~/OpenSai
+conda activate opensai           # NOT tidybot2 — the bridge needs scipy/redis from opensai
+# avoid lurching to a stale FSM goal left from a prior session
+redis-cli del sports_bot::cmd::base::goal_pose
+python sports_bot/base_bridge.py --robot-rigid-body-id 11
+# add --allow-nonzero-current-pose if the driver wasn't just restarted
+```
+
+Watch for the startup output: `T_W_R = (..., ..., ...°)` and the first
+sanity line should show Δ near zero. If jitter > a few mm at snapshot,
+something was moving — restart the bridge with the cart still.
+
+**Step 5 — send goals.** From a separate terminal in `~/OpenSai`:
+```bash
+conda activate opensai
+
+# read where the cart's control point is in world right now
+python sports_bot/scripts/send_base_goal.py --robot-rigid-body-id 11 --read
+
+# absolute goal: drive C to (1.0, 0.5) facing world +X
+python sports_bot/scripts/send_base_goal.py --robot-rigid-body-id 11 \
+    --x 1.0 --y 0.5 --yaw-deg 0
+
+# relative: from current C, +20 cm in world X, +10 cm in world Y, +15° yaw
+python sports_bot/scripts/send_base_goal.py --robot-rigid-body-id 11 \
+    --relative --x 0.20 --y 0.10 --yaw-deg 15
+```
+
+Default tolerances: 100 mm position, 5° yaw. Loose-on-purpose because
+single-session odom drift can be a few cm; tighten with
+`--pos-tol-mm 20 --yaw-tol-deg 2` right after a fresh bridge restart.
+
+**One-time T_B_C calibration** (already done — only redo if the markers
+get bumped or re-stuck):
+```bash
+python sports_bot/scripts/calibrate_robot_marker.py --robot-rigid-body-id 11
+# … drive 5 waypoints, mix rotation+translation … commit the JSON.
+```
+
+**Current calibration (SRC Kitchen, 2026-05-19):**
+`T_B_C = (-0.0351 m, +0.0086 m, -7.16°)`, RMS 3.71 mm / 0.37°,
+max per-waypoint residual 6.4 mm / 0.64°.
+
 ---
 
 ## Open items for integration
@@ -601,8 +713,25 @@ function now applies `R_WORLD_OPTI` to the quaternion via
 is honestly in world frame. Downstream consumers (base bridge, marker
 calibration) read this key directly instead of re-rotating raw OptiTrack
 quats themselves.
-- Make the FSM write to `hb1::desired_pose` instead of
-`sports_bot::cmd::base::goal_pose` (or add a one-line bridge).
+- ~~Make the FSM write to `hb1::desired_pose` instead of
+`sports_bot::cmd::base::goal_pose`~~ — superseded 2026-05-19. The FSM
+keeps writing world-frame goals to `sports_bot::cmd::base::goal_pose`;
+`base_bridge.py` translates to `hb1::desired_pose` (R-frame) using the
+persisted `T_B_C` + a per-session `T_W_R` snapshot. Two-key design
+preserved on purpose so the FSM doesn't have to know about the cart's
+session-start position.
+- **Re-derive `T_W_R` on goal change (or continuously) to kill odom
+drift.** Currently `T_W_R` is snapshot-once at bridge startup, so wheel
+slip over a session manifests as a constant world-frame position offset
+on subsequent goals. Two flavors of fix:
+  - *Per-goal refresh* — when a new `sports_bot::cmd::base::goal_pose`
+    arrives, read live `(T_W_B, T_R_C)` and recompute `T_W_R` before
+    converting. Eliminates drift between goals; drift during a single
+    move remains. ~5-line change, zero risk.
+  - *Closed-loop (every tick)* — recompute `T_W_R` every bridge
+    iteration and update `hb1::desired_pose` accordingly. Eliminates
+    intra-move drift too. Needs a small averaging / OT-dropout guard.
+  Worth doing before the FSM starts commanding the base for swings.
 - Decide PickleBall's permanent Streaming ID — easier to standardize on `1`
 in Motive than to keep passing `--optitrack-rigid-body-id 8` everywhere.
 - ~~Register laptop MAC addresses with Zen → static SRC IPs → switch
@@ -640,6 +769,41 @@ ifconfig en0 | awk '/inet / {print $2}'
 ---
 
 ## Change log
+
+- 2026-05-19 — **base-frame calibration captured on the cart + bridge
+  verified end-to-end.** Ran
+  `sports_bot/scripts/calibrate_robot_marker.py --robot-rigid-body-id 11`
+  on `tidybot01` with 5 well-spread waypoints (yaw spread 360°,
+  translation spread ~1.2 m, per-waypoint jitter < 0.1 mm). Solved
+  `T_B_C = (-0.0351 m, +0.0086 m, -7.16°)`, residual RMS 3.71 mm /
+  0.37°. Saved to
+  `sports_bot/optitrack/robot_marker_calibration.json`.
+
+  Then verified the bridge end-to-end with
+  `sports_bot/scripts/send_base_goal.py` (new this session — sends
+  absolute / relative world-frame goals and polls convergence). The
+  cart converges its odometry control point to commanded `goal_R` to
+  sub-mm precision in odom (confirmed via a watch loop on
+  `hb1::desired_pose` / `hb1::current_pose`), and world-frame
+  convergence matches `goal_W` to a few mm right after a fresh bridge
+  snapshot. Across a long session (~5 m of cumulative driving), odom
+  drift accumulated and produced ~80 mm of constant world-frame offset
+  on goals — fixed for now by restarting the bridge; "Open items"
+  carries the per-goal / closed-loop refresh as the proper fix.
+
+  Two bridge tweaks during bring-up:
+  - **Stale-goal lurch fix**: `base_bridge.run()` now seeds
+    `prev_goal_raw` with whatever's in `sports_bot::cmd::base::goal_pose`
+    at startup, so the first iteration doesn't forward a goal left over
+    from a previous test run. Before this, restarting the bridge could
+    immediately jerk the cart toward an old goal.
+  - **Convention clarified**: `goal_W` is the desired pose of the cart's
+    odometry control point C in world (matching what the bridge
+    naturally computes as `T_R_W ⊕ goal_W`), **not** the marker
+    centroid B. `send_base_goal.py` reads `T_W_C = T_W_B ⊕ T_B_C` for
+    both its "current pose" display and convergence checks so it's
+    consistent with the bridge. Resolved a confusing 45 mm "error"
+    that was really just B↔C offset.
 
 - 2026-05-19 — **base-frame calibration system landed.** Split the
   FSM↔TidyBot frame problem into two unknowns: `T_B_C` (geometric,
