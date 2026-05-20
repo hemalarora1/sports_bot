@@ -90,6 +90,7 @@ def _load_world_calibration(path):
         R, t = np.eye(3), np.zeros(3)
     return R, t
 
+# the calibrationv alues come from world_calibration.json. this is the transform from the optitrack frame to the world frame.
 R_WORLD_OPTI, T_WORLD_OPTI = _load_world_calibration(_CALIBRATION_FILE)
 
 def _opti_to_world_position(pos):
@@ -278,8 +279,8 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
 
     optionsDict = {}
-    optionsDict["clientAddress"] = "172.24.68.64"
-    optionsDict["serverAddress"] = "172.24.68.48"
+    optionsDict["clientAddress"] = "172.24.69.67"
+    optionsDict["serverAddress"] = "172.24.69.102"
     optionsDict["use_multicast"] = False
 
     # This will create a new NatNet client
