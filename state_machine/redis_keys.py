@@ -6,7 +6,7 @@ Two backends are supported:
                                  out of the box with the python_examples config
                                  files like single_panda.xml).
   ROBOT_BACKEND = "cs225a"   -> use the custom cs225a-style controller in
-                                 sports_bot/mmp_panda/controller.cpp, which
+                                 sports_bot/pickleball/controller.cpp, which
                                  exposes joint-level keys plus high-level
                                  racket goal keys we add on top.
 
@@ -75,7 +75,7 @@ class OpenSaiCartesianKeys:
 
 @dataclass(frozen=True)
 class Cs225aMmpPandaKeys:
-    """Joint-level interface to sports_bot/mmp_panda/controller.cpp plus the
+    """Joint-level interface to sports_bot/pickleball/controller.cpp plus the
     high-level racket / base goal keys the FSM expects the controller to read.
 
     These extra keys are NOT yet in controller.cpp; you'll add them in the C++

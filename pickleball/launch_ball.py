@@ -10,10 +10,10 @@ real cart.
 Examples:
 
     # default lob from opponent court toward the robot
-    python -m sports_bot.mmp_panda.launch_ball
+    python -m sports_bot.pickleball.launch_ball
 
     # custom shot: position [x y z], velocity [vx vy vz]
-    python -m sports_bot.mmp_panda.launch_ball \
+    python -m sports_bot.pickleball.launch_ball \
         --pos 5.0 0.3 1.7 --vel -6.0 -0.4 1.5
 """
 
@@ -26,7 +26,7 @@ import sys
 import redis
 
 
-# Keep these in sync with sports_bot/mmp_panda/redis_keys.h.
+# Keep these in sync with sports_bot/pickleball/redis_keys.h.
 BALL_LAUNCH_COUNTER_KEY  = "sports_bot::sim::ball::launch_counter"
 BALL_LAUNCH_POSE_KEY     = "sports_bot::sim::ball::launch_pose"
 BALL_LAUNCH_VELOCITY_KEY = "sports_bot::sim::ball::launch_velocity"

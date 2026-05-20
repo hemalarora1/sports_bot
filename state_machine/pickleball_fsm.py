@@ -324,11 +324,18 @@ class PickleballFSM:
         self._robot.write_base_goal(ready.base_pose)
         self._robot.write_racket_goal(ready.racket_position, ready.racket_orientation)
 
-        if pose_close(
+        settled = pose_close(
             racket_pos, ready.racket_position,
             racket_rot, ready.racket_orientation,
             self._cfg.fsm.pos_tol, self._cfg.fsm.ori_tol,
-        ):
+        )
+        timed_out = self._time_in_state() >= self._cfg.fsm.recover_max_s
+
+        if settled or timed_out:
+            if timed_out and not settled and self._cfg.fsm.verbose:
+                print(f"[FSM] RECOVER timed out after {self._cfg.fsm.recover_max_s:.1f}s "
+                      f"(pos err {np.linalg.norm(racket_pos - ready.racket_position):.3f} m); "
+                      f"forcing READY")
             self._plan = None
             self._t_predicted_impact = None
             self._tracker.reset()

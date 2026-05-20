@@ -1,11 +1,9 @@
 set(SPORTS_BOT_FOLDER "${CMAKE_CURRENT_SOURCE_DIR}")
 add_definitions(-DSPORTS_BOT_FOLDER="${SPORTS_BOT_FOLDER}")
 
-# Only mmp_panda is wired into the cs225a build right now; the panda and
-# my_project subdirs share executable target names with
-# cs225a/project_starter/{panda,my_project} and would clash if both trees are
-# included by the same parent CMakeLists. Re-enable the others by renaming
-# their executable targets first.
-add_subdirectory(mmp_panda)
-# add_subdirectory(panda)
-# add_subdirectory(my_project)
+# The pickleball/ subdir holds our actual implementation (sim, controller,
+# world URDF, run.sh, launcher). The panda/ and my_project/ folders at this
+# level are unmodified copies of cs225a/project_starter/{panda,my_project}
+# kept here for reference only — they're not built (and would collide with
+# the project_starter targets if added).
+add_subdirectory(pickleball)
