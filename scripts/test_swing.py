@@ -138,7 +138,8 @@ def main() -> None:
             sys.exit(1)
 
     cfg = PickleballConfig()
-    keys = RedisKeys(robot_backend="opensai")
+    from sports_bot.state_machine.redis_keys import OpenSaiCartesianKeys
+    keys = RedisKeys(robot_backend="opensai", opensai=OpenSaiCartesianKeys(robot_name="FrankaRobot"))
     planner = SwingPlanner(cfg.court, cfg.racket)
 
     strike_x = args.strike_x if args.strike_x is not None else cfg.court.strike_plane_x
