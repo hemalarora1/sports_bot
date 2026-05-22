@@ -216,6 +216,28 @@ def world_to_robot(goal_W: SE2, T_R_W: SE2) -> SE2:
 
 # ---------- Main loop ----------------------------------------------------------
 
+def _refresh_T_W_R(
+    r: redis.Redis,
+    rb_id: int,
+    T_B_C: SE2,
+) -> Optional[SE2]:
+    """Read live (T_W_B, T_R_C) and derive a fresh T_W_R.
+
+    Returns None if either pose is unavailable. A single-sample read is
+    enough here: OT position noise is sub-mm and yaw noise is fractions
+    of a degree, both well below the snapshot-residual error this is
+    meant to eliminate. Callers should fall back to the previous
+    T_W_R on None.
+    """
+    opti = _read_optitrack_pose_W(r, rb_id)
+    hb1 = _read_hb1_pose(r, HB1_CURRENT_POSE)
+    if opti is None or hb1 is None:
+        return None
+    T_W_B_now, _ = opti
+    T_R_C_now = hb1
+    return derive_T_W_R(T_W_B_now, T_B_C, T_R_C_now)
+
+
 def run(
     r: redis.Redis,
     rb_id: int,
@@ -223,13 +245,16 @@ def run(
     T_W_R: SE2,
     rate_hz: float,
     sanity_interval_s: float,
+    refresh_on_goal: bool = True,
 ) -> None:
     T_R_W = se2_inverse(T_W_R)
 
     print(f"[base_bridge] Bridging FSM goals → TidyBot at {rate_hz:.0f} Hz")
     print(f"[base_bridge]   {FSM_BASE_GOAL}  →  {HB1_DESIRED_POSE}")
     print(f"[base_bridge]   T_W_R = ({T_W_R[0]:+.4f}, {T_W_R[1]:+.4f}, "
-          f"{math.degrees(T_W_R[2]):+.2f}°)")
+          f"{math.degrees(T_W_R[2]):+.2f}°)  (startup snapshot)")
+    print(f"[base_bridge]   per-goal T_W_R refresh: "
+          f"{'ON' if refresh_on_goal else 'OFF'}")
     print()
 
     dt = 1.0 / rate_hz
@@ -256,6 +281,21 @@ def run(
             except (json.JSONDecodeError, TypeError, ValueError) as e:
                 print(f"[base_bridge] malformed goal in {FSM_BASE_GOAL}: {e}")
             else:
+                refresh_note = ""
+                if refresh_on_goal:
+                    T_W_R_fresh = _refresh_T_W_R(r, rb_id, T_B_C)
+                    if T_W_R_fresh is not None:
+                        dx_mm = 1000.0 * (T_W_R_fresh[0] - T_W_R[0])
+                        dy_mm = 1000.0 * (T_W_R_fresh[1] - T_W_R[1])
+                        dth_deg = math.degrees(wrap_angle(T_W_R_fresh[2] - T_W_R[2]))
+                        T_W_R = T_W_R_fresh
+                        T_R_W = se2_inverse(T_W_R)
+                        refresh_note = (
+                            f"  [T_W_R Δ=({dx_mm:+.1f},{dy_mm:+.1f}) mm, "
+                            f"{dth_deg:+.2f}°]"
+                        )
+                    else:
+                        refresh_note = "  [T_W_R refresh: missing OT/odom — kept prior]"
                 goal_R = world_to_robot(goal_W, T_R_W)
                 r.set(HB1_DESIRED_POSE, json.dumps(list(goal_R)))
                 print(
@@ -263,6 +303,7 @@ def run(
                     f"{math.degrees(goal_W[2]):+6.1f}°]  →  "
                     f"R=[{goal_R[0]:+.3f}, {goal_R[1]:+.3f}, "
                     f"{math.degrees(goal_R[2]):+6.1f}°]"
+                    f"{refresh_note}"
                 )
             prev_goal_raw = goal_raw
 
@@ -330,6 +371,15 @@ def main() -> None:
              "driver was started a while ago and the cart has since been moved; "
              "the snapshot still works as long as both readings are simultaneous.",
     )
+    parser.add_argument(
+        "--no-refresh-twr-on-goal", dest="refresh_on_goal",
+        action="store_false",
+        help="Disable per-goal T_W_R refresh. By default the bridge re-derives "
+             "T_W_R from live (T_W_B, T_R_C) on every new goal, which kills "
+             "the snapshot residual + accumulated odom drift between goals. "
+             "Disable for legacy behaviour (frozen startup snapshot).",
+    )
+    parser.set_defaults(refresh_on_goal=True)
     args = parser.parse_args()
 
     r = redis.Redis(host=args.redis_host, port=args.redis_port, decode_responses=True)
@@ -389,6 +439,7 @@ def main() -> None:
             T_B_C, T_W_R,
             rate_hz=args.rate_hz,
             sanity_interval_s=args.sanity_interval_s,
+            refresh_on_goal=args.refresh_on_goal,
         )
     except KeyboardInterrupt:
         print("\n[base_bridge] stopped.")
