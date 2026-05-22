@@ -145,6 +145,34 @@ def receive_rigid_body_frame( new_id, position, rotation ):
     redis_client.set(RIGID_BODY_ORI_KEY + str(new_id),
                      json.dumps([float(x) for x in world_rot]))
 
+
+# ---------- Per-marker (labeled) streaming ------------------------------------
+#
+# NatNet decomposes every labeled marker's 32-bit ID into (model_id, marker_id):
+# `model_id` is the asset / rigid body the marker belongs to (= the rigid body's
+# Streaming ID for asset markers, 0 for standalone), and `marker_id` is the
+# per-asset marker index assigned by Motive's Builder. Each cart marker on
+# rigid body 11 streams as (11, 1) ... (11, N).
+#
+# We publish per-marker world-frame positions so downstream consumers can pick
+# a subset of markers and derive their own auxiliary frames (e.g. the Franka
+# arm-base frame from 4 specific markers; see
+# sports_bot/utils/frames.py:compute_T_W_A_from_markers).
+
+MARKER_POS_KEY     = "sai2::optitrack::marker_pos::"          # ::<model_id>::<marker_id>
+MARKER_RAW_POS_KEY = "sai2::optitrack::raw::marker_pos::"     # ::<model_id>::<marker_id>
+
+
+def receive_labeled_marker(model_id, marker_id, position, residual_mm):
+    # Drop the per-frame residual silently for now — useful for diagnostics
+    # later if marker swaps become a problem. Position is in OT room frame.
+    suffix = f"{model_id}::{marker_id}"
+    redis_client.set(MARKER_RAW_POS_KEY + suffix,
+                     json.dumps([float(x) for x in position]))
+    world_pos = _opti_to_world_position(position)
+    redis_client.set(MARKER_POS_KEY + suffix,
+                     json.dumps(world_pos.tolist()))
+
 def receive_skeleton_frame(new_id, skeleton):
     
     # # Do timing 
@@ -304,6 +332,7 @@ if __name__ == "__main__":
     streaming_client.new_frame_listener = receive_new_frame
     streaming_client.rigid_body_listener = receive_rigid_body_frame
     streaming_client.skeleton_listener = receive_skeleton_frame
+    streaming_client.labeled_marker_listener = receive_labeled_marker
     
     # Set print level
     streaming_client.set_print_level(0)

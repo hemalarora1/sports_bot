@@ -83,6 +83,13 @@ class NatNetClient:
         self.rigid_body_listener = None
         self.skeleton_listener = None
         self.new_frame_listener  = None
+        # Set this to a callback to receive per-labeled-marker data at each frame.
+        # Signature: callback(model_id: int, marker_id: int, pos: (x, y, z),
+        #                     residual_mm: float). `model_id` is the rigid-body
+        # asset the marker belongs to (0 for unlabeled / standalone markers);
+        # `marker_id` is the per-asset marker index. See sports_bot/optitrack/
+        # StreamDataSkeleton.py for an example consumer.
+        self.labeled_marker_listener = None
 
         # Set Application Name
         self.__application_name = "Not Set"
@@ -678,6 +685,9 @@ class NatNetClient:
 
                 labeled_marker = MoCapData.LabeledMarker(tmp_id,pos,size,param, residual)
                 labeled_marker_data.add_labeled_marker(labeled_marker)
+
+                if self.labeled_marker_listener is not None:
+                    self.labeled_marker_listener(model_id, marker_id, pos, residual)
 
         return offset, labeled_marker_data
 
