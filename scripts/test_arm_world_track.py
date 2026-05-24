@@ -301,13 +301,31 @@ def _build_target_world_pose(
     keys: OpenSaiCartesianKeys,
     cal,
 ) -> SE3:
-    """Build the world-frame racket goal T_W_P_goal from the CLI flags."""
+    """Build the world-frame racket goal T_W_P_goal from the CLI flags.
+
+    Orientation policy
+    ------------------
+    When Redis is reachable (i.e. not --dry-run), we read the arm's current
+    EE pose and derive the current paddle world orientation via the forward
+    kinematic chain::
+
+        T_W_P = T_W_A ⊕ T_A_E ⊕ T_E_P
+
+    That orientation is used as R_W_P, regardless of --face-normal-*.  This
+    prevents a startup lurch: world_racket_to_arm_ee derives the EE *position*
+    from both the sweet-spot position AND its orientation, so a mismatched
+    orientation shifts the EE goal by up to 2×|t_EP| ≈ 0.70 m.
+
+    The --face-normal-* args are kept as a fallback for --dry-run (no Redis),
+    and they are still the orientation source for the old --from-current path
+    if the FK read somehow fails.
+    """
     face_normal = np.array([args.face_normal_x,
                             args.face_normal_y,
                             args.face_normal_z], dtype=float)
     if float(np.linalg.norm(face_normal)) < 1e-6:
         raise SystemExit("[arm_track] --face-normal vector is zero")
-    R_W_P = _R_world_racket_from_face_normal(face_normal)
+    R_W_P_synthesised = _R_world_racket_from_face_normal(face_normal)
 
     if args.from_current:
         if r is None:
@@ -335,8 +353,28 @@ def _build_target_world_pose(
         t_goal += np.array([args.offset_x, args.offset_y, args.offset_z])
         return (R_goal, t_goal)
 
+    # --target-* mode: position is fully specified; determine orientation.
     t_goal = np.array([args.target_x, args.target_y, args.target_z], dtype=float)
-    return (R_W_P, t_goal)
+
+    # Prefer live orientation from Redis — avoids a startup lurch caused by
+    # the world-up-heuristic roll in R_W_P_synthesised not matching the
+    # physical T_E_P mount roll.
+    if r is not None:
+        T_W_A = compute_T_W_A_from_markers(r, cal.marker_specs)
+        T_A_E = _read_T_A_E(r, keys)
+        if T_W_A is not None and T_A_E is not None:
+            T_W_E = se3_compose(T_W_A, T_A_E)
+            T_W_P_current = se3_compose(T_W_E, cal.T_E_P)
+            R_goal = T_W_P_current[0].copy()
+            print("[arm_track] using current paddle orientation to avoid "
+                  "startup lurch (face-normal synthesis would shift EE goal).")
+            return (R_goal, t_goal)
+        else:
+            print("[arm_track] WARNING: cannot read current EE pose — falling "
+                  "back to face-normal orientation (may cause startup motion).")
+
+    # Fallback (--dry-run or FK read failed): synthesised from --face-normal-*.
+    return (R_W_P_synthesised, t_goal)
 
 
 def main() -> None:

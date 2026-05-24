@@ -7,11 +7,18 @@ world-frame target and holds it, compensating for cart drift.
 
 Prompt usage
 ------------
-  x y z              move sweet spot to (x,y,z) world frame (absolute), face toward +X
-  x y z nx ny nz     same, with explicit face normal (nx, ny, nz)
-  r dx dy dz         move sweet spot by (dx,dy,dz) relative to current goal
-  r dx dy dz nx ny nz  relative move with explicit face normal
+  x y z              move sweet spot to (x,y,z) world frame; PRESERVE current orientation
+  x y z nx ny nz     same, with explicit face normal (nx,ny,nz); roll chosen by world-up
+  r dx dy dz         relative nudge from current goal; PRESERVE current orientation
+  r dx dy dz nx ny nz  relative nudge + explicit face normal
   q / quit           stop
+
+Orientation note
+----------------
+The script starts with the arm's **current** paddle orientation from Redis.
+Position-only commands (3 numbers) always preserve the current orientation —
+no orientation snap occurs. Only 6-number commands change the face normal, and
+roll is then filled by the world-up heuristic (keep paddle roughly upright).
 
 All units in metres, world frame:
   +X  toward opponent
@@ -20,17 +27,17 @@ All units in metres, world frame:
 
 Examples
 --------
-  # Interactive (default):
+  # Interactive (default — starts at current arm world pose):
   python sports_bot/scripts/cmd_arm_world.py
 
-  # Start at a specific position:
-  python sports_bot/scripts/cmd_arm_world.py --x 0.5 --y 0.0 --z 0.9
+  # Start at a specific XY position, read Z and orientation from current arm pose:
+  python sports_bot/scripts/cmd_arm_world.py --x 0.5 --y 0.0
 
-  # At the prompt — absolute then relative:
-  0.5 0.0 0.9          # go to world (0.5, 0, 0.9)
-  r 0.1 0 0            # nudge +10 cm in X
-  r 0 0 -0.05          # nudge -5 cm in Z
-  r 0 0.1 0 0 1 0      # nudge +10 cm in Y, change face to +Y
+  # At the prompt:
+  0.5 0.0 0.9          # go to world (0.5, 0, 0.9), keep orientation
+  r 0.1 0 0            # nudge +10 cm in X, keep orientation
+  r 0 0 -0.05          # nudge -5 cm in Z, keep orientation
+  0.5 0.0 0.9 0 1 0    # move + change face normal to world +Y
 
 Prereqs: Redis, OptiTrack streamer, Franka driver, OpenSai cartesian_controller.
 """
@@ -112,13 +119,21 @@ def _write_arm_goal(r: redis.Redis, keys: OpenSaiCartesianKeys, T_A_E: SE3) -> N
     r.set(keys.goal_linear_velocity, json.dumps([0.0, 0.0, 0.0]))
 
 
-def _parse_target(line: str) -> Optional[tuple[np.ndarray, np.ndarray, bool]]:
-    """Parse a position command. Returns (t_W_P, face_normal, is_relative) or None.
+def _parse_target(
+    line: str,
+) -> Optional[tuple[np.ndarray, Optional[np.ndarray], bool]]:
+    """Parse a position command.
+
+    Returns ``(t_W_P, face_normal_or_None, is_relative)``.
+
+    ``face_normal`` is ``None`` when the user gave only 3 numbers — the caller
+    should preserve the current paddle orientation rather than snapping to a
+    synthesised one.  A 6-number command provides an explicit face normal.
 
     Formats accepted:
-      x y z              absolute position, default face normal (+X)
+      x y z              absolute position, preserve current orientation
       x y z nx ny nz     absolute position, explicit face normal
-      r x y z            relative delta, default face normal
+      r x y z            relative delta, preserve current orientation
       r x y z nx ny nz   relative delta, explicit face normal
     """
     parts = line.split()
@@ -129,8 +144,7 @@ def _parse_target(line: str) -> Optional[tuple[np.ndarray, np.ndarray, bool]]:
     try:
         if len(nums) == 3:
             t = np.array([float(p) for p in nums])
-            n = np.array([1.0, 0.0, 0.0])
-            return t, n, relative
+            return t, None, relative       # face_normal=None → preserve orientation
         elif len(nums) == 6:
             t = np.array([float(p) for p in nums[:3]])
             n = np.array([float(p) for p in nums[3:]])
@@ -209,13 +223,24 @@ def run(
                     t_new, n_new, is_relative = parsed
                     if is_relative:
                         t_new = T_W_P_goal[1] + t_new
-                    T_W_P_goal = (_R_from_face_normal(n_new), t_new)
+                    if n_new is None:
+                        # Position-only command: preserve current orientation.
+                        # This is the common case — do NOT snap to a synthesised
+                        # face normal (that was the bug causing arm lurches).
+                        T_W_P_goal = (T_W_P_goal[0], t_new)
+                        ori_tag = "orientation preserved"
+                    else:
+                        # Explicit face normal given: synthesise orientation.
+                        # Roll is chosen by the world-up heuristic.
+                        T_W_P_goal = (_R_from_face_normal(n_new), t_new)
+                        ori_tag = (f"face_normal=[{n_new[0]:+.2f},"
+                                   f"{n_new[1]:+.2f},{n_new[2]:+.2f}]"
+                                   f" (roll from world-up heuristic)")
                     last_sent_t = None  # force immediate write to new target
                     tag = "relative→" if is_relative else ""
                     print(f"[cmd_arm] new target ({tag}world t="
                           f"[{t_new[0]:+.3f}, {t_new[1]:+.3f}, {t_new[2]:+.3f}])  "
-                          f"face_normal=[{n_new[0]:+.2f},{n_new[1]:+.2f},"
-                          f"{n_new[2]:+.2f}]")
+                          f"{ori_tag}")
                     _print_prompt()
         except queue.Empty:
             pass
@@ -307,9 +332,6 @@ def main() -> None:
     p.add_argument("--z", type=float, default=None,
                    help="Initial sweet-spot world Z (m). If omitted, uses "
                         "the arm's current world Z.")
-    p.add_argument("--face-normal-x", type=float, default=1.0)
-    p.add_argument("--face-normal-y", type=float, default=0.0)
-    p.add_argument("--face-normal-z", type=float, default=0.0)
     p.add_argument("--rate-hz", type=float, default=50.0)
     p.add_argument("--goal-deadband-mm", type=float, default=3.0,
                    help="Only write a new arm goal when the arm-frame position "
@@ -351,32 +373,26 @@ def main() -> None:
     print(f"[cmd_arm] arm base (world): t=[{T_W_A_init[1][0]:+.3f}, "
           f"{T_W_A_init[1][1]:+.3f}, {T_W_A_init[1][2]:+.3f}]")
 
-    # Build initial target — read current world pose for any coord not specified.
-    if args.x is None or args.y is None or args.z is None:
-        T_A_E = _read_T_A_E(r, keys)
-        if T_A_E is None:
-            print(f"[cmd_arm] cannot read EE pose — is OpenSai cartesian_controller "
-                  f"running on '{args.robot_name}'?")
-            sys.exit(1)
-        T_W_E = se3_compose(T_W_A_init, T_A_E)
-        T_W_P_current = se3_compose(T_W_E, cal.T_E_P)
-        t_current = T_W_P_current[1].copy()
-        t_init = np.array([
-            args.x if args.x is not None else t_current[0],
-            args.y if args.y is not None else t_current[1],
-            args.z if args.z is not None else t_current[2],
-        ])
-        # Use the current paddle orientation so the inverse-compose in the first
-        # loop tick yields exactly the current EE position — no startup lurch.
-        # (world_racket_to_arm_ee derives EE position from both sweet-spot
-        # position and orientation; a mismatched orientation shifts the EE goal
-        # by up to 2×|t_EP| = 0.70 m even when the position is correct.)
-        initial_T_W_P: SE3 = (T_W_P_current[0], t_init)
-    else:
-        t_init = np.array([args.x, args.y, args.z])
-        face_normal = np.array([args.face_normal_x, args.face_normal_y,
-                                args.face_normal_z])
-        initial_T_W_P = (_R_from_face_normal(face_normal), t_init)
+    # Build initial target — always read current EE pose to get the current
+    # paddle orientation.  This prevents a startup lurch: world_racket_to_arm_ee
+    # derives the EE position from both sweet-spot position AND orientation, so a
+    # mismatched orientation shifts the EE goal by up to 2×|t_EP| ≈ 0.70 m even
+    # when the position is exactly right.
+    T_A_E = _read_T_A_E(r, keys)
+    if T_A_E is None:
+        print(f"[cmd_arm] cannot read EE pose — is OpenSai cartesian_controller "
+              f"running on '{args.robot_name}'?")
+        sys.exit(1)
+    T_W_E = se3_compose(T_W_A_init, T_A_E)
+    T_W_P_current = se3_compose(T_W_E, cal.T_E_P)
+    t_current = T_W_P_current[1].copy()
+    t_init = np.array([
+        args.x if args.x is not None else t_current[0],
+        args.y if args.y is not None else t_current[1],
+        args.z if args.z is not None else t_current[2],
+    ])
+    # Always use the live paddle orientation — preserves arm posture.
+    initial_T_W_P: SE3 = (T_W_P_current[0], t_init)
 
     print(f"[cmd_arm] initial target: world t=[{t_init[0]:+.3f}, "
           f"{t_init[1]:+.3f}, {t_init[2]:+.3f}]")
@@ -386,9 +402,10 @@ def main() -> None:
           f"z∈[{args.z_min_m:+.2f},{args.z_max_m:+.2f}]m (arm frame)")
     print()
     print("Commands (all metres, world frame):")
-    print("  x y z              — absolute position, face toward +X")
-    print("  x y z nx ny nz     — absolute position, explicit face normal")
-    print("  r dx dy dz         — relative nudge from current goal")
+    print("  x y z              — absolute position, PRESERVE current orientation")
+    print("  x y z nx ny nz     — absolute position + explicit face normal")
+    print("                       (roll filled by world-up heuristic)")
+    print("  r dx dy dz         — relative nudge, PRESERVE current orientation")
     print("  r dx dy dz nx ny nz — relative nudge + new face normal")
     print("  q / quit           — exit (last goal stays in Redis)")
 
