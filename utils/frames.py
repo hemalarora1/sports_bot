@@ -100,7 +100,10 @@ def R_to_quat(R: np.ndarray) -> Tuple[float, float, float, float]:
 def rotate_quat(R_target_source: np.ndarray, quat_source: Sequence[float]) -> Tuple[float, float, float, float]:
     """Rotate a quaternion by a fixed rotation matrix. If `quat_source` expresses
     a body's orientation in frame S, and R_target_source maps S → T, this
-    returns the same body's orientation in frame T."""
+    returns the same body's orientation in frame T.
+
+    Used by StreamDataSkeleton.py to convert raw Motive-room-frame rigid body
+    quaternions into world-frame ones via the world calibration."""
     R_S_B = quat_to_R(quat_source[0], quat_source[1], quat_source[2], quat_source[3])
     R_T_B = R_target_source @ R_S_B
     return R_to_quat(R_T_B)
@@ -305,28 +308,6 @@ def average_angles(angles: Sequence[float]) -> float:
     return math.atan2(s, c)
 
 
-def average_quats(quats: Sequence[Sequence[float]]) -> Tuple[float, float, float, float]:
-    """Hemisphere-aligned mean of a list of (qx, qy, qz, qw) quaternions, then
-    renormalized. Accurate for small angular spread (< few degrees) — which is
-    the regime when averaging a held-still OptiTrack capture. Returns the mean
-    quaternion as (qx, qy, qz, qw)."""
-    arr = np.asarray(quats, dtype=float)
-    if arr.ndim != 2 or arr.shape[1] != 4 or arr.shape[0] == 0:
-        raise ValueError(f"average_quats expects (N, 4) input, got {arr.shape}")
-    ref = arr[0].copy()
-    # Flip any quat in the opposite hemisphere so the linear mean is meaningful.
-    for i in range(1, arr.shape[0]):
-        if float(np.dot(arr[i], ref)) < 0.0:
-            arr[i] = -arr[i]
-    mean = np.mean(arr, axis=0)
-    n = float(np.linalg.norm(mean))
-    if n < 1e-12:
-        # Antipodal samples cancelled out — fall back to the first sample.
-        return float(ref[0]), float(ref[1]), float(ref[2]), float(ref[3])
-    mean = mean / n
-    return float(mean[0]), float(mean[1]), float(mean[2]), float(mean[3])
-
-
 # ---------- SE(3) algebra ------------------------------------------------------
 
 def _skew(v: np.ndarray) -> np.ndarray:
@@ -382,10 +363,6 @@ def axis_angle_from_R(R: np.ndarray) -> np.ndarray:
                              R[1, 0] - R[0, 1]])
 
 
-def se3_identity() -> SE3:
-    return (np.eye(3), np.zeros(3))
-
-
 def se3_compose(a: SE3, b: SE3) -> SE3:
     """Pose composition: T_a ⊕ T_b. Same semantics as se2_compose — if
     T_a is X-in-Y and T_b is Z-in-X, the result is Z-in-Y."""
@@ -405,122 +382,7 @@ def se3_apply_point(T: SE3, p: Sequence[float]) -> np.ndarray:
     return R @ np.asarray(p, dtype=float) + t
 
 
-def se3_from_xi(xi: np.ndarray) -> SE3:
-    """Pack a 6-vector (tx, ty, tz, ωx, ωy, ωz) into an SE(3) element. Uses
-    the *decoupled* parameterization t-separate-from-axis-angle (NOT the
-    matrix exponential / twist). This is the parameterization the LM solver
-    uses; matches `se3_to_xi`."""
-    t = np.asarray(xi[:3], dtype=float)
-    R = R_from_axis_angle(np.asarray(xi[3:6], dtype=float))
-    return (R, t)
-
-
-def se3_to_xi(T: SE3) -> np.ndarray:
-    """Inverse of se3_from_xi: SE(3) → 6-vec (tx, ty, tz, ωx, ωy, ωz)."""
-    R, t = T
-    omega = axis_angle_from_R(R)
-    return np.concatenate([np.asarray(t, dtype=float), omega])
-
-
-def se3_from_se2(T2: SE2, z: float = 0.0) -> SE3:
-    """Lift an SE(2) element (x, y, theta) to SE(3) at height `z`, with
-    rotation about world +Z. Used to compose the SE(2) cart-frame transforms
-    (T_B_C, T_W_C) with full-3D arm transforms."""
-    x, y, th = T2
-    c, s = math.cos(th), math.sin(th)
-    R = np.array([
-        [c, -s, 0.0],
-        [s,  c, 0.0],
-        [0.0, 0.0, 1.0],
-    ])
-    t = np.array([x, y, z])
-    return (R, t)
-
-
-# ---------- Hand-eye 3D solver -------------------------------------------------
-
-def solve_hand_eye_se3(
-    samples: Sequence[Tuple[SE3, SE3]],
-    *,
-    initial: Optional[Tuple[SE3, SE3]] = None,
-) -> Tuple[SE3, SE3, float, float]:
-    """Solve T_W_A and T_E_P jointly from a list of pose pairs (T_A_E_i, T_W_P_i).
-
-    The constraint at every sample is
-
-        T_W_A  ⊕  T_A_E_i  ⊕  T_E_P  =  T_W_P_i
-
-    Stacks 6·N residuals (3 position + 3 axis-angle per sample) and minimises
-    via Levenberg-Marquardt over the 12 unknowns (T_W_A, T_E_P), each
-    parameterized as (tx, ty, tz, ωx, ωy, ωz) per se3_from_xi.
-
-    `samples[i] = (T_A_E_i, T_W_P_i)`.
-
-    Returns: (T_W_A, T_E_P, pos_rms_m, ori_rms_deg).
-
-    Requires ≥3 samples with reasonable rotational *and* translational
-    diversity. Pure translation across samples leaves T_E_P's rotation
-    underdetermined (the racket rolls with the EE consistently in every
-    sample); pure rotation underdetermines its translation.
-    """
-    try:
-        from scipy.optimize import least_squares
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError(
-            "solve_hand_eye_se3 needs scipy.optimize. "
-            "Install scipy or activate the opensai conda env."
-        ) from exc
-
-    if len(samples) < 3:
-        raise ValueError(f"need ≥3 samples, got {len(samples)}")
-
-    def residuals(params: np.ndarray) -> np.ndarray:
-        T_W_A = se3_from_xi(params[:6])
-        T_E_P = se3_from_xi(params[6:12])
-        out = np.empty(6 * len(samples))
-        for i, (T_A_E, T_W_P_meas) in enumerate(samples):
-            T_W_P_pred = se3_compose(se3_compose(T_W_A, T_A_E), T_E_P)
-            R_pred, t_pred = T_W_P_pred
-            R_meas, t_meas = T_W_P_meas
-            out[6 * i + 0:6 * i + 3] = t_pred - t_meas
-            # Rotation residual: axis-angle of R_err = R_pred · R_meas⁻¹,
-            # which is near identity when the prediction matches.
-            R_err = R_pred @ R_meas.T
-            out[6 * i + 3:6 * i + 6] = axis_angle_from_R(R_err)
-        return out
-
-    # Initial guess: assume T_E_P = identity and back-solve T_W_A from sample 0.
-    # If the racket frame happens to be near-identity in EE (as it should be
-    # when we set the Motive pivot at the sweet spot with +Z = face normal),
-    # this is already very close.
-    if initial is not None:
-        T_W_A_init, T_E_P_init = initial
-    else:
-        T_A_E_0, T_W_P_0 = samples[0]
-        T_W_A_init = se3_compose(T_W_P_0, se3_inverse(T_A_E_0))
-        T_E_P_init = se3_identity()
-    x0 = np.concatenate([se3_to_xi(T_W_A_init), se3_to_xi(T_E_P_init)])
-
-    result = least_squares(residuals, x0, method="lm", max_nfev=400)
-    T_W_A = se3_from_xi(result.x[:6])
-    T_E_P = se3_from_xi(result.x[6:12])
-
-    r = result.fun.reshape(-1, 6)
-    pos_rms = float(np.sqrt(np.mean(r[:, :3] ** 2)))
-    ori_rms_deg = float(np.degrees(np.sqrt(np.mean(r[:, 3:] ** 2))))
-    return T_W_A, T_E_P, pos_rms, ori_rms_deg
-
-
-# ---------- Arm calibration file I/O ------------------------------------------
-
-def arm_calibration_path() -> str:
-    """Conventional location next to robot_marker_calibration.json."""
-    return os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "optitrack",
-        "arm_calibration.json",
-    )
-
+# ---------- SE(3) <-> JSON helpers --------------------------------------------
 
 def _se3_to_dict(T: SE3) -> dict:
     R, t = T
@@ -541,66 +403,20 @@ def _se3_from_dict(d: dict) -> SE3:
     return (R, t)
 
 
-def save_arm_calibration(
-    path: str,
-    T_C_A: SE3,
-    T_E_P: SE3,
-    metadata: Optional[dict] = None,
-) -> None:
-    """Persist the two static arm transforms.
-
-    T_C_A : SE(3) offset from cart odom control-point frame C to Franka arm
-            base frame A. Re-solve when the arm gets re-mounted on the cart.
-    T_E_P : SE(3) offset from Franka end-effector frame E (whatever OpenSai's
-            cartesian_task reports) to the racket sweet-spot frame P
-            (origin = paddle sweet spot, +Z = face normal, per SwingPlanner
-            convention). Re-solve when the racket gets re-mounted or the
-            paddle's OptiTrack rigid body is rebuilt.
-    """
-    payload = {
-        "T_C_A": _se3_to_dict(T_C_A),
-        "T_E_P": _se3_to_dict(T_E_P),
-        "comment": (
-            "Static arm-mount + racket-mount transforms for the sports_bot rig. "
-            "T_C_A = cart odometry control point C → Franka arm base A. "
-            "T_E_P = Franka EE flange E → racket sweet-spot P (with +Z_P = "
-            "paddle face normal, matching SwingPlanner convention). Both are "
-            "solved jointly via SE(3) hand-eye in "
-            "scripts/calibrate_arm_to_cart.py from N (T_A_E, T_W_P) snapshots "
-            "captured while the cart sits still and the arm visits a tour of "
-            "joint waypoints. The script back-solves T_C_A from T_W_A using "
-            "T_W_C = T_W_B ⊕ T_B_C at calibration time."
-        ),
-    }
-    if metadata:
-        payload.update(metadata)
-    with open(path, "w") as f:
-        json.dump(payload, f, indent=2)
-
-
-def load_arm_calibration(path: str) -> Tuple[SE3, SE3]:
-    """Returns (T_C_A, T_E_P)."""
-    with open(path, "r") as f:
-        data = json.load(f)
-    return _se3_from_dict(data["T_C_A"]), _se3_from_dict(data["T_E_P"])
-
-
-# ---------- Marker-based arm calibration (lightweight alternative) ------------
-#
-# Instead of solving for T_C_A via SE(3) hand-eye, we exploit the fact that the
-# cart has labeled OptiTrack markers in known positions relative to the Franka
-# arm base. A subset of those markers (4 by default) is averaged to give the
-# arm base TRANSLATION in world; the cart rigid body's orientation is reused
-# (with an optional constant correction) for the arm base ORIENTATION. T_E_P
-# (flange → racket sweet spot) is supplied by mechanical measurement.
+# Arm base pose T_W_A is derived live from two labeled OptiTrack markers on
+# the cart, placed equidistantly on the left (-Y) and right (+Y) sides of the
+# Franka base. The midpoint of the marker pair = arm base origin; the pair
+# direction = Franka +Y; world +Z (flat-floor assumption) = Franka +Z;
+# Franka +X = Y × Z closes the right-handed frame.
 #
 # Schema persisted to `sports_bot/optitrack/arm_marker_calibration.json`:
 #
 #   {
-#     "marker_specs":   [[model_id, marker_id], ...],   # which markers define the arm base
-#     "cart_rigid_body_id": <int>,                       # for the orientation lookup
-#     "R_cart_to_arm":  [[3x3 rotation]],                # constant cart-rb-frame → arm-base-frame
-#     "T_E_P":          {translation_m, rotation_matrix} # measured / CAD'd, racket sweet spot
+#     "marker_specs": [[model_id, marker_id], [model_id, marker_id]],
+#                     # exactly 2 specs; spec[0] on -Y side, spec[1] on +Y side
+#                     # (i.e. vector spec[0]→spec[1] = Franka +Y)
+#     "T_E_P":        {translation_m, rotation_matrix}
+#                     # measured / CAD'd EE flange → racket sweet spot
 #   }
 
 MarkerSpec = Tuple[int, int]   # (model_id, marker_id) — as decoded by NatNetClient
@@ -630,70 +446,49 @@ def read_marker_position_W(
     return np.array([float(p[0]), float(p[1]), float(p[2])])
 
 
-def read_marker_centroid_W(
-    r,
-    specs: Sequence[MarkerSpec],
-    *,
-    min_visible: Optional[int] = None,
-) -> Optional[np.ndarray]:
-    """Centroid (mean) of N labeled marker world positions. Returns None if
-    fewer than `min_visible` markers are currently published; defaults to
-    requiring all of them, since a missing marker biases the centroid in a
-    way the runtime usually can't recover from."""
-    if min_visible is None:
-        min_visible = len(specs)
-    positions = []
-    for spec in specs:
-        p = read_marker_position_W(r, spec)
-        if p is not None:
-            positions.append(p)
-    if len(positions) < min_visible:
-        return None
-    return np.mean(np.asarray(positions), axis=0)
-
-
-def _read_cart_orientation_W(r, cart_rb_id: int) -> Optional[np.ndarray]:
-    """Read the cart rigid body's world-frame rotation as a 3x3 matrix from
-    `sai2::optitrack::rigid_body_ori::<id>` (which is a quaternion). Returns
-    None if the key is missing."""
-    raw = r.get(f"sai2::optitrack::rigid_body_ori::{int(cart_rb_id)}")
-    if raw is None:
-        return None
-    try:
-        q = json.loads(raw)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None
-    if len(q) != 4:
-        return None
-    return quat_to_R(float(q[0]), float(q[1]), float(q[2]), float(q[3]))
-
-
 def compute_T_W_A_from_markers(
     r,
     specs: Sequence[MarkerSpec],
-    cart_rb_id: int,
-    *,
-    R_cart_to_arm: Optional[np.ndarray] = None,
-    min_visible: Optional[int] = None,
 ) -> Optional[SE3]:
-    """Live arm base pose T_W_A, derived from:
-      - translation : centroid of the `specs` marker positions in world frame
-      - rotation    : cart rigid body's R_W_B, post-multiplied by an optional
-                      constant `R_cart_to_arm` to align the cart-rb local axes
-                      with Franka base axes.
+    """Live arm base pose T_W_A from a 2-marker spec.
 
-    Returns None if the markers or the cart rigid body aren't currently
-    visible (caller should retry / fall back to previous estimate).
+    Translation: midpoint (centroid) of the two markers in world frame —
+                 this is the *origin* of the returned arm-base frame.
+    Rotation:    Franka +Y = horiz_project(p_spec1 − p_spec0); Franka +Z =
+                 world +Z (flat-floor upright-arm assumption); Franka +X =
+                 Y × Z closes the right-handed frame.
+
+    Returns None if either marker isn't currently visible, or if the two
+    markers are stacked vertically (degenerate Franka +Y).
     """
-    t_W_A = read_marker_centroid_W(r, specs, min_visible=min_visible)
-    if t_W_A is None:
+    if len(specs) != 2:
+        raise ValueError(
+            f"compute_T_W_A_from_markers expects exactly 2 marker specs, "
+            f"got {len(specs)}"
+        )
+    p0 = read_marker_position_W(r, specs[0])
+    p1 = read_marker_position_W(r, specs[1])
+    if p0 is None or p1 is None:
         return None
-    R_W_B = _read_cart_orientation_W(r, cart_rb_id)
-    if R_W_B is None:
+
+    # Centroid → arm base origin.
+    t_W_A = 0.5 * (p0 + p1)
+
+    # Pair direction → Franka +Y (after horizontal projection so a slight Z
+    # mismatch between the two spheres doesn't tilt the inferred +Y axis).
+    y_raw = p1 - p0
+    z_world = np.array([0.0, 0.0, 1.0])
+    y_horiz = y_raw - float(np.dot(y_raw, z_world)) * z_world
+    ny = float(np.linalg.norm(y_horiz))
+    if ny < 1e-6:
+        # Markers stacked vertically — can't recover Franka +Y this way.
         return None
-    if R_cart_to_arm is None:
-        R_cart_to_arm = np.eye(3)
-    R_W_A = R_W_B @ R_cart_to_arm
+    y_hat = y_horiz / ny
+    z_hat = z_world
+    # Right-handed: X = Y × Z.
+    x_hat = np.cross(y_hat, z_hat)
+    R_W_A = np.column_stack([x_hat, y_hat, z_hat])
+
     return (R_W_A, t_W_A)
 
 
@@ -712,28 +507,34 @@ def save_arm_marker_calibration(
     path: str,
     *,
     marker_specs: Sequence[MarkerSpec],
-    cart_rigid_body_id: int,
-    R_cart_to_arm: np.ndarray,
     T_E_P: SE3,
     metadata: Optional[dict] = None,
 ) -> None:
+    """Persist the marker-based arm calibration. `marker_specs` must have
+    exactly 2 entries: spec[0] on the -Y side of the Franka base, spec[1] on
+    the +Y side (i.e. vector spec[0]→spec[1] is treated as Franka +Y).
+    `T_E_P` is the measured EE flange → racket sweet-spot transform."""
+    if len(marker_specs) != 2:
+        raise ValueError(
+            f"save_arm_marker_calibration: marker_specs must have exactly 2 "
+            f"entries (spec[0] on -Y side, spec[1] on +Y side; vector "
+            f"spec[0]→spec[1] = Franka +Y), got {len(marker_specs)}."
+        )
     payload = {
         "comment": (
             "Marker-based arm calibration for the sports_bot rig. Arm base "
-            "position T_W_A is computed live as the centroid of `marker_specs` "
+            "origin T_W_A.t is the midpoint of the two markers in marker_specs "
             "(world-frame positions published by StreamDataSkeleton.py). "
-            "Orientation is taken from cart rigid body `cart_rigid_body_id` "
-            "via its rigid_body_ori key, post-multiplied by `R_cart_to_arm` "
-            "to handle any constant rotation between the cart-rb local frame "
-            "and the Franka arm base frame. T_E_P is the static EE→racket "
-            "sweet-spot transform (measured, not solved) used by the "
-            "SwingPlanner."
+            "Arm base orientation: spec[0] on the -Y side of the Franka base, "
+            "spec[1] on the +Y side, so vector spec[0]→spec[1] is treated as "
+            "Franka +Y (after horizontal projection); world +Z is Franka +Z "
+            "(assumes upright cart); Franka +X = Y × Z closes the right-handed "
+            "frame. T_E_P is the measured EE flange → racket sweet-spot "
+            "transform used by the SwingPlanner."
         ),
         "marker_specs": [
             [int(spec[0]), int(spec[1])] for spec in marker_specs
         ],
-        "cart_rigid_body_id": int(cart_rigid_body_id),
-        "R_cart_to_arm": [[float(v) for v in row] for row in R_cart_to_arm],
         "T_E_P": _se3_to_dict(T_E_P),
     }
     if metadata:
@@ -746,8 +547,6 @@ def save_arm_marker_calibration(
 class ArmMarkerCalibration:
     """Materialized form of the arm-marker calibration."""
     marker_specs: List[MarkerSpec]
-    cart_rigid_body_id: int
-    R_cart_to_arm: np.ndarray
     T_E_P: SE3
 
 
@@ -755,15 +554,13 @@ def load_arm_marker_calibration(path: str) -> ArmMarkerCalibration:
     with open(path, "r") as f:
         data = json.load(f)
     specs = [(int(s[0]), int(s[1])) for s in data["marker_specs"]]
-    R_cart_to_arm = np.asarray(data.get("R_cart_to_arm", np.eye(3).tolist()),
-                               dtype=float)
-    if R_cart_to_arm.shape != (3, 3):
-        raise ValueError(f"R_cart_to_arm has shape {R_cart_to_arm.shape}, "
-                         f"expected (3, 3)")
+    if len(specs) != 2:
+        raise ValueError(
+            f"{path}: marker_specs must have exactly 2 entries, got "
+            f"{len(specs)}."
+        )
     return ArmMarkerCalibration(
         marker_specs=specs,
-        cart_rigid_body_id=int(data["cart_rigid_body_id"]),
-        R_cart_to_arm=R_cart_to_arm,
         T_E_P=_se3_from_dict(data["T_E_P"]),
     )
 
