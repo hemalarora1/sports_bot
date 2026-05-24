@@ -9,58 +9,46 @@ unless something is wrong. Each section has a date so we can see what's fresh.
 
 ```
 Motive PC (bay)  ──NatNet UDP──▶  StreamDataSkeleton.py  ──redis.set──▶  Redis
-                                  (NatNet client, your                   sai2::optitrack::
-                                   laptop or mini-PC)                    rigid_body_pos::<id>
-                                                                              │
-                                                                              ▼
+                                  (NatNet client,                         sai2::optitrack::
+                                   laptop or mini-PC)                     rigid_body_pos::<id>
+                                                                               │
+                                                                               ▼
 Redis  ◀──get──  pickleball_fsm.py  (BallTracker reads ball pose;
                                      SwingPlanner plans a hit;
                                      writes racket+base goals)
-                                                                              │
-                                                                              ▼
+                                                                               │
+                                                                               ▼
 Redis  ──get──▶  OpenSai (mini-PC)            ──torques──▶  Franka arm
        ──get──▶  TidyBot redis_driver.py      ──vel──────▶  mobile base
-                 (consumes hb1::desired_pose)
 ```
 
-Two parties only talk through Redis. Bringing up streaming, the FSM, or the controller
-side independently is fine — that's the whole point of the bus.
+Two parties only talk through Redis.
 
 ---
 
 ## Quick start: see the ball position on your laptop
 
-Setup as of 2026-05-19: laptop on **SRC wifi** with static IP `172.24.68.204`,
-Motive Kitchen PC in **multicast** mode. Run from the laptop:
+Setup as of 2026-05-19: laptop on **SRC wifi**, static IP `172.24.68.204`, Motive Kitchen PC in **multicast** mode.
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/sports_bot/optitrack"
 conda activate opensai
 PYTHONPATH=drivers/PythonClient python -u StreamDataSkeleton.py \
-    172.24.69.102        \
-    172.24.68.204        \
-    m                    # 'u' = unicast, 'm' = multicast
+    172.24.69.102 172.24.68.204 m    # 'm'=multicast, 'u'=unicast
 ```
 
-Or — preferred — just use the recorder wrapper which brings the streamer up
-itself and tears it down on exit:
+Preferred — recorder wrapper (starts streamer, tears it down on exit):
 
 ```bash
 ./sports_bot/scripts/record_throws.sh                   # defaults: multicast, ID 8
 STREAMER_MODE=u ./sports_bot/scripts/record_throws.sh   # only if Motive is in Unicast
 ```
 
-Live view of every rigid body Redis is publishing (second terminal):
+Live view of all rigid bodies in Redis:
 
 ```bash
-while true; do
-  clear
-  printf '=== %s ===\n' "$(date '+%H:%M:%S.%3N')"
-  for k in $(redis-cli --scan --pattern 'sai2::optitrack::rigid_body_pos::*' | sort); do
-    printf '%-50s %s\n' "$k" "$(redis-cli get "$k")"
-  done
-  sleep 0.1
-done
+./sports_bot/scripts/watch_ball.sh          # all rigid bodies
+./sports_bot/scripts/watch_ball.sh 8        # just the pickleball
 ```
 
 To get your laptop's IP: `ifconfig en0 | grep "inet "`.
@@ -69,1162 +57,344 @@ To get your laptop's IP: `ifconfig en0 | grep "inet "`.
 
 ## Network & ports
 
+| Item                   | Value           | Notes                                                       |
+| ---------------------- | --------------- | ----------------------------------------------------------- |
+| Kitchen Motive server  | `172.24.69.102` | Other bays have different IPs.                              |
+| NatNet command port    | `1510`          | UDP, bidirectional. Survives cross-subnet routing.          |
+| NatNet data port       | `1511`          | UDP. Multicast group `239.255.42.99:1511`.                  |
+| VRPN port              | `3883`          | Different protocol, disabled. Often confused with NatNet.   |
 
-| Item                   | Value           | Notes                                                                                                       |
-| ---------------------- | --------------- | ----------------------------------------------------------------------------------------------------------- |
-| Kitchen Motive server  | `172.24.69.102` | from src_mocap/README. Other bays have different IPs.                                                       |
-| NatNet command port    | `1510`          | UDP, bidirectional. Survives cross-subnet routing.                                                          |
-| NatNet data port       | `1511`          | UDP. In multicast, listened to on `239.255.42.99:1511`.                                                     |
-| NatNet multicast group | `239.255.42.99` | Default. Multicast does NOT route across subnets.                                                           |
-| VRPN port              | `3883`          | A *different* protocol. Disabled in Motive currently. The UI puts it next to NatNet which causes confusion. |
-
-
-**Stanford wifi → SRC subnet routing:** unicast UDP works (we get ~8 ms ping to
-`172.24.69.102`). Multicast does **not** — multicast packets stay inside the L2
-domain of the SRC switch.
-
-If you want multicast (the supported long-term path), you need:
-
-1. Your laptop's MAC registered with Zen (`zyaskawa@stanford.edu`) to get a static
-  IP on the SRC subnet, **and**
-2. To be associated with the `SRC` wifi SSID.
+**Multicast does NOT route across subnets** — requires laptop MAC registered with Zen (`zyaskawa@stanford.edu`) for a static SRC IP and association with `SRC` wifi SSID. Stanford wifi → unicast only.
 
 ---
 
 ## NatNet protocol cheatsheet
 
-NatNet has **two independent UDP channels**:
+Two independent UDP channels:
+- **Command (`:1510`)** — bidirectional unicast. Handshakes, DataDescriptions (names+IDs). Always works cross-subnet.
+- **Data (`:1511`)** — server→client per-frame positions. Multicast (same subnet only) or unicast (routes anywhere), set in Motive's Streaming → Transmission Type.
 
-- **Command channel (`:1510`)** — bidirectional unicast. Handshakes, queries,
-DataDescriptions ("list of rigid bodies + names + IDs"). Always works
-cross-subnet.
-- **Data channel (`:1511`)** — server → client, per-frame rigid body / marker /
-skeleton data. Delivered as either **multicast** (one copy on the wire, same
-subnet only) or **unicast** (one copy per client, routes anywhere). Picked in
-Motive's Streaming → Transmission Type.
-
-If you can `nc` the command port and get DataDescriptions back but no positions
-ever arrive, it's almost always the data channel: server is multicasting and you
-can't hear the group.
-
-The per-frame stream carries **numeric IDs**, not names. Names live in
-DataDescriptions, which is fetched separately. That's why a frame-level viewer
-shows `rigid_body 8` instead of `PickleBall`.
+If command channel works but no positions arrive: data channel mismatch (server multicasting, client can't hear). Per-frame stream carries **numeric IDs** only; names come from DataDescriptions fetched separately.
 
 ---
 
 ## Motive configuration (Kitchen, as of 2026-05-19)
 
-- Streaming → NatNet — **enabled**, Transmission Type **Multicast** (group
-`239.255.42.99`, data port `1511`). Switched back from Unicast on
-2026-05-19 once Zen issued a static SRC IP for the laptop
-(`172.24.68.204`).
-- Streaming → VRPN — disabled. Its "Broadcast Port: 3883" is a red herring; it
-belongs to VRPN, not NatNet.
-- Assets pane — `PickleBall` rigid body, **Streaming ID = 8**. (Default Streaming
-ID is the asset's row position in the pane. Can be overridden in the asset's
-Properties → User Data field.)
-- KVM access for the Kitchen Motive PC: `SRC-KVM-Kitchen.stanford.edu`. Credentials
-from Zen.
+- Streaming → NatNet — **enabled**, Transmission Type **Multicast** (group `239.255.42.99`, port `1511`).
+- Streaming → VRPN — disabled.
+- Streaming → **Labeled Markers — enabled** (required for `marker_pos::*` keys).
+- Assets: `PickleBall` rigid body, **Streaming ID = 8**; TidyBot cart, **Streaming ID = 11**.
+- KVM access: `SRC-KVM-Kitchen.stanford.edu`. Credentials from Zen.
 
-**Heads up:** multicast packets stay inside the L2 domain of the SRC switch —
-they do **not** route across subnets. The laptop must be associated with SRC
-wifi *and* using its registered static IP for multicast to work. If you ever
-need to record from Stanford-wifi again (off-subnet), flip Motive's
-Transmission Type to Unicast and run the streamer with `STREAMER_MODE=u`.
+**Critical gotcha — display vs streaming Up Axis are independent.** `View → Up Axis` is cosmetic; `Edit → Application Settings → Streaming → Up Axis` controls what NatNet publishes. These can silently disagree. Always confirm *streaming* is Z-up at session start. Sanity check: place ball on origin floor marker, read `sai2::optitrack::raw::rigid_body_pos::8` — the Z component should be small (~ball radius).
 
 ---
 
 ## Redis key schema
 
-Published by `StreamDataSkeleton.py` (per rigid body per frame, ~120 Hz):
+Published by `StreamDataSkeleton.py` (~120 Hz):
 
+| Key                                                         | Format                  | Frame              |
+| ----------------------------------------------------------- | ----------------------- | ------------------ |
+| `sai2::optitrack::rigid_body_pos::<id>`                     | JSON `[x, y, z]`        | World (calibrated) |
+| `sai2::optitrack::rigid_body_ori::<id>`                     | JSON `[qx, qy, qz, qw]` | World quat         |
+| `sai2::optitrack::raw::rigid_body_pos::<id>`                | JSON `[x, y, z]`        | Motive room frame  |
+| `sai2::optitrack::marker_pos::<model_id>::<marker_id>`      | JSON `[x, y, z]`        | World (calibrated) |
+| `sai2::optitrack::raw::marker_pos::<model_id>::<marker_id>` | JSON `[x, y, z]`        | Motive room frame  |
 
-| Key                                                         | Format                  | Frame                  |
-| ----------------------------------------------------------- | ----------------------- | ---------------------- |
-| `sai2::optitrack::rigid_body_pos::<id>`                     | JSON `[x, y, z]`        | **World** (calibrated) |
-| `sai2::optitrack::rigid_body_ori::<id>`                     | JSON `[qx, qy, qz, qw]` | World quat             |
-| `sai2::optitrack::raw::rigid_body_pos::<id>`                | JSON `[x, y, z]`        | Motive room frame      |
-| `sai2::optitrack::raw::rigid_body_ori::<id>`                | JSON `[qx, qy, qz, qw]` | Room quat              |
-| `sai2::optitrack::marker_pos::<model_id>::<marker_id>`      | JSON `[x, y, z]`        | **World** (calibrated) |
-| `sai2::optitrack::raw::marker_pos::<model_id>::<marker_id>` | JSON `[x, y, z]`        | Motive room frame      |
+`marker_pos::*` keys require **Labeled Markers enabled** in Motive. `model_id` = rigid-body Streaming ID the marker belongs to (0 = standalone/unaffiliated).
 
-
-`marker_`* keys are per-labeled-marker (added 2026-05-22 — see "Arm
-world-frame tracking" below). `model_id` is the rigid-body asset the marker
-belongs to (= asset's Streaming ID; **0 for standalone**, unaffiliated
-markers); `marker_id` is the per-asset marker index Motive assigns. The
-streamer publishes these via a `labeled_marker_listener` callback in the
-patched NatNetClient — you must enable **Application Settings → Streaming →
-Labeled Markers** in Motive for these keys to appear.
-
-World transform is `R_WORLD_OPTI · p_opti + T_WORLD_OPTI`, loaded from
-`sports_bot/optitrack/world_calibration.json`. If the file is missing, identity
-is used and the printout `[optitrack] no calibration file …, using identity`
-fires at startup.
+World transform: `R_WORLD_OPTI · p_opti + T_WORLD_OPTI` from `sports_bot/optitrack/world_calibration.json`.
 
 **Frame conventions:**
+- Motive streaming frame: **Z-up**, right-handed.
+- World frame: **Z-up**, right-handed, origin at robot home. +X toward opponent, +Y left, +Z up.
+- `world_calibration.json` is yaw + translation only (no axis swap needed).
 
-- OptiTrack (Motive) **streaming** frame: configured to **Z-up**, right-handed
-(see gotcha below — this is independent of Motive's *display* Up Axis).
-- World frame (what the FSM, controllers, and URDF use): **Z-up**, right-handed,
-origin at robot home. +X = toward opponent, +Y = robot's left, +Z = up. The
-FSM constants in `state_machine/config.py` all assume this convention.
-- `world_calibration.json` is just yaw + translation — both frames are Z-up so
-no axis swap is needed.
+**Current calibration (2026-05-17, SRC Kitchen):** 2D Procrustes from 3 floor markers. Max residual 0.34 mm horizontal, 1.87 mm vertical.
 
-**Critical Motive gotcha — display vs streaming Up Axis are independent.**
-Motive has *two* "Up Axis" settings:
+Other relevant Redis keys:
 
-1. `View → Up Axis` controls what the 3D perspective view shows. Cosmetic.
-2. `Edit → Application Settings → Streaming → Up Axis` controls what the NatNet
-  stream actually publishes. **This is the one that matters for Redis.**
-
-These can disagree silently — the perspective view will happily show Y-up while
-streaming emits Z-up, and nothing in the UI warns you. Always confirm the
-*streaming* setting at session start; if someone flipped it, the world
-calibration will silently produce garbage. The cleanest sanity check is to
-place the ball on the origin floor marker and read
-`sai2::optitrack::raw::rigid_body_pos::8` — the vertical component should be
-the small one (~ball radius), and the other two should be ~2.5 m and ~1.2 m.
-
-**Current calibration (2026-05-17, SRC Kitchen):** 2D Procrustes from the
-3 floor markers, assuming Motive streaming Z-up. Max horizontal residual 0.34 mm,
-max vertical residual 1.87 mm (floor unevenness, not noise).
-
-Consumed by `pickleball_fsm.py` via `BallTracker`:
-
-```
---ball-source optitrack --optitrack-rigid-body-id 8
-```
-
-Reads `sai2::optitrack::rigid_body_pos::8` (world frame, not raw).
-
-Other relevant keys (for full system integration):
-
-
-| Key                                                                                   | Owner               | Purpose                                         |
-| ------------------------------------------------------------------------------------- | ------------------- | ----------------------------------------------- |
-| `opensai::controllers::Panda::cartesian_controller::cartesian_task::goal_position`    | FSM → OpenSai       | Racket goal pos (opensai backend)               |
-| `opensai::controllers::Panda::cartesian_controller::cartesian_task::goal_orientation` | FSM → OpenSai       | Racket goal rot                                 |
-| `sports_bot::cmd::base::goal_pose`                                                    | FSM → controller    | `[x, y, theta]` base goal (cs225a backend)      |
-| `hb1::desired_pose`                                                                   | TidyBot driver      | `[x, y, theta]` the wheel driver actually reads |
-| `hb1::current_pose` / `hb1::current_vel`                                              | TidyBot driver → us | Base feedback                                   |
-| `hb1::kill` / `hb1::stop`                                                             | us → TidyBot driver | "kill" terminates driver; "stop" decelerates    |
-
+| Key                                                                                   | Owner               | Purpose                            |
+| ------------------------------------------------------------------------------------- | ------------------- | ---------------------------------- |
+| `opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::goal_position`    | us → OpenSai  | EE goal pos (arm base frame)       |
+| `opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::goal_orientation` | us → OpenSai  | EE goal rot (3×3 matrix)           |
+| `opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::current_position` | OpenSai → us  | Current EE pos (FK from encoders)  |
+| `opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::current_orientation` | OpenSai → us | Current EE rot                    |
+| `sports_bot::cmd::base::goal_pose`                                                    | FSM → base_bridge   | `[x, y, theta]` world-frame goal   |
+| `hb1::desired_pose`                                                                   | base_bridge → TidyBot | `[x, y, theta]` odom-frame goal  |
+| `hb1::current_pose` / `hb1::current_vel`                                              | TidyBot → us        | Base feedback                      |
+| `hb1::kill` / `hb1::stop`                                                             | us → TidyBot        | "kill" terminates; "stop" decels   |
 
 ---
 
 ## Gotchas hit so far
 
-- **Two copies of `StreamDataSkeleton.py`** in the repo. The one in
-`sports_bot/optitrack/StreamDataSkeleton.py` is the maintained version (has
-world calibration + rigid_body_listener already enabled). The one in
-`sports_bot/optitrack/drivers/PythonClient/StreamDataSkeleton.py` is the
-vanilla NatNet SDK sample — older, has `rigid_body_listener` commented out.
-Use the top-level one. It needs `PYTHONPATH=drivers/PythonClient` because the
-NatNet SDK modules live there.
-- `**python -u` matters** if you want to see prints in tail logs / background
-runs; without it Python buffers stdout aggressively when not on a TTY.
-- `**request_data_descriptions`** crashes the NatNet SDK on a UTF-8 decode of
-marker names (NatNetClient.py:965). Doesn't affect frame streaming. Live with
-it for now.
-- `**set_use_multicast(False)` is not enough** if Motive itself is in Multicast
-mode — the client requests unicast but Motive just doesn't send it. Both sides
-have to agree.
-- **macOS multicast bind silently drops frames** (patched 2026-05-19). The
-vendored NatNet client used to bind the data socket to
-`(self.local_ip_address, 1511)`. On BSD-derived stacks (macOS) that prevents
-delivery of multicast packets even though the IGMP join succeeds — `NAT_CONNECT`
-on the command port handshakes fine, server version arrives, but no data
-frames ever do. Fixed by binding to `('', 1511)` (INADDR_ANY) instead — the
-`IP_ADD_MEMBERSHIP` `setsockopt` above the bind still pins which interface
-joins the group, so we don't lose any selectivity. Patch is in
-`drivers/PythonClient/NatNetClient.py:__create_data_socket`. Symptom if it
-ever regresses: streamer log shows `resetting requested version to 4 2 0 0 from 0 0 0 0` (= command handshake worked) but no rigid-body Redis keys
-appear; switch to `STREAMER_MODE=u` (with Motive flipped to Unicast) to
-confirm.
-- `**sports_bot/` is its own git repo nested inside OpenSai.** So
-`git rev-parse --show-toplevel` from anywhere under `sports_bot/` returns
-`<OpenSai>/sports_bot`, not `<OpenSai>`. Helper scripts that need the OpenSai
-root must resolve it from `$0` (e.g. `$(cd "$(dirname "$0")/../.." && pwd)`),
-not from git. Running `python -m sports_bot.<module>` requires `cwd` to be
-the OpenSai root.
+- **Two copies of `StreamDataSkeleton.py`.** Use `sports_bot/optitrack/StreamDataSkeleton.py` (has world calibration + rigid_body_listener). The copy in `drivers/PythonClient/` is the vanilla SDK sample. Needs `PYTHONPATH=drivers/PythonClient`.
+- **`python -u` matters** for stdout in tail logs / background runs.
+- **`request_data_descriptions` crashes** on UTF-8 decode of marker names (NatNetClient.py:965). Doesn't affect streaming. Live with it.
+- **`set_use_multicast(False)` is not enough** if Motive is in Multicast — both sides must agree.
+- **macOS multicast bind silently drops frames** (patched 2026-05-19). Data socket must bind to `('', 1511)` (INADDR_ANY), not `(local_ip, 1511)`. Symptom: command handshake works (`resetting requested version to 4 2 0 0`), no Redis keys appear.
+- **`sports_bot/` is its own git repo** nested inside OpenSai. `git rev-parse --show-toplevel` from within it returns the `sports_bot/` dir, not the OpenSai root. Scripts resolve the OpenSai root from `$0`. Run modules as `python -m sports_bot.<module>` from the OpenSai root.
 
 ---
 
-## Ball tracker / intercept-prediction test harness
+## Ball tracker / intercept prediction
 
-`state_machine/ball_tracker_test.py` lets us record ball trajectories from
-Redis to disk and replay them through the *real* `BallTracker` to evaluate
-the intercept prediction visually + numerically. The FSM is not involved —
-this is a pure tracker/predictor test bench.
-
-Files:
-
-
-| Path                                 | Purpose                                                                                                            |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| `state_machine/ball_tracker_test.py` | `record` + `analyze` subcommands.                                                                                  |
-| `scripts/record_throws.sh`           | One-shot: starts the OptiTrack streamer if it isn't already up, runs the recorder, cleans up the streamer on exit. |
-| `scripts/watch_ball.sh`              | macOS-friendly replacement for `watch -n 0.1 redis-cli ...` — no GNU `watch` or `date %N` needed.                  |
-| `recordings/`                        | Default save directory (auto-created). Filenames `throws_<YYYYMMDD_HHMMSS>.npz`.                                   |
-
-
-**Record a session:**
+`state_machine/ball_tracker_test.py` — `record` + `analyze` subcommands.  
+`scripts/record_throws.sh` — starts streamer, runs recorder, cleans up.  
+`scripts/watch_ball.sh` — macOS-safe live viewer.  
+`recordings/` — `throws_<YYYYMMDD_HHMMSS>.npz`.
 
 ```bash
 conda activate opensai
-./sports_bot/scripts/record_throws.sh                      # ID 8, auto-named output
-RIGID_BODY_ID=1 ./sports_bot/scripts/record_throws.sh      # different rigid body
-./sports_bot/scripts/record_throws.sh -o myrun.npz         # explicit path
-./sports_bot/scripts/record_throws.sh --min-movement 0.002 # any record flag passes through
-```
-
-Hold the ball still for ~1 s between picking it up and throwing, and between
-throws — creates segmenter-friendly time gaps so walking-with-ball samples
-don't leak into a throw's fit window.
-
-**Sanity check the Redis stream (macOS-safe):**
-
-```bash
-./sports_bot/scripts/watch_ball.sh 8        # just the pickleball
-./sports_bot/scripts/watch_ball.sh          # all rigid bodies
-```
-
-**Analyze a recording:**
-
-```bash
-# Most recent recording, with viser viewer at http://localhost:8080
+./sports_bot/scripts/record_throws.sh                      # ID 8, multicast
 python -m sports_bot.state_machine.ball_tracker_test analyze \
     "$(ls -t sports_bot/recordings/throws_*.npz | head -1)"
-
-# Stats only, no viewer
-python -m sports_bot.state_machine.ball_tracker_test analyze \
-    sports_bot/recordings/<file>.npz --no-viser
-
-# A/B-tune tracker params on the same recording (no re-throwing)
-python -m sports_bot.state_machine.ball_tracker_test analyze \
-    sports_bot/recordings/<file>.npz \
-    --history-size 8 --max-position-jump 0.3 --gravity 9.81
+# A/B tracker params on same recording:
+python -m sports_bot.state_machine.ball_tracker_test analyze <file>.npz \
+    --tracker {leastsq,ekf} --history-size 8 --bounce-restitution 0.70
 ```
 
-Throws are auto-segmented from one continuous recording by 0.4 s time gaps
-(`--segment-gap-s`). Output: a per-throw error table bucketed by
-time-to-impact at the moment of prediction. The `[0.00, 0.15) s` bucket is the
-one the FSM actually acts on (it commits to SWING ~0.20 s before impact).
+**Current production defaults (volley-only mode for SRC Kitchen bring-up):**
+`max_bounces=0`, `online_bounce_pruning=False`, `history_size=8`, `history_max_age_s=0.20`. With `max_bounces=0` the predictor rejects any trajectory that would cross z=0 before the strike plane — volleys only, no FSM changes needed.
 
-**Reading the viser plot:**
+**Measured bounce parameters (SRC Kitchen, 11 bounces / 19 throws):**
 
-- Yellow translucent rectangle = strike plane (`court.strike_plane_x`, default 0.60 m).
-- Grey dots = recorded ball trajectory.
-- Cyan dots = fit-window samples driving `_fit_state` at the current tick.
-- Green spline + green sphere = current predicted ballistic arc + intercept.
-- Yellow sphere = actual recorded crossing of the strike plane.
-- Red→blue point cloud = every per-tick predicted intercept, colored by
-time-to-impact at the time of prediction (**red = close to impact** /
-short lookahead, **blue = far from impact** / long lookahead).
-
-The `_ReplayTracker` subclass in `ball_tracker_test.py` shares
-`_fit_state` / `predict_intercept` / `is_incoming` with the production
-`BallTracker` and only overrides the ingest layer (so we test the production
-code path, not a copy of it).
-
----
-
-## What we're debugging now (2026-05-17)
-
-**Bounce-blind trajectory fitter.** `BallTracker.predict_intercept` fits a
-single ballistic arc (constant v in xy, free-fall in z) over the last ≤12
-samples within a 0.30 s window. This breaks the moment the recorded
-trajectory spans a bounce: the linear least-squares fit averages pre- and
-post-bounce velocities, producing garbage. The fitter is also floor-blind —
-the parabola is happily extrapolated through z = 0, which is why many
-predicted intercepts in the viser plots end up well below the floor. Verified
-visually 2026-05-17: scrubbing into the post-bounce period of a recorded
-throw lands the cyan fit-window across the bounce, and the green prediction
-dives below z = 0.
-
-Real pickleball returns are mostly post-bounce groundstrokes, so this has to
-be fixed before the robot can do anything beyond hitting volleys.
-
-Planned work:
-
-- **Phase 1 — bounce detection + empirical parameter measurement.**
-`_detect_bounces` in `ball_tracker_test.py` finds floor bounces as
-local z-minima below ~10 cm with a downward → upward `v_z` flip,
-then fits ballistic velocity windows on either side (using a
-gravity-aware quadratic-in-z linear fit, same physics model as
-`_fit_state`). Per-bounce `(e, μ_t)` is printed in the throw summary
-and an aggregate `mean / median / std` is reported with suggested
-config values. Bounces show as orange spheres in viser with `(e, μ_t)` labels. Verified on synthetic ground-truth data: recovers
-`e=0.70` and `μ_t=0.90` to within 2 % across 4 bounces.
-- **Phase 2 — bounce-aware `predict_intercept`.**
-`_propagate_to_plane` in `ball_tracker.py` propagates the fitted
-ballistic state forward; if `z` would hit 0 before `x` reaches the
-strike plane, reflects `v_z` with `cfg.bounce_restitution` and
-scales `v_xy` with `cfg.bounce_tangential_damping`, then continues
-until either the plane is reached or `cfg.max_bounces` is exhausted.
-`Intercept` now carries `n_bounces`. `max_bounces=1` by default.
-Verified on a synthetic groundstroke that reaches `x=0.6` after one
-bounce: 3× as many usable predictions vs. the no-bounce baseline,
-and the final `[0.00, 0.15) s` bucket lands at 3-5 mm error.
-
-Known limitation (the Phase 3 problem): predictions made while the
-fit window straddles a bounce are still poisoned, because the
-least-squares fit averages pre- and post-bounce velocities. Bucket
-errors of 150-170 mm mean / 700-800 mm max in the `[0.30, 0.50) s`
-window are this exact failure mode.
-
-**Measured bounce parameters (SRC Kitchen, 2026-05-17).** Aggregated `e`
-and `μ_t` across all recordings in `sports_bot/recordings/`:
-
-
-| metric                        | restitution `e`                                      | tangential `μ_t` |
-| ----------------------------- | ---------------------------------------------------- | ---------------- |
-| n bounces                     | 11 (across 19 throws, 12 recordings, 12,116 samples) | same             |
-| mean                          | 0.712                                                | 0.640            |
-| median                        | 0.690                                                | 0.606            |
-| std                           | 0.058                                                | 0.127            |
-| min, max                      | 0.666, 0.841                                         | 0.492, 0.932     |
-| trimmed mean (10 % each side) | 0.703                                                | 0.624            |
-
-
-`e` is tight (std ≈ 6 %, one outlier at 0.841 likely a glancing /
-mis-fit bounce). `μ_t` is much noisier (std ≈ 13 %), which is expected —
-it lumps friction with spin coupling and is highly throw-dependent.
-**Defaults updated in `config.py`: `bounce_restitution = 0.70`,
-`bounce_tangential_damping = 0.62`** (medians, rounded). Worth
-re-measuring after every ~50 new throws to tighten the estimate.
-
-- **Phase 3a — online bounce-triggered history pruning.** Implemented
-in `BallTracker._try_prune_pre_bounce`: every tick after a sample is
-appended, scan the rolling history for a clear floor-bounce
-local-min (z below `online_bounce_z_threshold = 0.10 m`,
-strictly-greater z 2 samples on either side). If found, drop all
-pre-bounce samples from `_history`. The next `_fit_state` then
-operates only on the new ballistic arc. Conservative detection on
-purpose — false positives truncate the fit window. Toggle with
-`cfg.tracker.online_bounce_pruning` (default `True`) or the
-analyzer's `--no-online-bounce-pruning` for A/B.
-
-Measured impact on the SRC Kitchen recording set (12 recordings,
-19 throws with crossings):
-
-| tti window | mean err 3a-off → 3a-on | max err 3a-off → 3a-on |
+| metric | restitution `e` | tangential `μ_t` |
 |---|---|---|
-| `[0.30, 0.50) s` | 0.160 → 0.144 m | 1.24 → 0.86 m |
-| `[0.15, 0.30) s` | 0.170 → 0.117 m | 1.02 → 1.42 m |
-| `[0.00, 0.15) s` (commit-to-swing) | **0.082 → 0.050 m** | **0.73 → 0.31 m** |
+| median | 0.690 | 0.606 |
+| mean | 0.712 | 0.640 |
+| std | 0.058 | 0.127 |
 
-Commit-window mean drops 40 %, max drops 58 %. The 5 cm mean error
-at swing-commit is now under the paddle face. Early buckets
-(`tti ≥ 0.5 s`) are unchanged because the bounce isn't in history
-yet — that's the regime Phase 3b/EKF would help.
-- **Phase 3b — Bayesian state estimator (KF over `(p, v)` with
-bounce jumps).** Implemented in
-`state_machine/ekf_ball_tracker.py` (`EKFBallTracker`) on 2026-05-19,
-with the **same public interface** as the LS `BallTracker`
-(`update` / `is_incoming` / `predict_intercept` / `_fit_state` /
-`reset`) so the FSM can swap backends without code changes. The FSM
-is **not** swapped yet — it's a testing tool A/B-able from the
-analyzer. State = `[px, py, pz, vx, vy, vz]`; dynamics are linear
-between bounces (constant-v in xy, free-fall in z), so the "EKF"
-is really a linear KF with discrete bounce jumps. In
-`predict_intercept`, each predicted floor crossing applies the
-same `(e, μ_t)` state jump as the LS code path, *plus* a
-covariance inflation from `σ_e ≈ 0.058`, `σ_{μ_t} ≈ 0.127`
-(measured Phase 1). Online bounce detection inside `update`
-mirrors the LS pruner — instead of dropping pre-bounce samples,
-it re-seeds the filter from the post-bounce ones. `Intercept`
-gained an optional `position_cov: Optional[np.ndarray]` (3×3) for
-downstream use; the LS tracker leaves it `None`. New
-`BallTrackerConfig.ekf: EKFConfig` carries all the EKF tunables.
+Config defaults: `bounce_restitution=0.70`, `bounce_tangential_damping=0.62`. Re-enable bounce mode by setting `max_bounces=1`, `online_bounce_pruning=True`.
 
-A/B from the analyzer:
+**EKF tracker** (`state_machine/ekf_ball_tracker.py`) — same public interface as `BallTracker`, A/B-able via `--tracker ekf`. At swing-commit essentially tied with LS+pruning (5.0 cm LS vs 5.8 cm EKF mean). The payoff is uncertainty-aware commit via `Intercept.position_cov` — FSM not yet wired for this.
 
-`bash python -m sports_bot.state_machine.ball_tracker_test analyze <rec> \     --tracker {leastsq,ekf}` 
-
-with overrides for `--ekf-process-accel-std-{xy,z}`,
-`--ekf-measurement-pos-std`, `--ekf-seed-samples`, and
-`--no-ekf-bounce-handling`. viser renders a translucent 1σ
-position ellipsoid at the predicted intercept when
-`--tracker ekf` is active.
-
-**A/B on the recording set (12 recordings, 19 throws, default
-EKF config):** essentially tied with the LS+pruning baseline at
-the swing-commit bucket the FSM actually acts on.
-
-| tti window | LS mean | EKF mean | Δ |
-|---|---|---|---|
-| [0.00, 0.15) s (commit) | **5.0 cm** | 5.8 cm | +0.8 cm |
-| [0.15, 0.30) s          | 11.7 cm | 13.5 cm | +1.8 cm |
-| [0.30, 0.50) s          | 14.4 cm | 20.6 cm | +6.3 cm |
-| [0.50, 0.70) s          | 28.3 cm | 27.3 cm | −1.0 cm |
-| [0.70, 1.00) s          | 25.2 cm | 20.8 cm | **−4.4 cm** |
-| [1.00, 1.50) s          | 24.7 cm | 32.5 cm | +7.8 cm |
-
-So the EKF on its own is **not** an obvious improvement at
-swing-commit on this dataset — within 1 cm of the tuned
-LS+pruning result. The headline payoff the EKF unlocks is what's
-*enabled*: an uncertainty-aware commit rule (swing when the
-predicted intercept's position σ drops below a paddle tolerance,
-instead of on a fixed `swing_commit_time_s = 0.20`). The
-`Intercept.position_cov` plumbing is in place; the FSM change is
-not done.
-
-**Tuning gotchas hit during bring-up (worth remembering before
-tuning further):**
-
-- *Mahalanobis outlier gating self-destructs at low `σ_meas`.*
-  With `σ_meas = 2 mm`, a slightly biased seed velocity makes
-  innovation cov `S = P + R` tiny, and innovations of just
-  20–30 mm trip a 5.5σ gate. Empirically observed 95% rejection
-  rate on real recordings → filter locks into the seed velocity
-  and never recovers. Defaults are now `σ_meas = 5 mm` and
-  threshold `= 20`; the shared `max_position_jump` filter still
-  catches gross teleports.
-- *Seed quality matters more than expected.* A 4-sample LS seed
-  is too noisy in velocity, and a low-`σ_meas` recursive update
-  corrects `v` slowly (poor observability of `v` from `p` alone
-  — the position-velocity correlation P[0,3] collapses fast).
-  Bumped `seed_samples` default 4 → 6 (~50 ms at 120 Hz).
-- *No automatic state expiry across idle gaps.* The LS tracker
-  self-resets via `history_max_age_s`; the EKF carries the
-  posterior forward forever. The analyzer now explicitly calls
-  `tracker.reset()` on any inter-sample gap > 0.30 s. If the FSM
-  is ever swapped to the EKF, `_step_recover` already calls the
-  equivalent reset, so we're fine there — but anywhere else long
-  gaps can happen would need the same.
-
-Open work if we want to push the EKF further:
-
-- Apply the bounce *jump* (with covariance inflation) to the
-  existing posterior instead of re-seeding from post-bounce
-  samples — preserves pre-bounce xy information that the current
-  approach throws away.
-- Wire the FSM commit decision to a covariance-based rule
-  (replace `swing_commit_time_s` with a position-σ threshold).
-- Re-measure `(σ_e, σ_μ_t)` once we have ≥ 50 bounces; the
-  current 13% std on `μ_t` inflates the predicted intercept
-  ellipsoid more than it probably should.
+**Commit-window accuracy (tti ∈ [0.00, 0.15) s):** 5.0 cm mean / 31 cm max (LS + bounce pruning, SRC Kitchen recordings).
 
 ---
 
 ## Base frame calibration (FSM goals → TidyBot driver)
 
-The FSM speaks world frame W (floor tape). The TidyBot driver speaks robot
-odometry frame R (origin = wherever the cart was parked when
-`redis_driver.py` started; re-anchors every driver restart). `base_bridge.py`
-sits between them. To do its job it needs the per-session transform
-`T_W_R`. We split that into two pieces.
+Four frames:
 
-**Four frames, two unknown transforms:**
+| frame | what |
+|---|---|
+| W | world; floor tape origin |
+| B | OptiTrack rigid-body frame, glued to cart markers |
+| C | TidyBot odometry control-point (what `hb1::current_pose` tracks) |
+| R | robot odometry origin; anchors at driver start |
 
-
-| frame | what / where                                                                                                                                    |
-| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| W     | world; floor tape origin; FSM speaks this                                                                                                       |
-| B     | OptiTrack rigid-body local frame, glued to the markers on the cart; pose in W comes from `sai2::optitrack::rigid_body_pos::<id>` + `…ori::<id>` |
-| C     | TidyBot odometry control-point frame, glued to the cart at whatever pivot the firmware tracks; pose in R comes from `hb1::current_pose`         |
-| R     | robot odometry origin; floor-fixed for the session                                                                                              |
-
-
-`T_W_B(t)` and `T_R_C(t)` are streamed live. The two unknowns are
-`T_B_C` (static — depends on where the markers sit on the cart vs.
-the firmware's odometry pivot) and `T_W_R` (static per session — depends on
-where the cart was parked at driver start). They satisfy
-
-```
-T_W_B(t) ⊕ T_B_C  =  T_W_R ⊕ T_R_C(t)        for all t
-```
-
-(same point on the cart, two ways to express its world pose).
-
-**Why split:** `T_B_C` is geometric and persists across sessions; `T_W_R`
-re-anchors every driver restart and is meaningless tomorrow. So we
-calibrate `T_B_C` once (the slow drive-around) and back-solve `T_W_R` from
-one stationary snapshot every session (the fast bringup).
+Two unknowns: `T_B_C` (geometric, persists across sessions) and `T_W_R` (per-session, derived at bridge startup). Constraint: `T_W_B ⊕ T_B_C = T_W_R ⊕ T_R_C`.
 
 **Files:**
 
+| Path | Purpose |
+|---|---|
+| `sports_bot/utils/frames.py` | SE(2)+(3) algebra, hand-eye solver, calibration I/O |
+| `scripts/calibrate_robot_marker.py` | Interactive N-waypoint capture, solves `(T_B_C, T_W_R)` via LM |
+| `optitrack/robot_marker_calibration.json` | Persisted `T_B_C`. Re-solve only when markers re-stuck. |
+| `sports_bot/base_bridge.py` | Loads `T_B_C`, derives `T_W_R` from 1-s snapshot, forwards goals, periodic OT-vs-odom sanity print. |
 
-| Path                                                 | Purpose                                                                                                                                                |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `sports_bot/utils/frames.py`                         | SE(2) algebra, quat ↔ R, projection-based yaw extraction, 2D hand-eye AX=XB solver, calibration file I/O.                                              |
-| `sports_bot/scripts/calibrate_robot_marker.py`       | Interactive N-waypoint capture; solves `(T_B_C, T_W_R)` jointly via Levenberg-Marquardt; persists only `T_B_C`.                                        |
-| `sports_bot/optitrack/robot_marker_calibration.json` | Persisted `T_B_C`. Re-solve only when markers are re-stuck.                                                                                            |
-| `sports_bot/base_bridge.py`                          | Loads `T_B_C`, snapshots `(T_W_B, T_R_C)` for 1 s, derives `T_W_R = T_W_B ⊕ T_B_C ⊕ T_R_C⁻¹`, forwards goals, prints OT-vs-odom cross-check every 2 s. |
+**Current calibration (SRC Kitchen, 2026-05-19):** `T_B_C = (-0.0351 m, +0.0086 m, -7.16°)`, RMS 3.71 mm / 0.37°.
 
+`goal_W` is the desired pose of **C** (odometry control point), not marker centroid B. Use `T_W_C = T_W_B ⊕ T_B_C` when querying current world pose for control purposes.
 
-**One-time `T_B_C` calibration** (re-run when markers get re-stuck):
-
-```bash
-conda activate opensai
-# 1. start redis, OptiTrack streamer, TidyBot driver
-# 2. drive cart to 5 waypoints — mix translation AND rotation between them
-python sports_bot/scripts/calibrate_robot_marker.py --robot-rigid-body-id <ID>
-```
-
-Each waypoint: hold the cart still, press Enter, 1 s average is captured.
-Aim for ≥30 cm translation and ≥30° rotation span across the set —
-the script warns if diversity is poor. Residual RMS should land under
-~1 cm / 0.5°; the script flags higher values. Persists to
-`sports_bot/optitrack/robot_marker_calibration.json`. Commit it.
-
-**Per-session bringup:**
-
-```bash
-python sports_bot/base_bridge.py --robot-rigid-body-id <ID>
-```
-
-2-second pose snapshot (cart sits still) → derives `T_W_R` → runs the
-bridge. Every ~2 s it prints a sanity line comparing `T_W_C` computed two
-ways:
-
-```
-[base_bridge] sanity  W_via_OT=[+1.234, +0.567, +12.3°]  W_via_odom=[+1.235, +0.566, +12.2°]  Δ=[+1.0, -1.0] mm, -0.1°
-```
-
-Growing Δ over time ≈ wheel slip or marker shift. Free runtime watchdog;
-not load-bearing, but useful for debugging.
-
-**Quat passthrough is fixed**: `_opti_to_world_quat()` now actually
-rotates the quaternion through `R_WORLD_OPTI`, so
-`sai2::optitrack::rigid_body_ori::<id>` is genuinely in W. Both the
-calibration script and the bridge read this world-frame key directly.
-
-**Goals are in C-frame, not B-frame.** `sports_bot::cmd::base::goal_pose`
-is the desired world pose of the cart's **odometry control point C** (the
-pivot the TidyBot firmware reports about), not the marker centroid B. The
-bridge converts via `goal_R = T_W_R⁻¹ ⊕ goal_W` so the cart's C lands at
-`goal_W` in world. Reading the cart's "current world pose" for relative
-goals or convergence checks must therefore use
-`T_W_C = T_W_B ⊕ T_B_C`, **not** raw `sai2::optitrack::rigid_body_pos::<id>`
-(which is `T_W_B`). `send_base_goal.py` and the bridge's sanity print
-already do this; anything else querying "where is the cart in world" for
-control purposes should too.
-
-**Odom drift is the dominant accuracy limit across long sessions.**
-`T_W_R` is fixed at the bridge's startup snapshot. Wheel slip during
-extended driving (5+ m of cumulative travel) accumulates a few cm of
-drift between odom and OT, which shows up as a constant world-frame
-position offset on commanded goals. Fix is to either (a) restart the
-bridge mid-session (cheap), or (b) re-derive `T_W_R` per goal /
-continuously in the bridge (proper, not yet implemented — see "Open
-items"). The runtime sanity print Δ is exactly this drift; when it
-exceeds a few cm, restart the bridge for tighter accuracy.
+**Odom drift:** `T_W_R` is snapshot-once at bridge startup. After ~5 m of travel, drift can reach a few cm. Restart the bridge to re-anchor; the sanity Δ print is the watchdog. `--periodic-refresh-s 0.5` (default) re-derives `T_W_R` every 0.5 s and re-emits the last goal — eliminates held-goal drift.
 
 ---
 
 ## Arm world-frame tracking (marker-based, 2026-05-22)
 
-The FSM and the base both speak world frame **W**. The OpenSai cartesian
-controller for the Franka speaks **A** — the Franka arm base frame
-(`current_position` / `current_orientation` / `goal_`* are all in A). To
-command arm goals from a world-frame intercept point — and to reconstruct
-the racket sweet-spot in world for FSM logic — we need `T_W_A(t)` live.
+OpenSai's cartesian controller speaks arm base frame **A** (all `current_*` / `goal_*` keys are in A). We need `T_W_A(t)` live to command world-frame intercept targets.
 
-**Approach:** two standalone spherical OptiTrack markers on the cart,
-mounted on the **left (−Y)** and **right (+Y)** sides of the Franka base,
-equidistant from its center. From them:
+**Approach:** two standalone spherical OptiTrack markers on the cart, left (−Y) and right (+Y) of the Franka base, equidistant from center.
 
 ```
 t_W_A   = 0.5 * (p_left + p_right)               # midpoint = arm base origin
-y_hat_W = horiz_project(p_right − p_left) / ||…|| # → Franka +Y
-z_hat_W = [0, 0, 1]                               # → Franka +Z (upright cart)
-x_hat_W = y_hat × z_hat                           # → Franka +X (right-handed)
-R_W_A   = [x_hat | y_hat | z_hat]
+y_hat_W = horiz_project(p_right − p_left) / ||…|| # Franka +Y
+z_hat_W = [0, 0, 1]                               # Franka +Z (upright cart)
+x_hat_W = y_hat × z_hat                           # Franka +X (right-handed)
 ```
 
-No hand-eye calibration, no tape-measuring the arm base, no dependency on
-the cart rigid body's orientation or `T_B_C`. The static EE→racket sweet-
-spot transform `T_E_P` is supplied by mechanical measurement / CAD —
-defaults pulled from `state_machine/config.py:54-62` (sweet spot 0.368 m
-along EE +Z, face normal = EE +X).
+No hand-eye calibration needed.
 
-**Four frames live on the arm side of the picture:**
+**Frames:**
 
+| frame | what |
+|---|---|
+| A | Franka arm base. +X forward, +Y left, +Z up |
+| E | Franka EE flange. OpenSai FK publishes `current_position/orientation` in A |
+| P | Racket sweet-spot. +Z_P = face normal (SwingPlanner convention) |
 
-| frame | what / where                                                                                                                            |
-| ----- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| W     | world; floor tape origin (existing)                                                                                                     |
-| A     | Franka arm base — the mounting flange on top of the cart. +X forward (away from the controller box), +Y left, +Z up (Franka convention) |
-| E     | Franka EE flange — frame in which OpenSai's `cartesian_task::current_position` is reported                                              |
-| P     | racket sweet-spot — origin at paddle face center, **+Z_P = face normal** (matches the `SwingPlanner` convention)                        |
-
-
-Runtime composition:
-
+**Runtime composition:**
 ```
-T_W_P(t)         = T_W_A(t) ⊕ T_A_E(t) ⊕ T_E_P              # racket pose in world
-T_A_E_desired    = T_W_A(t)⁻¹ ⊕ T_W_P_goal ⊕ T_E_P⁻¹        # world goal → arm goal
+T_W_P(t)      = T_W_A(t) ⊕ T_A_E(t) ⊕ T_E_P          # racket pose in world
+T_A_E_desired = T_W_A(t)⁻¹ ⊕ T_W_P_goal ⊕ T_E_P⁻¹    # world goal → EE goal
 ```
 
-The inverse-compose lives in `utils/frames.py:world_racket_to_arm_ee`.
+`world_racket_to_arm_ee` in `frames.py` does the inverse-compose.
+
+**Paddle geometry (MTEN MT-01, as mounted 2026-05-23):**
+- Handle mounted straight along EE +Z — no rotation adapter.
+- Face normal is **perpendicular to the handle** → in the EE XY plane → **face normal = EE +X**.
+- `T_E_P`: translation `[0, 0, 0.35]` (sweet spot 35 cm along EE +Z); rotation maps P's +Z to EE +X:
+  ```
+  R_E_P = [[0, 0, 1],
+            [1, 0, 0],
+            [0, 1, 0]]
+  ```
+- Paddle tip (far end of paddle) is ~**45 cm** along EE +Z from the flange (`PADDLE_TIP_OFFSET_M = 0.45`).
+
+`verify_arm_calibration.py --init` writes these as the starter defaults.
+
+**Floor collision avoidance:** `enforce_paddle_floor(t_A_E, R_A_E, T_W_A)` in `frames.py` computes the world-frame Z of the commanded paddle tip exactly:
+```
+z_tip_world = T_W_A.t[2] + t_A_E[2] + R_A_E[2,2] * PADDLE_TIP_OFFSET_M
+```
+If below floor + 5 cm clearance, raises the EE goal in arm-frame Z. Called before `clip_to_arm_workspace` in `test_arm_world_track.py` and `base_intercept.py`. Uses actual EE orientation (R_A_E[2,2]) — not worst-case — and gets arm base height from live T_W_A, no config constant needed.
 
 **Files:**
 
+| Path | Purpose |
+|---|---|
+| `optitrack/drivers/PythonClient/NatNetClient.py` | Patched: `labeled_marker_listener` callback |
+| `optitrack/StreamDataSkeleton.py` | Publishes `marker_pos::<model>::<id>` per frame |
+| `utils/frames.py` | SE(3) algebra; `compute_T_W_A_from_markers`, `world_racket_to_arm_ee`, `enforce_paddle_floor`, `clip_to_arm_workspace` |
+| `optitrack/arm_marker_calibration.json` | 2 marker IDs + `T_E_P`. Re-do only when spheres move or paddle mount changes. |
+| `scripts/list_markers.py` | Live table of all labeled markers; tap one to see its row blink |
+| `scripts/verify_arm_calibration.py` | `--init` writes starter JSON; bare run prints T_W_A / T_W_E / T_W_P live |
+| `scripts/test_arm_world_track.py` | Hold a fixed world racket pose as cart moves |
+| `scripts/base_intercept.py` | Ball intercept loop; `--arm-track` adds arm tracking to base-only mode |
 
-| Path                                                        | Purpose                                                                                                                                                                       |
-| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sports_bot/optitrack/drivers/PythonClient/NatNetClient.py` | Patched with a `labeled_marker_listener` callback hook, mirroring `rigid_body_listener`.                                                                                      |
-| `sports_bot/optitrack/StreamDataSkeleton.py`                | Registers `receive_labeled_marker` which publishes per-marker world positions to `sai2::optitrack::marker_pos::<model_id>::<marker_id>`.                                      |
-| `sports_bot/utils/frames.py`                                | SE(3) algebra; `MarkerSpec`, `compute_T_W_A_from_markers`, `world_racket_to_arm_ee`; marker calibration save/load (`ArmMarkerCalibration` dataclass).                         |
-| `sports_bot/optitrack/arm_marker_calibration.json`          | Persisted: 2 marker IDs + `T_E_P`. Re-do only when spheres move or paddle mount changes.                                                                                      |
-| `sports_bot/scripts/list_markers.py`                        | Live ANSI-refreshing table of every visible labeled marker. Used to identify which `(model_id, marker_id)` correspond to the two cart spheres (tap one to see its row blink). |
-| `sports_bot/scripts/verify_arm_calibration.py`              | `--init` writes a starter JSON; bare run loads, computes `T_W_A` / `T_W_E` / `T_W_P` live, prints them for visual / tape sanity.                                              |
-| `sports_bot/scripts/test_arm_world_track.py`                | Drives the Franka to hold a fixed world racket pose as the cart moves. Foundational test for the FSM arm-intercept work to come.                                              |
-| `sports_bot/utils/test_frames_se3.py`                       | Synthetic tests for SE(3) algebra (`R ↔ axis_angle` round-trip, compose/inverse identities).                                                                                  |
+**Motive setup (one-time):** Mount two spherical markers (not flat stickers — visible from any angle) standalone — do NOT add to cart rigid body 11. Enable Labeled Markers in Motive. Manually label both in the Markers pane to lock IDs.
 
-
-**Motive setup (one-time):**
-
-- Mount two spherical IR markers on the cart, left (−Y) and right (+Y) of
-the Franka base, equidistant from its center. Spheres (not flat
-stickers) because flat stickers only reflect within ±30–45° of camera-
-normal; spheres are visible from any angle, which matters as the cart
-yaws.
-- Keep them **standalone — do NOT add them to cart rigid body 11.**
-Adding them to asset 11 changes Motive's pivot/centroid for that asset
-and silently invalidates the persisted `T_B_C` calibration.
-- In Motive: **Edit → Application Settings → Streaming → Labeled Markers**
-must be **enabled**. Without this the streamer's `marker_pos::`* keys
-never appear, even though `rigid_body_*` keys keep flowing.
-- In Motive's Markers pane: **manually label both spheres** so they get
-persistent IDs across frames. Symmetric placement is fine for the
-midpoint (centroid is swap-invariant), but the inferred Franka +Y sign
-flips if Motive swaps the labels, so locking IDs matters.
-
-**Convention reminders:**
-
-- `marker_specs[0]` = **left / −Y** sphere.
-- `marker_specs[1]` = **right / +Y** sphere.
-- Vector spec[0]→spec[1] is treated as Franka **+Y**.
-- If `verify_arm_calibration.py` shows Franka +Y pointing the wrong way,
-just swap the two entries in the JSON.
-
-**Per-session bringup** (assumes the Day-to-day bringup steps 1–5 are done
-— Redis, OT streamer, TidyBot driver, base bridge, base goal sender — but
-arm calibration is independent of TidyBot/base_bridge, you only need
-streamer + Redis + the OpenSai cartesian controller running on the Franka):
-
+**Per-session arm bringup:**
 ```bash
-# 1. Confirm both spheres are streaming as standalone (model_id = 0).
-#    Tap one sphere by hand — watch its row update.
-python sports_bot/scripts/list_markers.py                # all markers
-python sports_bot/scripts/list_markers.py --model-id 0   # standalone only
+# Confirm markers streaming
+python sports_bot/scripts/list_markers.py --model-id 0
+# Suppose IDs are (0,5) and (0,6).
 
-# Record the two IDs. Suppose they're (0, 5) and (0, 6).
-
-# 2. First-time setup only: write the starter JSON.
+# First time only:
 python sports_bot/scripts/verify_arm_calibration.py --init
+# Edit arm_marker_calibration.json: set marker_specs [[0,5],[0,6]]
+# spec[0]=left/-Y, spec[1]=right/+Y
 
-# 3. Edit sports_bot/optitrack/arm_marker_calibration.json:
-#    "marker_specs": [[0, 5], [0, 6]]    # spec[0]=left/-Y, spec[1]=right/+Y
-#    Confirm T_E_P translation (default [0, 0, 0.368]) matches your paddle
-#    mount; adjust if the paddle bracket changed.
-
-# 4. Sanity check the full chain. Requires the OpenSai cartesian_controller
-#    to be running on the Franka with robot_name "FrankaRobot" — confirm via
-#    redis-cli get opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::current_position
-#    (should be a 3-vector, not nil).
+# Sanity check (needs OpenSai running):
 python sports_bot/scripts/verify_arm_calibration.py
-#    Prints: T_W_A (arm base in world), T_W_E (flange in world),
-#    T_W_P (sweet spot in world). Eyeball against the physical robot.
-#    Add --no-ee to verify just T_W_A when OpenSai isn't up.
+# T_W_P[:,2] (face normal in world) should point toward opponent.
+# Use --no-ee to check T_W_A only.
 
-# 5. Verify world-frame arm tracking. Position the arm comfortably first,
-#    then:
+# World-frame arm hold test:
 python sports_bot/scripts/test_arm_world_track.py --from-current
-#    Holds the racket at its current world pose. Push the cart by hand —
-#    the arm should sweep to keep the paddle at the same world point.
-#    If it moves the opposite way, swap marker_specs[0] and [1] in the
-#    JSON (Franka +Y inferred backwards).
-
-# 6. Absolute world target:
-python sports_bot/scripts/test_arm_world_track.py \
-    --target-x 0.6 --target-y 0.0 --target-z 0.9 \
-    --face-normal-x 1 --face-normal-y 0 --face-normal-z 0
-#    Default face normal = world +X (toward opponent). The script enforces
-#    a 20 cm max-startup-jump safety; override with --max-startup-jump-m 0
-#    if you genuinely need a big first move (e.g. from a weird home pose).
+# Push cart by hand — arm should keep paddle at same world point.
+# If it moves opposite, swap marker_specs[0] and [1] in JSON.
 ```
 
-**Sanity one-liners:**
-
-```bash
-# Are the two spheres streaming?
-redis-cli get sai2::optitrack::marker_pos::0::5
-redis-cli get sai2::optitrack::marker_pos::0::6
-
-# What does the streamer think the arm base is right now?
-python sports_bot/scripts/verify_arm_calibration.py --no-ee
-
-# What's the OpenSai controller currently reporting for the EE pose?
-redis-cli get opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::current_position
-redis-cli get opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::current_orientation
-```
-
-**Gotchas (arm side):**
-
-- **Labeled markers must be enabled in Motive.** Symptom: `list_markers.py`
-shows 0 markers but `redis-cli get sai2::optitrack::rigid_body_pos::11`
-still returns positions. Fix: Motive → Streaming → enable Labeled
-Markers, then restart the streamer.
-- **Streamer must be restarted after pulling the 2026-05-22 changes.** The
-`labeled_marker_listener` hook was added that day; an older process
-doesn't have it wired up even if Motive is configured correctly.
-- **Symmetric sphere placement + Motive auto-labeler.** If the two spheres
-are too close together or too symmetric, Motive may swap their IDs
-frame-to-frame. Position is fine (centroid is swap-invariant); the
-inferred Franka +Y sign flips. Always manually label both in the Markers
-pane to lock IDs across sessions.
-- **Floor must be flat-ish.** Franka +Z = world +Z is an explicit
-assumption baked into the rotation derivation. A cart tilt of a few
-degrees doesn't matter for intercepts at the FSM's 5 cm tolerance, but
-significant tilt (cart on a ramp) breaks it. If this becomes an issue,
-upgrade to Procrustes against 3+ markers with known arm-base-frame
-positions.
-- `**R_cart_to_arm` is no longer in the schema.** An earlier draft derived
-arm orientation from cart RB orientation with a constant correction;
-that path was dropped on 2026-05-22 because it required knowing how
-Motive's cart-RB local frame relates to Franka base axes (non-trivial
-given `T_B_C` has a −7.16° yaw offset between the cart RB local frame
-and the firmware odometry frame). Marker-pair direction → Franka +Y
-bypasses this entirely.
+**Arm gotchas:**
+- **Labeled markers must be enabled in Motive** — symptom: `list_markers.py` shows 0 markers but rigid-body keys still flow.
+- **Symmetric sphere placement** — Motive may swap IDs frame-to-frame if markers are too close. Manual label locks them.
+- **Floor must be flat** — `z_hat_W = [0,0,1]` is hardcoded (upright cart). Significant tilt breaks it.
+- `marker_specs[0]` = left/−Y, `marker_specs[1]` = right/+Y. Wrong order → Franka +Y inferred backwards → swap to fix.
 
 ---
 
-## Day-to-day bringup (SRC Kitchen, TidyBot on `tidybot01`)
+## Day-to-day bringup (SRC Kitchen, TidyBot `tidybot01`)
 
-Three machines/contexts in play, but they're all on the same Redis. As
-of 2026-05-19 the working setup is **Redis + streamer + driver + bridge
-all on the cart's mini-PC `tidybot01`** (so everything defaults to
-`localhost`).
+All services run on `tidybot01` → all default to `localhost`. Known IDs: Ball=8, TidyBot=11.
 
-Known IDs:
-
-- PickleBall = Motive Streaming ID **8**
-- TidyBot rigid body = Motive Streaming ID **11**
-
-**Step 1 — Redis.**
-
+**Step 1 — Redis:**
 ```bash
 redis-server
-# sanity: redis-cli ping → PONG
+redis-cli ping  # → PONG
 ```
 
-**Step 2 — OptiTrack streamer.**
-
+**Step 2 — OptiTrack streamer:**
 ```bash
-cd ~/OpenSai/sports_bot/optitrack
-conda activate opensai
+cd ~/OpenSai/sports_bot/optitrack && conda activate opensai
 PYTHONPATH=drivers/PythonClient python -u StreamDataSkeleton.py \
     172.24.69.102 <tidybot01-IP> m
-# 'm' = multicast (default in Motive). 'u' = unicast if Motive ever flipped.
+# Sanity:
+redis-cli get sai2::optitrack::rigid_body_pos::8   # ball
+redis-cli get sai2::optitrack::rigid_body_pos::11  # cart
 ```
 
-Sanity:
-
+**Step 3 — TidyBot driver:**
 ```bash
-redis-cli get sai2::optitrack::rigid_body_pos::8     # ball
-redis-cli get sai2::optitrack::rigid_body_pos::11    # cart
-redis-cli get sai2::optitrack::rigid_body_ori::11    # cart quat in world
-```
-
-**Step 3 — TidyBot driver** (lives in `~/tidybot2/redis_driver.py`, its
-own conda env `tidybot2`):
-
-```bash
-cd ~/tidybot2
-conda activate tidybot2
+cd ~/tidybot2 && conda activate tidybot2
 python redis_driver.py
 ```
 
-The driver writes `hb1::desired_pose := hb1::current_pose` on startup,
-so the cart sits still until something writes a new goal.
-
-**Step 4 — base bridge.**
-
+**Step 4 — Base bridge:**
 ```bash
-cd ~/OpenSai
-conda activate opensai           # NOT tidybot2 — the bridge needs scipy/redis from opensai
-# avoid lurching to a stale FSM goal left from a prior session
-redis-cli del sports_bot::cmd::base::goal_pose
+cd ~/OpenSai && conda activate opensai
+redis-cli del sports_bot::cmd::base::goal_pose   # avoid stale lurch
 python sports_bot/base_bridge.py --robot-rigid-body-id 11
-# add --allow-nonzero-current-pose if the driver wasn't just restarted
+# Watch for T_W_R = (...) and Δ near zero in first sanity line.
 ```
 
-Watch for the startup output: `T_W_R = (..., ..., ...°)` and the first
-sanity line should show Δ near zero. If jitter > a few mm at snapshot,
-something was moving — restart the bridge with the cart still.
-
-**Step 5 — send goals.** From a separate terminal in `~/OpenSai`:
-
+**Step 5 — Send base goals:**
 ```bash
-conda activate opensai
-
-# read where the cart's control point is in world right now
 python sports_bot/scripts/send_base_goal.py --robot-rigid-body-id 11 --read
-
-# absolute goal: drive C to (1.0, 0.5) facing world +X
 python sports_bot/scripts/send_base_goal.py --robot-rigid-body-id 11 \
     --x 1.0 --y 0.5 --yaw-deg 0
-
-# relative: from current C, +20 cm in world X, +10 cm in world Y, +15° yaw
 python sports_bot/scripts/send_base_goal.py --robot-rigid-body-id 11 \
     --relative --x 0.20 --y 0.10 --yaw-deg 15
 ```
+Default tolerances: 100 mm / 5°. Tighten with `--pos-tol-mm 20 --yaw-tol-deg 2` after fresh bridge restart.
 
-Default tolerances: 100 mm position, 5° yaw. Loose-on-purpose because
-single-session odom drift can be a few cm; tighten with
-`--pos-tol-mm 20 --yaw-tol-deg 2` right after a fresh bridge restart.
-
-**One-time T_B_C calibration** (already done — only redo if the markers
-get bumped or re-stuck):
-
+**Step 6 — OpenSai cartesian controller** (arm sessions only — started outside this repo):
 ```bash
-python sports_bot/scripts/calibrate_robot_marker.py --robot-rigid-body-id 11
-# … drive 5 waypoints, mix rotation+translation … commit the JSON.
-```
-
-**Current calibration (SRC Kitchen, 2026-05-19):**
-`T_B_C = (-0.0351 m, +0.0086 m, -7.16°)`, RMS 3.71 mm / 0.37°,
-max per-waypoint residual 6.4 mm / 0.64°.
-
-**Step 6 — OpenSai cartesian controller** (only needed if you want to
-command the arm; skip for base-only sessions). The controller is part of
-the OpenSai install on `tidybot01` and is started outside this repo (see
-the OpenSai README / Franka bringup). Sanity:
-
-```bash
-# These should return JSON, not nil — confirms the cartesian_task is active.
 redis-cli get opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::current_position
-redis-cli get opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::current_orientation
-redis-cli get opensai::controllers::FrankaRobot::active_controller_name   # should be "cartesian_controller"
+redis-cli get opensai::controllers::FrankaRobot::active_controller_name  # → "cartesian_controller"
 ```
 
-**Step 7 — Verify arm marker calibration** (re-run any time the cart
-spheres get bumped, the paddle is re-mounted, or after a Motive restart):
-
+**Step 7 — Verify arm calibration:**
 ```bash
-conda activate opensai
-python sports_bot/scripts/verify_arm_calibration.py
-# Prints T_W_A, T_W_E, T_W_P. Eyeball against the physical robot.
-# Use --no-ee if OpenSai isn't running (verifies just T_W_A).
+python sports_bot/scripts/verify_arm_calibration.py  # prints T_W_A, T_W_E, T_W_P
 ```
 
-If the calibration JSON is missing, write a starter:
-
+**Step 8 — Arm + intercept loop:**
 ```bash
-python sports_bot/scripts/verify_arm_calibration.py --init
-# Then edit sports_bot/optitrack/arm_marker_calibration.json — put your
-# two sphere IDs in marker_specs (use list_markers.py to identify them):
-python sports_bot/scripts/list_markers.py --model-id 0
-```
-
-**Step 8 — Optional: world-frame arm hold test.** Drives the arm to keep
-the racket at a fixed world point while you push the cart by hand.
-
-```bash
-# Position the arm to a comfortable pose first, then:
-python sports_bot/scripts/test_arm_world_track.py --from-current
-# Or specify an absolute target:
-python sports_bot/scripts/test_arm_world_track.py \
-    --target-x 0.6 --target-y 0.0 --target-z 0.9
+python sports_bot/scripts/base_intercept.py \
+    --ball-rigid-body-id 8 --strike-plane-x 0.60 \
+    --ready-x 0.0 --ready-y 0.0 --ready-yaw-deg 0 \
+    --base-y-min -1.0 --base-y-max 1.0 \
+    --arm-track     # omit for base-only
 ```
 
 ---
 
 ## Open items for integration
 
-- ~~`world_calibration.json` for whichever bay we end up using~~ — done for
-SRC Kitchen 2026-05-17. Re-do per bay (and after any Motive ground-plane
-or camera recalibration).
-- **Daily calibration sanity check.** Place a marker at the origin floor
-mark, read `sai2::optitrack::raw::rigid_body_pos::<id>` and run it through
-`R, t`; expect world-frame `(0, 0, 0)` within ~5 mm. If it drifts,
-re-solve. (Better: group the 3 floor markers into a single `FloorRef`
-rigid body and read its world pose each session.)
-- ~~`_opti_to_world_quat()` is a passthrough~~ — fixed 2026-05-19. The
-function now applies `R_WORLD_OPTI` to the quaternion via
-`sports_bot.utils.frames.rotate_quat`, so `sai2::optitrack::rigid_body_ori::<id>`
-is honestly in world frame. Downstream consumers (base bridge, marker
-calibration) read this key directly instead of re-rotating raw OptiTrack
-quats themselves.
-- ~~Make the FSM write to `hb1::desired_pose` instead of
-`sports_bot::cmd::base::goal_pose`~~ — superseded 2026-05-19. The FSM
-keeps writing world-frame goals to `sports_bot::cmd::base::goal_pose`;
-`base_bridge.py` translates to `hb1::desired_pose` (R-frame) using the
-persisted `T_B_C` + a per-session `T_W_R` snapshot. Two-key design
-preserved on purpose so the FSM doesn't have to know about the cart's
-session-start position.
-- **Re-derive `T_W_R` on goal change (or continuously) to kill odom
-drift.** Currently `T_W_R` is snapshot-once at bridge startup, so wheel
-slip over a session manifests as a constant world-frame position offset
-on subsequent goals. Two flavors of fix:
-  - *Per-goal refresh* — when a new `sports_bot::cmd::base::goal_pose`
-  arrives, read live `(T_W_B, T_R_C)` and recompute `T_W_R` before
-  converting. Eliminates drift between goals; drift during a single
-  move remains. ~5-line change, zero risk.
-  - *Closed-loop (every tick)* — recompute `T_W_R` every bridge
-  iteration and update `hb1::desired_pose` accordingly. Eliminates
-  intra-move drift too. Needs a small averaging / OT-dropout guard.
-  Worth doing before the FSM starts commanding the base for swings.
-- Decide PickleBall's permanent Streaming ID — easier to standardize on `1`
-in Motive than to keep passing `--optitrack-rigid-body-id 8` everywhere.
-- ~~Register laptop MAC addresses with Zen → static SRC IPs → switch
-Motive back to multicast~~ — done 2026-05-19. Laptop static IP is
-`172.24.68.204` on the SRC subnet; Motive's Streaming →
-Transmission Type is set to Multicast. The streamer defaults to
-multicast (`scripts/record_throws.sh` uses `STREAMER_MODE=m` unless
-overridden). Override with `STREAMER_MODE=u` if Motive is ever
-flipped back to Unicast.
-- Confirm whether the cart's mini-PC is on SRC and could run the streamer
-itself (cleanest architecture: streamer + Redis + OpenSai all on the cart;
-laptop reads from cart's Redis remotely).
+- **Daily calibration sanity check.** Place marker at origin floor mark, read raw pos, apply world transform, expect (0,0,0) within ~5 mm.
+- **Re-derive `T_W_R` continuously in bridge.** `--periodic-refresh-s 0.5` handles held-goal drift; intra-move drift still accumulates. Per-tick recompute with OT-dropout guard is the proper fix.
+- **Decide PickleBall's permanent Streaming ID** — easier to standardize on `1` than keep passing `--optitrack-rigid-body-id 8` everywhere.
+- **EKF commit rule.** Wire FSM commit decision to `Intercept.position_cov` σ threshold (replace fixed `swing_commit_time_s = 0.20`). Plumbing is in place; FSM change not done.
+- **Re-measure bounce params** after ≥50 more throws to tighten `μ_t` estimate (current std ≈ 13%).
+- **Confirm `tidybot01` is on SRC subnet** — cleanest architecture: streamer + Redis + OpenSai all on cart; laptop reads remotely.
 
 ---
 
 ## Useful one-liners
 
 ```bash
-# Is Redis up?
 redis-cli ping
-
-# Clear stale OptiTrack keys
 redis-cli --scan --pattern 'sai2::optitrack::*' | xargs -r -I{} redis-cli del {}
-
-# Watch a single rigid body
-watch -n 0.1 'redis-cli get sai2::optitrack::rigid_body_pos::8'   # GNU watch, brew install if missing
-
-# Confirm cross-subnet routing works (should be a few ms RTT)
+watch -n 0.1 'redis-cli get sai2::optitrack::rigid_body_pos::8'
 ping -c 2 172.24.69.102
-
-# What's my wifi IP?
 ifconfig en0 | awk '/inet / {print $2}'
+redis-cli get opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::current_position
+redis-cli get opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::current_orientation
 ```
 
 ---
 
 ## Change log
 
-- 2026-05-19 — **base-frame calibration captured on the cart + bridge
-verified end-to-end.** Ran
-`sports_bot/scripts/calibrate_robot_marker.py --robot-rigid-body-id 11`
-on `tidybot01` with 5 well-spread waypoints (yaw spread 360°,
-translation spread ~1.2 m, per-waypoint jitter < 0.1 mm). Solved
-`T_B_C = (-0.0351 m, +0.0086 m, -7.16°)`, residual RMS 3.71 mm /
-0.37°. Saved to
-`sports_bot/optitrack/robot_marker_calibration.json`.
-  Then verified the bridge end-to-end with
-  `sports_bot/scripts/send_base_goal.py` (new this session — sends
-  absolute / relative world-frame goals and polls convergence). The
-  cart converges its odometry control point to commanded `goal_R` to
-  sub-mm precision in odom (confirmed via a watch loop on
-  `hb1::desired_pose` / `hb1::current_pose`), and world-frame
-  convergence matches `goal_W` to a few mm right after a fresh bridge
-  snapshot. Across a long session (~5 m of cumulative driving), odom
-  drift accumulated and produced ~80 mm of constant world-frame offset
-  on goals — fixed for now by restarting the bridge; "Open items"
-  carries the per-goal / closed-loop refresh as the proper fix.
-  Two bridge tweaks during bring-up:
-  - **Stale-goal lurch fix**: `base_bridge.run()` now seeds
-  `prev_goal_raw` with whatever's in `sports_bot::cmd::base::goal_pose`
-  at startup, so the first iteration doesn't forward a goal left over
-  from a previous test run. Before this, restarting the bridge could
-  immediately jerk the cart toward an old goal.
-  - **Convention clarified**: `goal_W` is the desired pose of the cart's
-  odometry control point C in world (matching what the bridge
-  naturally computes as `T_R_W ⊕ goal_W`), **not** the marker
-  centroid B. `send_base_goal.py` reads `T_W_C = T_W_B ⊕ T_B_C` for
-  both its "current pose" display and convergence checks so it's
-  consistent with the bridge. Resolved a confusing 45 mm "error"
-  that was really just B↔C offset.
-- 2026-05-19 — **base-frame calibration system landed.** Split the
-FSM↔TidyBot frame problem into two unknowns: `T_B_C` (geometric,
-marker-vs-odometry-pivot offset; persisted in
-`sports_bot/optitrack/robot_marker_calibration.json`) and `T_W_R`
-(per-session, where the cart was parked at driver start; derived from
-a 1-s snapshot at bridge startup). New `sports_bot/utils/frames.py`
-carries SE(2) algebra + a 2D AX=XB hand-eye solver via
-Levenberg-Marquardt — solver verified to machine precision against
-synthetic ground truth. New interactive
-`sports_bot/scripts/calibrate_robot_marker.py` captures N waypoints
-(default 5; mix rotation+translation) and reports per-waypoint
-residuals. Refactored `sports_bot/base_bridge.py` to load `T_B_C`,
-back-solve `T_W_R`, and print a periodic OT-vs-odom cross-check
-residual as a wheel-slip / marker-drift watchdog. Also fixed
-`_opti_to_world_quat()` in `StreamDataSkeleton.py` (was a passthrough)
-via `sports_bot.utils.frames.rotate_quat`, so
-`sai2::optitrack::rigid_body_ori::<id>` is now honestly world-frame.
-- 2026-05-17 — first draft. Got OptiTrack streaming working from Stanford wifi to
-Kitchen bay by switching Motive to Unicast. Confirmed PickleBall = Streaming
-ID 8. Identified VRPN port (3883) vs NatNet (1511) confusion in Motive UI.
-Streamer + Redis end-to-end verified; FSM and robot integration untouched.
-- 2026-05-17 — added `world_calibration.json` for SRC Kitchen. Constrained
-Procrustes from 3 taped floor markers (origin / 1 m forward / 1 m right).
-Motive is Y-up, our world is Z-up; the calibration absorbs the axis swap so
-FSM/sim/URDF stay Z-up unchanged.
-- 2026-05-17 — discovered Motive's *streaming* Up Axis was Z, not Y (the View
-Up Axis was Y, which is what we'd been looking at). Re-solved
-`world_calibration.json` for Z-up streaming: now just yaw + translation, no
-axis swap. Added the "display vs streaming Up Axis" gotcha to the conventions
-section.
-- 2026-05-17 — built the BallTracker test harness
-(`state_machine/ball_tracker_test.py` + `scripts/record_throws.sh` +
-`scripts/watch_ball.sh`). Recorded the first dataset of real throws against
-SRC Kitchen OptiTrack. Confirmed visually in viser that the production
-`predict_intercept` is bounce-blind and floor-blind: post-bounce extrapolation
-of a single-arc ballistic fit produces predicted intercepts well below `z=0`.
-Opened the Phase 1 → Phase 3 plan in "What we're debugging now".
-- 2026-05-17 — landed **Phase 1** (bounce detection + empirical `(e, μ_t)`
-measurement in the analyzer) and **Phase 2** (bounce-aware
-`predict_intercept` in production). Added `bounce_restitution`,
-`bounce_tangential_damping`, `max_bounces`, `floor_epsilon` to
-`BallTrackerConfig`; added `n_bounces` to `Intercept`. New CLI flags on
-`analyze`: `--bounce-restitution`, `--bounce-tangential-damping`,
-`--max-bounces`, `--no-bounce-detection`. viser scene now shows detected
-bounces as orange spheres with `(e, μ_t)` labels, and the predicted-arc
-spline bends at predicted bounces. Verified on synthetic data; need to
-run on the real recordings next to nail down SRC Kitchen `(e, μ_t)`.
-- 2026-05-17 — measured `(e, μ_t)` on the SRC Kitchen recording set
-(11 bounces / 19 throws / 12 recordings) and updated `config.py`
-defaults to `bounce_restitution = 0.70`, `bounce_tangential_damping = 0.62` (medians of measurements). See the table under "What we're
-debugging now" for the full distribution.
-- 2026-05-18 — landed **Phase 3a** (online bounce-triggered history
-pruning) in `BallTracker._try_prune_pre_bounce`. New config knobs:
-`online_bounce_pruning` (default `True`), `online_bounce_z_threshold`.
-Measured on the recording set: commit-to-swing window mean error
-dropped 8.2 → 5.0 cm and max dropped 73 → 31 cm. Phase 3b (full EKF
-with uncertainty ellipsoids) deferred until the rest of the FSM is
-end-to-end on the cart.
-- 2026-05-19 — **switched to multicast streaming.** Zen issued a static
-SRC IP for the recording laptop (`172.24.68.204`). Motive's
-Streaming → Transmission Type flipped from Unicast back to Multicast
-(group `239.255.42.99`, port `1511`). `scripts/record_throws.sh`
-default is now `STREAMER_MODE=m`; flip to `STREAMER_MODE=u` if
-Motive is ever switched back. Also made `MY_IP` env-overridable for
-the rare case `en0` isn't the SRC interface. No calibration impact —
-the world-frame transform is independent of transmission type.
-First multicast run hit a macOS-specific bug in the vendored NatNet
-client (data socket bound to `(local_ip, 1511)` doesn't receive
-multicast on BSD stacks — command channel handshakes but no frames
-arrive). Patched `NatNetClient.__create_data_socket` to bind to
-`('', 1511)` instead; `IP_ADD_MEMBERSHIP` still pins the interface
-joining the group. Multicast confirmed end-to-end the same day.
-Hardened `record_throws.sh` cleanup along the way: reap stale
-`StreamDataSkeleton.py` processes at startup, escalate SIGTERM →
-SIGKILL if a Python child is stuck in a socket-retry loop, and bail
-early if the streamer dies before publishing rather than waiting the
-full 10 s.
-- 2026-05-19 — **diagnostic + filtering pass on the LS tracker** ahead of
-the OptiTrack 240 Hz bump. Three changes, all behind config flags so
-the existing FSM path is unchanged unless explicitly overridden:
-  1. **Rejection reasons surfaced.** `BallTracker.predict_intercept`
-  and `EKFBallTracker.predict_intercept` now set
-  ``self.last_reject_reason`` to one of
-  ``insufficient_history / not_incoming / past_plane / on_floor /
-  would_bounce / tti_too_short / tti_too_long`` whenever they
-  return `None`. The FSM ignores this; the analyzer surfaces it in
-  a new GUI text panel ("reject reason") and color-codes the
-  recorded trajectory by per-tick reason
-  (green = OK, red = volley filter, amber = not incoming, blue =
-  tti too long, etc.). New checkbox "Trajectory: color by
-  rejection reason" in the Display folder; legend folder lists
-  the color → reason mapping. Internals: ``_propagate_to_plane``
-  now returns a `REJECT_*` string on failure instead of bare
-  `None` so the caller can distinguish bounce-blocked from
-  past-plane.
-  2. **Per-axis median filter on raw OptiTrack samples** before they
-  enter `_history`. New `BallTrackerConfig.median_filter_window`
-  (default 3, 0/1 disables); applies to both LS and EKF trackers.
-  Kills single-sample marker swaps / reflection artifacts at the
-  cost of ~1 sample of lag in reported "current" position. On
-  clean recordings the effect is in the noise (3.3 → 4.0 cm at
-  commit on the test recording — slight regression because there
-  were no outliers to filter); on real-cart data with marker
-  occlusion, expected to be a clear win. Analyzer override flags:
-  `--median-filter-window N` and `--no-median-filter`.
-  3. **History defaults retuned for 240 Hz prep.** Previous
-  `history_size = 8, history_max_age_s = 0.20` (120 Hz sweet
-  spot) gives a 33 ms LS window at 240 Hz — too short, throws
-  away the sample-rate benefit. New: `history_size = 12,
-  history_max_age_s = 0.15`. At 240 Hz that gives 50 ms / 12
-  samples (size-binding); at 120 Hz it gives 100 ms / 12 samples
-  (slightly longer than the 67 ms 120 Hz optimum, but commit-
-  moment error only regresses 5.3 → 5.8 cm across the recording
-  set). Briefly tried `age = 0.07` to bind purely by time —
-  catastrophic on recordings with sparse / bursty sample
-  density (3-sample windows → noisy `v_z` → 65 cm dz bias on
-  otherwise-clean throws). Lesson: `history_max_age_s` is a
-  safety floor for sample density; `history_size` should remain
-  the typical binding cap. Re-sweep on real 240 Hz cart data
-  once it's live.
-   Also updated `_ReplayTracker` (in the analyzer) to apply the same
-   median filter and initialize `last_reject_reason`, and propagated
-   `position_cov / last_reject_reason` through the new `TickAnalysis`
-   fields so the viser overlay can read them.
-- 2026-05-19 — **tuned `BallTrackerConfig.history_size` for fast
-volleys**. After the first SRC Kitchen recording session showed
-"meaningful predictions only at ~~400 ms to impact," swept window
-sizes 4–20 across 22 throws (mix of fully-tracked + ones with
-mid-flight OptiTrack dropouts). The 167 ms window (size=20) was
-introducing window-average lag in the LS velocity estimate — i.e.,
-the fit's `v` was biased toward older samples, so forward
-propagation aimed slightly off the true intercept. Shrinking to 8
-samples (~~67 ms at 120 Hz) drops commit-moment mean error
-(tti ∈ [0.10, 0.20) s) from ~10 cm → ~7 cm and earlier-flight
-buckets stay within 1 cm of the size-20 result. Post-commit buckets
-(tti < 0.10 s) are slightly *worse* (size-20 had a 3 cm edge there)
-but the FSM has already frozen the plan by then, so those don't
-matter. Also added `--segment-min-incoming-speed` to
-the analyzer (default `cfg.tracker.min_incoming_speed`) so its
-segmentation matches the FSM's gating exactly: a segment is
-"incoming" iff signed `v_x < -min_incoming_speed`. Carry-around /
-sideways-wave samples are now trimmed away in viser so the throw
-trajectory dominates the visualization. `_replay` also resets the
-tracker on slow→fast transitions (5+ non-incoming samples followed
-by an incoming one) so the LS history doesn't span the carry-prefix.
-- 2026-05-19 — **switched the production tracker to volley-only mode**
-for SRC Kitchen bring-up. `BallTrackerConfig` defaults changed:
-`max_bounces = 0`, `online_bounce_pruning = False`, `history_size = 8`
-(originally bumped to 20 in the same session, then dialed back after a
-sweep — see below), `history_max_age_s = 0.20`. With `max_bounces = 0` the LS predictor
-rejects any propagation that would cross `z = 0` before the strike
-plane, so groundstrokes return `None` and the FSM stays in READY —
-volley filtering is enforced *at the predictor*, no FSM changes
-needed. Longer history window is safe in volley mode (no bounce risk
-to straddle). A/B numbers across the existing recording set with
-these defaults: ~11 cm mean error at the commit moment (tti ≈ 0.20 s
-bucket); ~3.5 cm mean error on the last 150 ms (would be the
-operative number if SWING re-issues the strike command during
-execution — currently it doesn't, clean follow-up). Bounce mode
-re-enabled by setting those four knobs back per the docstring in
-`config.py`; (e, μ_t) defaults are already measured so no retuning is
-needed when we flip back.
-- 2026-05-19 — implemented **Phase 3b** as a testing tool, not an FSM
-swap. New `state_machine/ekf_ball_tracker.py` (`EKFBallTracker`);
-identical public interface to `BallTracker` so the FSM could swap
-without code changes. Added `EKFConfig` nested under
-`BallTrackerConfig.ekf`, optional `position_cov` field on `Intercept`
-(backwards-compatible — LS leaves it `None`), and analyzer flags
-`--tracker {leastsq,ekf}` plus EKF-specific overrides
-(`--ekf-process-accel-std-{xy,z}`, `--ekf-measurement-pos-std`,
-`--ekf-seed-samples`, `--no-ekf-bounce-handling`). viser draws a
-translucent 1σ ellipsoid at the predicted intercept when
-`--tracker ekf`. A/B across the full recording set: essentially tied
-with the LS+pruning baseline at the swing-commit bucket
-(5.0 cm LS → 5.8 cm EKF mean; full table in the **Phase 3b** block
-under "What we're debugging now"). FSM is **not** switched — the
-unlock the EKF actually buys is a covariance-based commit rule (swing
-when σ on the strike plane is tight enough), not point-estimate
-accuracy at commit. Tuning gotchas worth a callout: Mahalanobis
-outlier gate self-destructs at small `σ_meas` (95% rejection rate
-observed, locks filter into seed velocity — defaulted to
-`σ_meas = 5 mm`, threshold `= 20`); 4-sample LS seed is too noisy for
-the low-`σ_meas` recursive update to correct (bumped to 6); the EKF
-posterior doesn't self-expire across idle gaps the way LS history
-does (analyzer explicitly resets on gap > 0.30 s).
-
+- **2026-05-23** — T_E_P corrected: translation `[0,0,0.368]→[0,0,0.35]`; rotation unchanged (face normal = EE +X — handle is along EE +Z, face is perpendicular). `PADDLE_TIP_OFFSET_M=0.45` added. `enforce_paddle_floor` replaces worst-case z_min computation with exact world-Z of commanded paddle tip using live T_W_A and R_A_E.
+- **2026-05-22** — arm world-frame tracking landed. Marker-pair midpoint → T_W_A; T_E_P persisted in `arm_marker_calibration.json`; `world_racket_to_arm_ee` + `clip_to_arm_workspace` in `frames.py`. `base_bridge.py` `--periodic-refresh-s` added to kill held-goal drift. `base_intercept.py` `--arm-track` mode + world-frame tracking-error diagnostic.
+- **2026-05-19** — base-frame calibration captured on cart. `T_B_C=(-0.035, +0.009, -7.16°)`, RMS 3.71 mm/0.37°. Bridge verified end-to-end; `send_base_goal.py` added. Switched to multicast streaming (laptop static IP `172.24.68.204`); patched macOS NatNet data socket bind bug. Phase 3b EKF implemented as analyzer tool (not FSM swap). Tracker switched to volley-only defaults for bring-up.
+- **2026-05-18** — Phase 3a: online bounce-triggered history pruning. Commit-window mean 8.2→5.0 cm, max 73→31 cm.
+- **2026-05-17** — Phases 1+2: bounce detection + empirical (e, μ_t) measurement; bounce-aware `predict_intercept`. Measured e=0.71, μ_t=0.64 (SRC Kitchen). BallTracker test harness + `record_throws.sh` + `watch_ball.sh`. `world_calibration.json` for SRC Kitchen (Z-up streaming confirmed). First OptiTrack streaming verified (unicast path from Stanford wifi).

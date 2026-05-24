@@ -83,6 +83,7 @@ from sports_bot.utils.frames import (                            # noqa: E402
     arm_marker_calibration_path,
     clip_to_arm_workspace,
     compute_T_W_A_from_markers,
+    enforce_paddle_floor,
     load_arm_marker_calibration,
     load_robot_marker_calibration,
     quat_to_R,
@@ -251,10 +252,13 @@ def run(
                     T_W_P_goal: SE3 = (R_W_P_const, t_W_P)
                     R_A_E, t_A_E_raw = world_racket_to_arm_ee(
                         T_W_P_goal, T_W_A, arm_cal.T_E_P)
+                    t_A_E_floored, floor_adj = enforce_paddle_floor(
+                        t_A_E_raw, R_A_E, T_W_A)
                     t_A_E_clipped, was_clipped = clip_to_arm_workspace(
-                        t_A_E_raw,
+                        t_A_E_floored,
                         r_max=arm_reach_m, z_min=arm_z_min, z_max=arm_z_max,
                     )
+                    was_clipped = was_clipped or floor_adj
                     _write_arm_goal(r, arm_keys, (R_A_E, t_A_E_clipped))
                     if was_clipped:
                         r_raw = float(np.linalg.norm(t_A_E_raw[:2]))

@@ -590,6 +590,11 @@ FRANKA_DEFAULT_REACH_M = 0.75
 FRANKA_DEFAULT_Z_MIN_M = -0.10
 FRANKA_DEFAULT_Z_MAX_M = 1.00
 
+# Distance from EE flange to the far end of the paddle along EE +Z.
+# Used to enforce a floor-clearance constraint: the paddle tip must not go
+# below the world floor even if the caller's hardware z_min would allow it.
+PADDLE_TIP_OFFSET_M = 0.45
+
 
 def clip_to_arm_workspace(
     t_A_E: np.ndarray,
@@ -626,3 +631,35 @@ def clip_to_arm_workspace(
         t[:2] = t[:2] * (r_max / r_xy)
         clipped = True
     return t, clipped
+
+
+def enforce_paddle_floor(
+    t_A_E: np.ndarray,
+    R_A_E: np.ndarray,
+    T_W_A: SE3,
+    *,
+    paddle_tip_offset: float = PADDLE_TIP_OFFSET_M,
+    clearance: float = 0.05,
+    floor_z_world: float = 0.0,
+) -> Tuple[np.ndarray, bool]:
+    """Raise the commanded EE goal in arm-frame Z if the paddle tip would be
+    below the world floor. Returns (adjusted_t_A_E, was_adjusted).
+
+    The world-frame Z of the paddle tip at the commanded goal is computed exactly
+    from the live arm base pose (T_W_A from OptiTrack) and the commanded EE
+    orientation (R_A_E). Assumes an upright cart so arm-frame Z = world Z
+    (Franka +Z = world +Z), which is guaranteed by compute_T_W_A_from_markers.
+
+        z_tip_world = T_W_A.t[2] + t_A_E[2] + R_A_E[2,2] * paddle_tip_offset
+
+    Call this before clip_to_arm_workspace so the floor constraint is applied
+    in world-frame terms; the hardware clip then handles reach/height limits.
+    """
+    arm_base_z = float(T_W_A[1][2])
+    z_tip_world = arm_base_z + float(t_A_E[2]) + float(R_A_E[2, 2]) * paddle_tip_offset
+    floor_limit = floor_z_world + clearance
+    if z_tip_world >= floor_limit:
+        return np.asarray(t_A_E, dtype=float), False
+    t = np.asarray(t_A_E, dtype=float).copy()
+    t[2] += floor_limit - z_tip_world
+    return t, True

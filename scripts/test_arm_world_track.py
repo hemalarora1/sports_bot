@@ -100,6 +100,7 @@ from sports_bot.utils.frames import (  # noqa: E402
     axis_angle_from_R,
     clip_to_arm_workspace,
     compute_T_W_A_from_markers,
+    enforce_paddle_floor,
     load_arm_marker_calibration,
     se3_compose,
     world_racket_to_arm_ee,
@@ -211,9 +212,12 @@ def run(
         else:
             R_A_E, t_A_E_raw = world_racket_to_arm_ee(
                 T_W_P_goal, T_W_A, cal.T_E_P)
+            t_A_E_floored, floor_adj = enforce_paddle_floor(
+                t_A_E_raw, R_A_E, T_W_A)
             t_A_E_clipped, was_clipped = clip_to_arm_workspace(
-                t_A_E_raw, r_max=reach_m, z_min=z_min, z_max=z_max,
+                t_A_E_floored, r_max=reach_m, z_min=z_min, z_max=z_max,
             )
+            was_clipped = was_clipped or floor_adj
             T_A_E_desired = (R_A_E, t_A_E_clipped)
             if not dry_run:
                 _write_arm_goal(r, keys, T_A_E_desired)
