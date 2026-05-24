@@ -106,6 +106,9 @@ from sports_bot.utils.frames import (  # noqa: E402
     world_racket_to_arm_ee,
 )
 
+_MARKER_DROPOUT_RESET_S = 3.0   # re-seed EMA if markers absent this long
+_MARKER_MAX_JUMP_M = 0.10       # discard T_W_A reading if position jumps this far
+
 
 # ---------- Helpers -----------------------------------------------------------
 
@@ -180,6 +183,8 @@ def run(
     reach_m: float,
     z_min: float,
     z_max: float,
+    filter_alpha: float,
+    goal_deadband_m: float,
 ) -> None:
     dt = 1.0 / rate_hz
     last_print = -math.inf
@@ -196,50 +201,91 @@ def run(
           f"face_normal={R_goal[:,2].round(3).tolist()}")
     print(f"[arm_track] workspace clip: r ≤ {reach_m:.2f} m, "
           f"z ∈ [{z_min:+.2f}, {z_max:+.2f}] m (arm base frame)")
+    print(f"[arm_track] marker filter alpha={filter_alpha:.2f} "
+          f"(τ≈{1.0/(filter_alpha*rate_hz+1e-9):.0f}ms), "
+          f"goal deadband={goal_deadband_m*1000:.1f}mm")
     print(f"[arm_track] loop rate {rate_hz:.0f} Hz, "
           f"writing {keys.goal_position}{' (DRY RUN)' if dry_run else ''}")
     print(f"[arm_track] Ctrl-C to stop. Last goal stays in Redis on exit.\n")
 
+    # EMA state for T_W_A — seeded on first valid read.
+    t_smooth: Optional[np.ndarray] = None
+    R_smooth: Optional[np.ndarray] = None
+    last_sent_t: Optional[np.ndarray] = None  # last arm-frame position written
+    last_marker_t: float = -math.inf
+
     while True:
         t_loop = time.perf_counter()
 
-        T_W_A = compute_T_W_A_from_markers(r, cal.marker_specs)
-        if T_W_A is None:
+        T_W_A_raw = compute_T_W_A_from_markers(r, cal.marker_specs)
+        if T_W_A_raw is None:
             if t_loop - last_warn > 1.0:
                 last_warn = t_loop
-                print(f"[arm_track] markers missing — holding last goal "
-                      f"(no Redis write this tick).")
+                absent = (t_loop - last_marker_t
+                          if last_marker_t > -math.inf else 0.0)
+                print(f"[arm_track] markers missing ({absent:.0f}s) — "
+                      f"holding last goal (no Redis write this tick).")
         else:
-            R_A_E, t_A_E_raw = world_racket_to_arm_ee(
-                T_W_P_goal, T_W_A, cal.T_E_P)
-            t_A_E_floored, floor_adj = enforce_paddle_floor(
-                t_A_E_raw, R_A_E, T_W_A)
-            t_A_E_clipped, was_clipped = clip_to_arm_workspace(
-                t_A_E_floored, r_max=reach_m, z_min=z_min, z_max=z_max,
-            )
-            was_clipped = was_clipped or floor_adj
-            T_A_E_desired = (R_A_E, t_A_E_clipped)
-            if not dry_run:
-                _write_arm_goal(r, keys, T_A_E_desired)
+            R_raw, t_raw = T_W_A_raw
+            dropout = (t_smooth is None or
+                       t_loop - last_marker_t > _MARKER_DROPOUT_RESET_S)
+            if (not dropout and
+                    float(np.linalg.norm(t_raw - t_smooth)) > _MARKER_MAX_JUMP_M):
+                # Looks like a bad frame or Motive marker-ID swap — discard.
+                if t_loop - last_warn > 1.0:
+                    last_warn = t_loop
+                    delta = float(np.linalg.norm(t_raw - t_smooth))
+                    print(f"[arm_track] T_W_A jumped {delta*100:.1f} cm in one "
+                          f"tick — discarding bad frame, EMA resets on next "
+                          f"valid read.")
+                last_marker_t = -math.inf
+            else:
+                if dropout:
+                    t_smooth = t_raw.copy()
+                    R_smooth = R_raw.copy()
+                    last_sent_t = None  # force write after re-seed
+                else:
+                    t_smooth = (filter_alpha * t_raw
+                                + (1.0 - filter_alpha) * t_smooth)
+                    R_smooth = (filter_alpha * R_raw
+                                + (1.0 - filter_alpha) * R_smooth)
+                last_marker_t = t_loop
+                T_W_A = (R_smooth, t_smooth)
 
-            if was_clipped and t_loop - last_clip_warn > 1.0:
-                last_clip_warn = t_loop
-                r_raw = float(np.linalg.norm(t_A_E_raw[:2]))
-                print(f"[arm_track] CLIPPED: raw arm-frame target "
-                      f"[{t_A_E_raw[0]:+.3f}, {t_A_E_raw[1]:+.3f}, "
-                      f"{t_A_E_raw[2]:+.3f}] (r_xy={r_raw:.3f} m) → "
-                      f"[{t_A_E_clipped[0]:+.3f}, {t_A_E_clipped[1]:+.3f}, "
-                      f"{t_A_E_clipped[2]:+.3f}]")
+                R_A_E, t_A_E_raw = world_racket_to_arm_ee(
+                    T_W_P_goal, T_W_A, cal.T_E_P)
+                t_A_E_floored, floor_adj = enforce_paddle_floor(
+                    t_A_E_raw, R_A_E, T_W_A)
+                t_A_E_clipped, was_clipped = clip_to_arm_workspace(
+                    t_A_E_floored, r_max=reach_m, z_min=z_min, z_max=z_max,
+                )
+                was_clipped = was_clipped or floor_adj
 
-            if t_loop - last_print >= print_interval_s:
-                last_print = t_loop
-                t_W_A = T_W_A[1]
-                tag = " (clipped)" if was_clipped else ""
-                print(f"[arm_track] T_W_A.t=[{t_W_A[0]:+.3f},"
-                      f"{t_W_A[1]:+.3f},{t_W_A[2]:+.3f}]  "
-                      f"→ goal_A.t=[{t_A_E_clipped[0]:+.3f},"
-                      f"{t_A_E_clipped[1]:+.3f},"
-                      f"{t_A_E_clipped[2]:+.3f}]{tag}")
+                moved = (last_sent_t is None or
+                         float(np.linalg.norm(t_A_E_clipped - last_sent_t))
+                         > goal_deadband_m)
+                if moved:
+                    if not dry_run:
+                        _write_arm_goal(r, keys, (R_A_E, t_A_E_clipped))
+                    last_sent_t = t_A_E_clipped.copy()
+
+                if was_clipped and t_loop - last_clip_warn > 1.0:
+                    last_clip_warn = t_loop
+                    r_raw = float(np.linalg.norm(t_A_E_raw[:2]))
+                    print(f"[arm_track] CLIPPED: raw arm-frame target "
+                          f"[{t_A_E_raw[0]:+.3f}, {t_A_E_raw[1]:+.3f}, "
+                          f"{t_A_E_raw[2]:+.3f}] (r_xy={r_raw:.3f} m) → "
+                          f"[{t_A_E_clipped[0]:+.3f}, {t_A_E_clipped[1]:+.3f}, "
+                          f"{t_A_E_clipped[2]:+.3f}]")
+
+                if t_loop - last_print >= print_interval_s:
+                    last_print = t_loop
+                    tag = " (clipped)" if was_clipped else ""
+                    print(f"[arm_track] T_W_A.t=[{t_smooth[0]:+.3f},"
+                          f"{t_smooth[1]:+.3f},{t_smooth[2]:+.3f}]  "
+                          f"→ goal_A.t=[{t_A_E_clipped[0]:+.3f},"
+                          f"{t_A_E_clipped[1]:+.3f},"
+                          f"{t_A_E_clipped[2]:+.3f}]{tag}")
 
         elapsed = time.perf_counter() - t_loop
         sleep = dt - elapsed
@@ -351,6 +397,16 @@ def main() -> None:
     p.add_argument("--calibration", default=None,
                    help="Path to arm_marker_calibration.json. Default: "
                         "sports_bot/optitrack/arm_marker_calibration.json")
+    p.add_argument("--goal-deadband-mm", type=float, default=3.0,
+                   help="Only write a new arm goal when the arm-frame position "
+                        "has moved more than this many mm from the last sent "
+                        "goal. Suppresses vibration from residual marker noise. "
+                        "Set 0 to disable.")
+    p.add_argument("--marker-filter-alpha", type=float, default=0.15,
+                   help="EMA smoothing factor for T_W_A (0<α≤1). Lower = "
+                        "smoother but more lag. 1.0 = no filter. Default 0.15 "
+                        "gives ~130ms time constant at 50Hz, filtering OptiTrack "
+                        "marker noise while tracking cart motion.")
     p.add_argument("--redis-host", default="localhost")
     p.add_argument("--redis-port", type=int, default=6379)
     p.add_argument("--dry-run", action="store_true",
@@ -441,6 +497,8 @@ def main() -> None:
             reach_m=args.reach_m,
             z_min=args.z_min_m,
             z_max=args.z_max_m,
+            filter_alpha=args.marker_filter_alpha,
+            goal_deadband_m=args.goal_deadband_mm / 1000.0,
         )
     except KeyboardInterrupt:
         print(f"\n[arm_track] stopping — leaving last goal in Redis "
