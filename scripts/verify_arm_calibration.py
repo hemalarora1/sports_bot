@@ -75,10 +75,12 @@ def _write_starter(path: str) -> None:
     IDs and default racket geometry pulled from sports_bot/state_machine/
     config.py.
 
-    T_E_P defaults (from sports_bot/state_machine/config.py:54-62):
-        translation = [0, 0, 0.368]    (sweet_spot_in_flange)
-        rotation    aligns racket +Z with EE +X (face_normal_in_flange)
-                    and racket +Y with EE +Z. Columns:
+    T_E_P defaults:
+        translation = [0, 0, 0.35]    (sweet spot 35 cm along EE +Z / handle axis)
+        rotation    aligns racket +Z with EE +X (face normal = EE +X).
+                    The paddle handle is mounted along EE +Z; the face is
+                    perpendicular to the handle (in EE XY plane), facing EE +X.
+                    Columns of R_E_P (P-frame axes expressed in E-frame):
                       racket +X in EE = [0, 1, 0]   (EE +Y)
                       racket +Y in EE = [0, 0, 1]   (EE +Z)
                       racket +Z in EE = [1, 0, 0]   (EE +X = face normal)
@@ -88,7 +90,7 @@ def _write_starter(path: str) -> None:
         [1.0, 0.0, 0.0],
         [0.0, 1.0, 0.0],
     ])
-    T_E_P_trans = np.array([0.0, 0.0, 0.368])
+    T_E_P_trans = np.array([0.0, 0.0, 0.35])
     # Two standalone labeled markers (model_id = 0). User edits the
     # marker_id placeholders after running list_markers.py.
     marker_specs = [(0, 1), (0, 2)]

@@ -580,3 +580,49 @@ def world_racket_to_arm_ee(
     """
     return se3_compose(se3_compose(se3_inverse(T_W_A), T_W_P_goal),
                        se3_inverse(T_E_P))
+
+
+# Conservative Franka Panda workspace for the FLANGE in the arm base frame.
+# Hardware reach is ~85 cm; leave ~10 cm headroom so orientation goals have
+# room to settle without the cartesian controller saturating. Z range is set
+# for a paddle-mounted upright Franka — adjust if your mount geometry differs.
+FRANKA_DEFAULT_REACH_M = 0.75
+FRANKA_DEFAULT_Z_MIN_M = -0.10
+FRANKA_DEFAULT_Z_MAX_M = 1.00
+
+
+def clip_to_arm_workspace(
+    t_A_E: np.ndarray,
+    *,
+    r_max: float = FRANKA_DEFAULT_REACH_M,
+    z_min: float = FRANKA_DEFAULT_Z_MIN_M,
+    z_max: float = FRANKA_DEFAULT_Z_MAX_M,
+) -> Tuple[np.ndarray, bool]:
+    """Clip an EE position (in the arm base frame) to a conservative reachable
+    cylinder. Returns (clipped_position, was_clipped).
+
+    Strategy: clamp Z to [z_min, z_max], then radially shrink xy to r_max if
+    it overshoots. Orientation is left to the caller — OpenSai's cartesian
+    task generally handles unreachable orientations gracefully via task-space
+    prioritization, while position needs to stay in-workspace or the
+    controller saturates and the arm sits in a compromise pose that *looks*
+    like tracking but isn't.
+
+    The point is that during a chase the cart may not have caught up yet, so
+    the FSM-level world target can be far outside the current arm workspace.
+    Clipping makes the arm reach as far as it can toward the target rather
+    than committing to a goal it can't fulfill.
+    """
+    clipped = False
+    t = np.asarray(t_A_E, dtype=float).copy()
+    if t[2] < z_min:
+        t[2] = z_min
+        clipped = True
+    elif t[2] > z_max:
+        t[2] = z_max
+        clipped = True
+    r_xy = float(np.linalg.norm(t[:2]))
+    if r_xy > r_max:
+        t[:2] = t[:2] * (r_max / r_xy)
+        clipped = True
+    return t, clipped

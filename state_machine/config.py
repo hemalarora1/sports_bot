@@ -49,14 +49,16 @@ class RacketConfig:
     for the paddle TCP); the FSM does not consume these directly.
     """
 
-    # Sweet-spot offset in the link7 frame. Flange is at link7 +z = 0.107 m;
-    # paddle face center is another 0.261 m along link7 +z.
+    # Sweet-spot offset in the EE (flange) frame. The paddle handle is mounted
+    # along EE +Z (straight onto the flange, no rotation adapter); the sweet
+    # spot is 35 cm along the handle from the flange.
     sweet_spot_in_flange: np.ndarray = field(
-        default_factory=lambda: np.array([0.0, 0.0, 0.368])
+        default_factory=lambda: np.array([0.0, 0.0, 0.35])
     )
 
-    # Paddle face normal expressed in the link7 frame. Paddle is mounted so that
-    # link7 +x is the face-strike direction.
+    # Paddle face normal expressed in the EE (flange) frame. The face is
+    # perpendicular to the handle (EE +Z), pointing along EE +X toward the
+    # opponent.
     face_normal_in_flange: np.ndarray = field(
         default_factory=lambda: np.array([1.0, 0.0, 0.0])
     )

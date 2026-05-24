@@ -246,6 +246,7 @@ def run(
     rate_hz: float,
     sanity_interval_s: float,
     refresh_on_goal: bool = True,
+    periodic_refresh_s: float = 0.5,
 ) -> None:
     T_R_W = se2_inverse(T_W_R)
 
@@ -255,6 +256,8 @@ def run(
           f"{math.degrees(T_W_R[2]):+.2f}°)  (startup snapshot)")
     print(f"[base_bridge]   per-goal T_W_R refresh: "
           f"{'ON' if refresh_on_goal else 'OFF'}")
+    print(f"[base_bridge]   periodic T_W_R refresh: "
+          f"{'every ' + str(periodic_refresh_s) + ' s' if periodic_refresh_s > 0 else 'OFF'}")
     print()
 
     dt = 1.0 / rate_hz
@@ -266,6 +269,11 @@ def run(
         print(f"[base_bridge] ignoring pre-existing {FSM_BASE_GOAL} = {prev_goal_raw}")
         print(f"              (will only forward goals written from here on)")
     last_sanity = 0.0
+    last_periodic_refresh = time.perf_counter()
+    # Remember the last world-frame goal we forwarded so the periodic refresh
+    # can re-emit it in R-frame against the updated T_W_R. None until the
+    # first goal arrives.
+    last_goal_W: Optional[SE2] = None
 
     while True:
         t0 = time.perf_counter()
@@ -298,6 +306,10 @@ def run(
                         refresh_note = "  [T_W_R refresh: missing OT/odom — kept prior]"
                 goal_R = world_to_robot(goal_W, T_R_W)
                 r.set(HB1_DESIRED_POSE, json.dumps(list(goal_R)))
+                last_goal_W = goal_W
+                # Reset the periodic timer — per-goal refresh already updated
+                # T_W_R, no point doing it again in the same tick.
+                last_periodic_refresh = t0
                 print(
                     f"[base_bridge] goal  W=[{goal_W[0]:+.3f}, {goal_W[1]:+.3f}, "
                     f"{math.degrees(goal_W[2]):+6.1f}°]  →  "
@@ -306,6 +318,35 @@ def run(
                     f"{refresh_note}"
                 )
             prev_goal_raw = goal_raw
+
+        # Periodic T_W_R refresh — eliminates odom drift accumulating during
+        # held goals (cart parked at ready, or mid-move when the FSM hasn't
+        # updated the goal). We re-emit the last forwarded goal in R-frame
+        # using the fresh T_W_R so the cart adjusts.
+        if periodic_refresh_s > 0 and (t0 - last_periodic_refresh) >= periodic_refresh_s:
+            last_periodic_refresh = t0
+            if last_goal_W is not None:
+                T_W_R_fresh = _refresh_T_W_R(r, rb_id, T_B_C)
+                if T_W_R_fresh is not None:
+                    dx_mm = 1000.0 * (T_W_R_fresh[0] - T_W_R[0])
+                    dy_mm = 1000.0 * (T_W_R_fresh[1] - T_W_R[1])
+                    dth_deg = math.degrees(
+                        wrap_angle(T_W_R_fresh[2] - T_W_R[2]))
+                    T_W_R = T_W_R_fresh
+                    T_R_W = se2_inverse(T_W_R)
+                    goal_R = world_to_robot(last_goal_W, T_R_W)
+                    r.set(HB1_DESIRED_POSE, json.dumps(list(goal_R)))
+                    # Only log when the shift is actually material — < 0.5 mm
+                    # changes are sub-OT-noise and would just spam the log.
+                    if (abs(dx_mm) > 0.5 or abs(dy_mm) > 0.5
+                            or abs(dth_deg) > 0.05):
+                        print(
+                            f"[base_bridge] periodic refresh: T_W_R Δ="
+                            f"({dx_mm:+.1f},{dy_mm:+.1f}) mm, "
+                            f"{dth_deg:+.2f}° — re-emitted last goal "
+                            f"R=[{goal_R[0]:+.3f}, {goal_R[1]:+.3f}, "
+                            f"{math.degrees(goal_R[2]):+6.1f}°]"
+                        )
 
         # Periodic sanity print: cross-check OptiTrack chain vs odometry chain.
         # Big divergence = wheel slip, marker shift, or odometry drift.
@@ -380,6 +421,13 @@ def main() -> None:
              "Disable for legacy behaviour (frozen startup snapshot).",
     )
     parser.set_defaults(refresh_on_goal=True)
+    parser.add_argument(
+        "--periodic-refresh-s", type=float, default=0.5,
+        help="Re-derive T_W_R and re-emit the last forwarded goal every N "
+             "seconds (default 0.5). Catches odom drift accumulating while a "
+             "goal is held constant (parked at ready, or mid-move with no FSM "
+             "update). Set 0 to disable.",
+    )
     args = parser.parse_args()
 
     r = redis.Redis(host=args.redis_host, port=args.redis_port, decode_responses=True)
@@ -440,6 +488,7 @@ def main() -> None:
             rate_hz=args.rate_hz,
             sanity_interval_s=args.sanity_interval_s,
             refresh_on_goal=args.refresh_on_goal,
+            periodic_refresh_s=args.periodic_refresh_s,
         )
     except KeyboardInterrupt:
         print("\n[base_bridge] stopped.")
