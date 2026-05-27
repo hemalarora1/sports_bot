@@ -476,6 +476,22 @@ def run(
                 float(R_W_A[1, 0]), float(R_W_A[0, 0])))
             clip_tag = '  [CLIPPED]' if was_clipped else ''
 
+            # Joint positions from hardware sensor key.
+            q_line = '[joints]  unavailable'
+            q_raw = r.get('opensai::sensors::FrankaRobot::joint_positions')
+            if q_raw is not None:
+                try:
+                    q_deg = [math.degrees(v) for v in json.loads(q_raw)]
+                    q_line = (
+                        '[joints]  '
+                        + '  '.join(
+                            f'q{i+1}={q_deg[i]:+6.1f}°'
+                            for i in range(len(q_deg))
+                        )
+                    )
+                except Exception:
+                    pass
+
             # Current sweet-spot from FK (Redis current_position).
             ee = _read_ee_pose(r, keys)
             if ee is not None:
@@ -511,7 +527,8 @@ def run(
                 f'  ori=[{rx_goal:+.1f}°,{ry_goal:+.1f}°,{rz_goal:+.1f}°]\n'
                 f'[goal_A]  pos=[{t_A_goal[0]:+.3f},{t_A_goal[1]:+.3f},'
                 f'{t_A_goal[2]:+.3f}]{clip_tag}\n'
-                f'{cur_line}'
+                f'{cur_line}\n'
+                f'{q_line}'
             )
             _print_prompt()
 
