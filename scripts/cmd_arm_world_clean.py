@@ -23,14 +23,23 @@ Frame conventions
 -----------------
   W   world frame  (+X toward opponent, +Y left, +Z up; floor tape origin)
   A   Franka arm base frame  (derived from two OptiTrack markers every tick)
-  E   EE / compliant frame   (at sweet spot; +X = face normal, +Z = handle)
+  E   EE / compliant frame   (at sweet spot; +Y = face normal, +Z = flange→racket / handle)
 
 Reference orientation (ori 0 0 0)
 -----------------------------------
-  Face toward opponent  (+X world)
-  Handle pointing down  (-Z world)
+  Face toward opponent  (+X world)   ← EE +Y axis
+  Handle pointing down  (-Z world)   ← EE +Z axis
 
-  Internally: R_W_E_ref = Rx(180°) = diag(1, -1, -1)
+  Internally:
+    EE +X → World +Y  (right-hand completion)
+    EE +Y → World +X  (face toward opponent)
+    EE +Z → World -Z  (handle pointing down)
+
+  R_W_E_ref = [[0, 1, 0],
+               [1, 0, 0],
+               [0, 0,-1]]
+
+  (This is Rz(90°) @ Rx(180°) relative to the old +X-face convention.)
 
 ori command convention
 -----------------------
@@ -152,12 +161,15 @@ from sports_bot.utils.frames import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # Reference orientation
 # ---------------------------------------------------------------------------
-# Face toward +X opponent, handle pointing down (-Z world).
-# This equals Rx(180°) = diag(1, -1, -1).
+# Physical EE convention (MTEN paddle, handle along EE +Z, face normal = EE +Y):
+#   EE +Y → World +X   face toward opponent
+#   EE +Z → World -Z   handle pointing down
+#   EE +X → World +Y   right-hand completion (= EE +Y × EE +Z in world)
+#
 # ori 0 0 0 reproduces this exactly; all RPY commands are applied on top.
 R_W_E_REF: np.ndarray = np.array([
+    [0.,  1.,  0.],
     [1.,  0.,  0.],
-    [0., -1.,  0.],
     [0.,  0., -1.],
 ])
 
@@ -420,8 +432,13 @@ def run(
     last_debug_t: float = -math.inf
     debug_interval_s = 2.0
 
-    # Per-marker tracking for jump detection.
+    # Per-marker tracking for jump detection and EMA smoothing.
+    # EMA filter on raw marker positions before computing T_W_A.
+    # alpha=0.15 at 50 Hz → time constant ≈ 0.12 s (smooths noise, tracks
+    # slow base motion fine; increase toward 1.0 to reduce filtering).
+    _EMA_ALPHA: float = 0.15
     prev_pos: List[Optional[np.ndarray]] = [None, None]
+    filt_pos: List[Optional[np.ndarray]] = [None, None]   # EMA-smoothed
     last_warn_t: List[float] = [-math.inf, -math.inf]
     last_both_ok_t: float = -math.inf   # last time both markers were seen
 
@@ -523,9 +540,14 @@ def run(
                                 f'— possible ID swap or dropout'
                             )
                 prev_pos[i] = pos.copy()
+                # EMA smoothing: seed with first reading, then blend.
+                if filt_pos[i] is None:
+                    filt_pos[i] = pos.copy()
+                else:
+                    filt_pos[i] = _EMA_ALPHA * pos + (1.0 - _EMA_ALPHA) * filt_pos[i]
 
         # ----------------------------------------------------------------
-        # 3. Build T_W_A from markers
+        # 3. Build T_W_A from markers (use EMA-smoothed positions)
         # ----------------------------------------------------------------
         if p[0] is None or p[1] is None:
             # Can't compute arm base pose — skip write, hold last Redis goal.
@@ -534,11 +556,13 @@ def run(
 
         last_both_ok_t = t_loop
 
-        # Midpoint = arm base origin.
-        t_W_A: np.ndarray = 0.5 * (p[0] + p[1])
+        # Midpoint = arm base origin (from smoothed marker positions).
+        f0 = filt_pos[0] if filt_pos[0] is not None else p[0]
+        f1 = filt_pos[1] if filt_pos[1] is not None else p[1]
+        t_W_A: np.ndarray = 0.5 * (f0 + f1)
 
         # spec[0] → spec[1] direction (horizontally projected) = Franka +Y.
-        y_raw = p[1] - p[0]
+        y_raw = f1 - f0
         z_world = np.array([0.0, 0.0, 1.0])
         y_horiz = y_raw - float(np.dot(y_raw, z_world)) * z_world
         ny = float(np.linalg.norm(y_horiz))
