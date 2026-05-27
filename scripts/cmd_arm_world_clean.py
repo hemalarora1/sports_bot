@@ -27,19 +27,23 @@ Frame conventions
 
 Reference orientation (ori 0 0 0)
 -----------------------------------
-  Face toward opponent  (+X world)   ← EE +Y axis
-  Handle pointing down  (-Z world)   ← EE +Z axis
+  Face toward opponent  (+X world)
+  Handle pointing down  (-Z world)
+
+  Why the 45° offset:  the Franka URDF has panda_hand_joint with
+  rpy="0 0 -0.7854" (-45° Z).  OpenSai's EE frame = link8 (before
+  that rotation).  The paddle face is along panda_hand +Y, which in
+  link8 frame = Rz(-45°)·[0,1,0] = [1/√2, 1/√2, 0].
 
   Internally:
-    EE +X → World +Y  (right-hand completion)
-    EE +Y → World +X  (face toward opponent)
-    EE +Z → World -Z  (handle pointing down)
+    link8 +X → World [1/√2,  1/√2,  0]
+    link8 +Y → World [1/√2, -1/√2,  0]
+    link8 +Z → World [0,     0,    -1]  (handle down)
 
-  R_W_E_ref = [[0, 1, 0],
-               [1, 0, 0],
-               [0, 0,-1]]
-
-  (This is Rz(90°) @ Rx(180°) relative to the old +X-face convention.)
+  Face normal in link8 frame: [1/√2, 1/√2, 0]  (panda_hand +Y)
+  R_W_E_ref = [[1/√2,  1/√2,  0],
+               [1/√2, -1/√2,  0],
+               [0,     0,    -1]]
 
 ori command convention
 -----------------------
@@ -161,16 +165,22 @@ from sports_bot.utils.frames import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # Reference orientation
 # ---------------------------------------------------------------------------
-# Physical EE convention (MTEN paddle, handle along EE +Z, face normal = EE +Y):
-#   EE +Y → World +X   face toward opponent
-#   EE +Z → World -Z   handle pointing down
-#   EE +X → World +Y   right-hand completion (= EE +Y × EE +Z in world)
+# OpenSai EE frame = Franka link8 frame (NOT panda_hand).
+# panda_hand_joint has rpy="0 0 -π/4", so panda_hand is Rz(-45°) from link8.
+# Paddle face = panda_hand +Y.  In link8 coords: Rz(-45°)·[0,1,0] = [1/√2, 1/√2, 0].
+# Handle = panda_hand +Z = link8 +Z.
+#
+# At ori 0 0 0: face toward +X opponent, handle pointing down (-Z world).
+#   link8 +X → World [1/√2,  1/√2,  0]
+#   link8 +Y → World [1/√2, -1/√2,  0]
+#   link8 +Z → World [0,     0,    -1]   handle down
 #
 # ori 0 0 0 reproduces this exactly; all RPY commands are applied on top.
+_S2 = math.sqrt(0.5)   # 1/√2
 R_W_E_REF: np.ndarray = np.array([
-    [0.,  1.,  0.],
-    [1.,  0.,  0.],
-    [0.,  0., -1.],
+    [_S2,  _S2,  0.],
+    [_S2, -_S2,  0.],
+    [0.,   0.,  -1.],
 ])
 
 # ---------------------------------------------------------------------------

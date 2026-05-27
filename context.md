@@ -237,9 +237,11 @@ T_A_E_desired = T_W_A(t)⁻¹ ⊕ T_W_P_goal ⊕ T_E_P⁻¹    # world goal → 
 `world_racket_to_arm_ee` in `frames.py` does the inverse-compose.
 
 **Paddle geometry (MTEN MT-01, as mounted 2026-05-23):**
-- Handle mounted straight along EE +Z — no rotation adapter.
-- Face normal is **perpendicular to the handle** → in the EE XY plane → **face normal = EE +X**.
+- Handle mounted straight along EE +Z (= link8 +Z = panda_hand +Z) — no rotation adapter.
+- OpenSai EE frame = Franka **link8** frame. `panda_hand_joint` has `rpy="0 0 -0.7854"` (-45° Z), so panda_hand = Rz(-45°) @ link8.
+- Paddle face = **panda_hand +Y** = `[1/√2, 1/√2, 0]` in link8 frame (45° between link8 +X and +Y).
 - Natural operating pose: face toward +X opponent, handle pointing down (-Z world).
+- `R_W_E_REF = [[1/√2, 1/√2, 0], [1/√2, -1/√2, 0], [0, 0, -1]]` — verified 2026-05-26.
 - `picklebot.xml` `compliantFrame xyz="0 0 0.35"` — OpenSai's `current_position`/`goal_position`
   track the **sweet spot** (35 cm along EE +Z from the flange) directly. No code offset needed.
 - `T_E_P` in `arm_marker_calibration.json`: translation `[0, 0, 0]` (zeroed after compliantFrame fix);
