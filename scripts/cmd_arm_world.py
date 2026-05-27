@@ -79,6 +79,13 @@ from sports_bot.utils.frames import (  # noqa: E402
 
 _MARKER_DROPOUT_RESET_S = 3.0   # re-seed EMA if markers absent this long
 _MARKER_MAX_JUMP_M = 0.10       # discard T_W_A reading if position jumps this far
+# Orientation jump threshold: Frobenius |R_raw - R_smooth|.
+# Formula: 2*sqrt(1 - cos(θ)) where θ is the rotation angle between them.
+#   θ = 25° → 0.44   (legitimate fast cart rotation, allow)
+#   θ = 45° → 0.77   (physically impossible in one 20ms tick, discard)
+# A Motive marker-ID swap flips the y-hat vector ~180° → |diff|_F ≈ 2.83.
+# We use 0.6 (~20° equivalent lag tolerance) as the threshold.
+_MARKER_MAX_ORI_JUMP = 0.6
 
 
 # ---------- Helpers -----------------------------------------------------------
@@ -179,6 +186,8 @@ def run(
     z_max: float,
     filter_alpha: float,
     goal_deadband_m: float,
+    lock_orientation: bool = False,
+    max_goal_vel_ms: float = 0.3,
 ) -> None:
     cmd_q: queue.Queue[str] = queue.Queue()
     t_stdin = threading.Thread(target=_stdin_reader, args=(cmd_q,), daemon=True)
@@ -188,6 +197,15 @@ def run(
     R_g, t_g = T_W_P_goal
     print(f"\n[cmd_arm] holding sweet spot at world t="
           f"[{t_g[0]:+.3f}, {t_g[1]:+.3f}, {t_g[2]:+.3f}]")
+
+    # Orientation lock: when set, this arm-frame rotation is written every tick
+    # instead of the R_A_E re-derived from T_W_A.  This eliminates the ~0.2°
+    # per-command orientation twitch caused by OptiTrack marker angular noise.
+    # Position tracking (world→arm via T_W_A) continues normally when locked.
+    # When the cart rotates significantly, unlock to let world-frame orientation
+    # compensation kick back in.
+    locked_R_A_E: Optional[np.ndarray] = None  # None = unlocked
+
     _print_prompt()
 
     dt = 1.0 / rate_hz
@@ -213,11 +231,41 @@ def run(
                 if cmd == "":
                     _print_prompt()
                     continue
+
+                # Orientation lock/unlock controls.
+                if cmd.lower() == "lock":
+                    if locked_R_A_E is not None:
+                        print("[cmd_arm] orientation already locked.")
+                    else:
+                        print("[cmd_arm] orientation will be locked on the "
+                              "next marker frame.")
+                        lock_orientation = True
+                    _print_prompt()
+                    continue
+                if cmd.lower() == "unlock":
+                    locked_R_A_E = None
+                    lock_orientation = False
+                    last_sent_t = None  # force rewrite with live R_A_E
+                    print("[cmd_arm] orientation unlocked — re-deriving from "
+                          "T_W_A each tick.")
+                    _print_prompt()
+                    continue
+                if cmd.lower() == "status":
+                    ori_state = ("LOCKED" if locked_R_A_E is not None
+                                 else "live (unlocked)")
+                    _, t_g = T_W_P_goal
+                    print(f"[cmd_arm] target_W=[{t_g[0]:+.3f},{t_g[1]:+.3f},"
+                          f"{t_g[2]:+.3f}]  orientation={ori_state}")
+                    _print_prompt()
+                    continue
+
                 parsed = _parse_target(cmd)
                 if parsed is None:
-                    print(f"[cmd_arm] unrecognised: '{cmd}' — "
-                          f"expected 'x y z', 'r dx dy dz', "
-                          f"'x y z nx ny nz', 'r dx dy dz nx ny nz', or 'q'")
+                    print(f"[cmd_arm] unrecognised: '{cmd}'\n"
+                          f"          position : x y z  |  r dx dy dz\n"
+                          f"          with normal: x y z nx ny nz  |  "
+                          f"r dx dy dz nx ny nz\n"
+                          f"          controls  : lock | unlock | status | q")
                     _print_prompt()
                 else:
                     t_new, n_new, is_relative = parsed
@@ -228,14 +276,17 @@ def run(
                         # This is the common case — do NOT snap to a synthesised
                         # face normal (that was the bug causing arm lurches).
                         T_W_P_goal = (T_W_P_goal[0], t_new)
-                        ori_tag = "orientation preserved"
+                        ori_tag = (f"ori={'LOCKED' if locked_R_A_E is not None else 'preserved'}")
                     else:
                         # Explicit face normal given: synthesise orientation.
-                        # Roll is chosen by the world-up heuristic.
+                        # Roll is chosen by the world-up heuristic.  Also clear
+                        # any orientation lock so the new face normal takes effect.
                         T_W_P_goal = (_R_from_face_normal(n_new), t_new)
+                        locked_R_A_E = None
+                        lock_orientation = False
                         ori_tag = (f"face_normal=[{n_new[0]:+.2f},"
                                    f"{n_new[1]:+.2f},{n_new[2]:+.2f}]"
-                                   f" (roll from world-up heuristic)")
+                                   f" (roll from world-up heuristic; lock cleared)")
                     last_sent_t = None  # force immediate write to new target
                     tag = "relative→" if is_relative else ""
                     print(f"[cmd_arm] new target ({tag}world t="
@@ -258,14 +309,24 @@ def run(
             R_raw, t_raw = T_W_A_raw
             dropout = (t_smooth is None or
                        t_loop - last_marker_t > _MARKER_DROPOUT_RESET_S)
-            if (not dropout and
-                    float(np.linalg.norm(t_raw - t_smooth)) > _MARKER_MAX_JUMP_M):
-                # Looks like a bad frame or Motive marker-ID swap — discard.
+            if not dropout:
+                pos_jump = float(np.linalg.norm(t_raw - t_smooth))
+                # Orientation jump: Frobenius |R_raw - R_smooth|.
+                # Catches Motive marker-ID swaps, which barely move the midpoint
+                # (t_W_A) but flip the y-hat vector ~180°, making R_W_A garbage.
+                # The position-only check above misses this entirely.
+                ori_jump = float(np.linalg.norm(R_raw - R_smooth, 'fro'))
+                bad_frame = (pos_jump > _MARKER_MAX_JUMP_M
+                             or ori_jump > _MARKER_MAX_ORI_JUMP)
+            else:
+                bad_frame = False
+            if bad_frame:
                 if t_loop - last_warn > 1.0:
                     last_warn = t_loop
-                    delta = float(np.linalg.norm(t_raw - t_smooth))
-                    print(f"[cmd_arm] T_W_A jumped {delta*100:.1f} cm in one tick "
-                          f"— discarding bad frame, EMA resets on next valid read.")
+                    print(f"[cmd_arm] T_W_A bad frame: "
+                          f"pos_jump={pos_jump*100:.1f}cm  "
+                          f"ori_jump={ori_jump:.2f} (>{_MARKER_MAX_ORI_JUMP:.2f}) "
+                          f"— discarding, arm holds last goal.")
                 last_marker_t = -math.inf
             else:
                 if dropout:
@@ -277,34 +338,70 @@ def run(
                                 + (1.0 - filter_alpha) * t_smooth)
                     R_smooth = (filter_alpha * R_raw
                                 + (1.0 - filter_alpha) * R_smooth)
+                    # Re-orthogonalise R_smooth: linear EMA of rotation matrices
+                    # accumulates numerical drift (det drifts from 1, axes lose
+                    # orthogonality).  SVD projects back to the nearest SO(3)
+                    # element every tick — cheap at 3×3.
+                    U, _, Vt = np.linalg.svd(R_smooth)
+                    if np.linalg.det(U @ Vt) < 0:
+                        U[:, -1] *= -1   # ensure proper rotation, not reflection
+                    R_smooth = U @ Vt
                 last_marker_t = t_loop
                 T_W_A = (R_smooth, t_smooth)
 
                 R_A_E, t_A_E_raw = world_racket_to_arm_ee(
                     T_W_P_goal, T_W_A, cal.T_E_P)
+
+                # Capture orientation lock on first valid frame after `lock` cmd.
+                if lock_orientation and locked_R_A_E is None:
+                    locked_R_A_E = R_A_E.copy()
+                    print(f"[cmd_arm] orientation LOCKED (arm-frame R_A_E "
+                          f"captured). Type 'unlock' to release.")
+                    _print_prompt()
+
+                # Use locked orientation when set; otherwise live R_A_E.
+                R_to_write = (locked_R_A_E if locked_R_A_E is not None
+                              else R_A_E)
+
                 t_A_E_floored, floor_adj = enforce_paddle_floor(
-                    t_A_E_raw, R_A_E, T_W_A)
+                    t_A_E_raw, R_to_write, T_W_A)
                 t_A_E_clipped, was_clipped = clip_to_arm_workspace(
                     t_A_E_floored, r_max=reach_m, z_min=z_min, z_max=z_max)
                 was_clipped = was_clipped or floor_adj
+
+                # --- Goal velocity clamping -----------------------------------
+                # Cap how fast the arm-frame position goal can change per tick.
+                # Without this, a large/fast cart motion (real or marker glitch)
+                # instantly commands a large arm jump → violent motion.
+                # We ramp toward the desired goal at max_goal_vel_ms m/s.
+                vel_clamped = False
+                if last_sent_t is not None and max_goal_vel_ms > 0:
+                    max_step = max_goal_vel_ms / rate_hz
+                    delta = t_A_E_clipped - last_sent_t
+                    dist = float(np.linalg.norm(delta))
+                    if dist > max_step:
+                        t_A_E_clipped = last_sent_t + delta * (max_step / dist)
+                        vel_clamped = True
 
                 moved = (last_sent_t is None or
                          float(np.linalg.norm(t_A_E_clipped - last_sent_t))
                          > goal_deadband_m)
                 if moved:
-                    _write_arm_goal(r, keys, (R_A_E, t_A_E_clipped))
+                    _write_arm_goal(r, keys, (R_to_write, t_A_E_clipped))
                     last_sent_t = t_A_E_clipped.copy()
 
                 if t_loop - last_print >= print_interval_s:
                     last_print = t_loop
                     R_g, t_g = T_W_P_goal
                     tag = " CLIPPED" if was_clipped else ""
+                    tag += " VEL-CLAMPED" if vel_clamped else ""
+                    lock_tag = " [ORI LOCKED]" if locked_R_A_E is not None else ""
                     print(f"[cmd_arm] cart=[{t_smooth[0]:+.3f},{t_smooth[1]:+.3f},"
                           f"{t_smooth[2]:+.3f}]  "
                           f"target_W=[{t_g[0]:+.3f},{t_g[1]:+.3f},{t_g[2]:+.3f}]  "
                           f"goal_A=[{t_A_E_clipped[0]:+.3f},"
                           f"{t_A_E_clipped[1]:+.3f},"
-                          f"{t_A_E_clipped[2]:+.3f}]{tag}")
+                          f"{t_A_E_clipped[2]:+.3f}]{tag}{lock_tag}")
 
         elapsed = time.perf_counter() - t_loop
         sleep_t = dt - elapsed
@@ -347,6 +444,20 @@ def main() -> None:
     p.add_argument("--calibration", default=None)
     p.add_argument("--redis-host", default="localhost")
     p.add_argument("--redis-port", type=int, default=6379)
+    p.add_argument("--lock-orientation", action="store_true",
+                   help="Lock arm-frame orientation immediately at startup. "
+                        "Eliminates the ~0.2° per-command twitch from OptiTrack "
+                        "marker angular noise. Position tracking in world frame "
+                        "continues normally. Use 'unlock' at the prompt to "
+                        "re-enable live orientation. Equivalent to typing 'lock' "
+                        "as the first command.")
+    p.add_argument("--max-goal-vel-ms", type=float, default=0.3,
+                   help="Maximum rate at which the arm-frame position goal can "
+                        "change (m/s). Prevents violent arm motion when the cart "
+                        "is moved quickly or a marker glitch causes a large "
+                        "T_W_A jump. The goal ramps toward the desired value at "
+                        "this speed. Set 0 to disable (unsafe with fast cart "
+                        "motion). Default 0.3 m/s → 6 mm/tick at 50 Hz.")
     args = p.parse_args()
 
     cal_path = args.calibration or arm_marker_calibration_path()
@@ -402,12 +513,20 @@ def main() -> None:
           f"z∈[{args.z_min_m:+.2f},{args.z_max_m:+.2f}]m (arm frame)")
     print()
     print("Commands (all metres, world frame):")
-    print("  x y z              — absolute position, PRESERVE current orientation")
+    print("  x y z              — absolute position, preserve orientation")
     print("  x y z nx ny nz     — absolute position + explicit face normal")
     print("                       (roll filled by world-up heuristic)")
-    print("  r dx dy dz         — relative nudge, PRESERVE current orientation")
+    print("  r dx dy dz         — relative nudge, preserve orientation")
     print("  r dx dy dz nx ny nz — relative nudge + new face normal")
+    print("  lock               — lock arm-frame orientation (stops marker twitch)")
+    print("  unlock             — re-enable live orientation from T_W_A")
+    print("  status             — print current target and lock state")
     print("  q / quit           — exit (last goal stays in Redis)")
+    if args.lock_orientation:
+        print("\n[cmd_arm] --lock-orientation: will lock on first marker frame.")
+    print(f"[cmd_arm] goal velocity cap: "
+          f"{args.max_goal_vel_ms:.2f} m/s "
+          f"({'disabled' if args.max_goal_vel_ms <= 0 else f'{args.max_goal_vel_ms/args.rate_hz*1000:.1f} mm/tick'})")
 
     try:
         run(
@@ -421,6 +540,8 @@ def main() -> None:
             z_max=args.z_max_m,
             filter_alpha=args.marker_filter_alpha,
             goal_deadband_m=args.goal_deadband_mm / 1000.0,
+            lock_orientation=args.lock_orientation,
+            max_goal_vel_ms=args.max_goal_vel_ms,
         )
     except KeyboardInterrupt:
         print(f"\n[cmd_arm] interrupted — last goal stays in Redis.")

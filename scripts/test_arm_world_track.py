@@ -108,6 +108,9 @@ from sports_bot.utils.frames import (  # noqa: E402
 
 _MARKER_DROPOUT_RESET_S = 3.0   # re-seed EMA if markers absent this long
 _MARKER_MAX_JUMP_M = 0.10       # discard T_W_A reading if position jumps this far
+_MARKER_MAX_ORI_JUMP = 0.6      # Frobenius |R_raw - R_smooth|; ~20° equivalent.
+                                 # Catches Motive marker-ID swaps (flip ~180° → 2.83)
+                                 # which the position-only check misses entirely.
 
 
 # ---------- Helpers -----------------------------------------------------------
@@ -229,15 +232,20 @@ def run(
             R_raw, t_raw = T_W_A_raw
             dropout = (t_smooth is None or
                        t_loop - last_marker_t > _MARKER_DROPOUT_RESET_S)
-            if (not dropout and
-                    float(np.linalg.norm(t_raw - t_smooth)) > _MARKER_MAX_JUMP_M):
-                # Looks like a bad frame or Motive marker-ID swap — discard.
+            if not dropout:
+                pos_jump = float(np.linalg.norm(t_raw - t_smooth))
+                ori_jump = float(np.linalg.norm(R_raw - R_smooth, 'fro'))
+                bad_frame = (pos_jump > _MARKER_MAX_JUMP_M
+                             or ori_jump > _MARKER_MAX_ORI_JUMP)
+            else:
+                bad_frame = False
+            if bad_frame:
                 if t_loop - last_warn > 1.0:
                     last_warn = t_loop
-                    delta = float(np.linalg.norm(t_raw - t_smooth))
-                    print(f"[arm_track] T_W_A jumped {delta*100:.1f} cm in one "
-                          f"tick — discarding bad frame, EMA resets on next "
-                          f"valid read.")
+                    print(f"[arm_track] T_W_A bad frame: "
+                          f"pos_jump={pos_jump*100:.1f}cm  "
+                          f"ori_jump={ori_jump:.2f} (>{_MARKER_MAX_ORI_JUMP:.2f}) "
+                          f"— discarding, arm holds last goal.")
                 last_marker_t = -math.inf
             else:
                 if dropout:
@@ -249,6 +257,12 @@ def run(
                                 + (1.0 - filter_alpha) * t_smooth)
                     R_smooth = (filter_alpha * R_raw
                                 + (1.0 - filter_alpha) * R_smooth)
+                    # Re-orthogonalise: linear EMA drifts from SO(3); SVD
+                    # projects back to nearest proper rotation each tick.
+                    U, _, Vt = np.linalg.svd(R_smooth)
+                    if np.linalg.det(U @ Vt) < 0:
+                        U[:, -1] *= -1
+                    R_smooth = U @ Vt
                 last_marker_t = t_loop
                 T_W_A = (R_smooth, t_smooth)
 

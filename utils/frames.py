@@ -590,10 +590,13 @@ FRANKA_DEFAULT_REACH_M = 0.75
 FRANKA_DEFAULT_Z_MIN_M = -0.10
 FRANKA_DEFAULT_Z_MAX_M = 1.00
 
-# Distance from EE flange to the far end of the paddle along EE +Z.
-# Used to enforce a floor-clearance constraint: the paddle tip must not go
-# below the world floor even if the caller's hardware z_min would allow it.
-PADDLE_TIP_OFFSET_M = 0.45
+# Distance from the sweet spot (compliant frame, 35 cm along EE +Z from
+# flange) to the far tip of the paddle along EE +Z.
+# Physical layout: flange → 35 cm → sweet spot / compliant frame
+#                              → 10 cm → paddle tip (far end of face)
+# Total flange→tip = 45 cm; sweet-spot→tip = 10 cm.
+# Used by enforce_paddle_floor to ensure the paddle tip stays above the floor.
+PADDLE_TIP_OFFSET_M = 0.10
 
 
 def clip_to_arm_workspace(
