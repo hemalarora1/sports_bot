@@ -12,11 +12,11 @@
 			linkName="end-effector">
 			<velocitySaturation enabled="false" />
 			<otg type="acceleration"
-				maxLinearVelocity="0.1"
-				maxAngularVelocity="1.0"
-				maxLinearAcceleration="1.5"
-				maxAngularAcceleration="3.0"
-				maxLinearJerk="5.0"
+				maxLinearVelocity="0.5"
+				maxAngularVelocity="3.0"
+				maxLinearAcceleration="2.0"
+				maxAngularAcceleration="6.0"
+				maxLinearJerk="10.0"
 				maxAngularJerk="100" />
 			<compliantFrame xyz="0 0 0.35"
 							rpy="0 0 0" />
@@ -24,10 +24,14 @@
 			<orientationGains kp="100.0" kv="20.0" ki="0.0"/>
 		</motionForceTask>
 
+		<!-- Null-space posture task: keeps arm in a dextrous mid-range configuration.
+		     Goal is written at startup (and every 2 s) by cmd_arm_world_clean.py via
+		     the opensai::controllers::FrankaRobot::cartesian_controller::joint_task::goal_position key.
+		     kp=50 is strong enough to hold posture without competing with the Cartesian task. -->
 		<jointTask name="joint_task">
 			<velocitySaturation enabled="true" />
 			<otg type="disabled" />
-			<gains kp="20.0" kv="10.0" ki="0.0" />
+			<gains kp="50.0" kv="14.0" ki="0.0" />
 		</jointTask>
 	</controller>
 

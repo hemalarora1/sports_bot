@@ -83,7 +83,7 @@ Debug output
     [goal_A]  — computed arm-frame position goal (+ CLIPPED flag if hit limit)
     [current] — sweet-spot world position from FK, position error, angle error,
                 and current orientation expressed as "ori rx ry rz"
-    [joints]  — joint angles; q5 flagged ⚠SING if |q5| < 20° (wrist singularity)
+    [joints]  — joint angles (degrees)
     [ns_goal] — null-space q5 target, current q5, gap, and write-success status
 
   Marker warnings printed immediately whenever a marker is missing or jumps
@@ -169,13 +169,23 @@ _MARKER_JUMP_M = 0.04    # position jump threshold per tick (m); 4 cm in 20 ms
 _WARN_INTERVAL_S = 1.0   # suppress repeated warnings within this window (s)
 
 # ---------------------------------------------------------------------------
-# Null-space / singularity constants
+# Null-space posture constants
 # ---------------------------------------------------------------------------
-# The Franka wrist singularity is at q5 = 0°.  The natural IK solution for
-# "face +X, handle -Z" drives q5 toward 0°.  We override q5 in the null-space
-# joint goal to keep the wrist clear of the singularity.
-_Q5_NS_TARGET_RAD: float = math.radians(-45.0)   # default null-space q5 goal
-_Q5_SINGULARITY_DEG: float = 20.0                  # |q5| < this → flag ⚠SING
+# A known-good, dextrous mid-range configuration verified by free-driving.
+# Written to Redis at startup and every 2 s so the null-space joint task
+# maintains a comfortable arm posture while the Cartesian task tracks the
+# sweet-spot position/orientation.
+#
+# All values in radians.  Override via --ns-posture on the command line.
+_NS_POSTURE_DEFAULT: List[float] = [
+    -0.0185313,   # q1
+     0.120268,    # q2
+    -0.0260702,   # q3
+    -1.5398,      # q4  (elbow — well within joint limits)
+     0.0762534,   # q5
+     1.77002,     # q6
+    -0.778473,    # q7
+]
 
 # ---------------------------------------------------------------------------
 # Rotation helpers
@@ -247,32 +257,21 @@ def _ns_goal_key(robot_name: str) -> str:
 def _write_nullspace_goal(
     r: redis.Redis,
     robot_name: str,
-    q5_rad: float = _Q5_NS_TARGET_RAD,
-) -> Optional[List[float]]:
-    """Read current joints, override q5 to avoid wrist singularity, write to Redis.
+    posture: List[float],
+) -> bool:
+    """Write a full 7-joint posture as the null-space (joint task) goal.
 
-    The Franka wrist singularity is at q5 = 0°.  Setting q5 to -45° (default)
-    in the null-space goal directs the redundancy resolver to use the
-    non-singular IK solution, enabling reliable orientation convergence.
+    Unlike the old q5-override approach, this writes the complete target
+    posture directly.  The Cartesian task retains strict priority; the
+    joint task uses the null-space (1 DOF for a 7-DOF arm with 6 Cartesian
+    DOF) to pull toward this posture as a secondary objective.
 
-    Joints 1-4 and 6-7 are taken from the current sensor reading so the
-    null-space task only pulls on q5, not on the whole arm.
-
-    Returns the written 7-vector (radians), or None if the joints key is absent.
+    Returns True on success, False if the posture list is invalid.
     """
-    sensor_key = f'opensai::sensors::{robot_name}::joint_positions'
-    q_raw = r.get(sensor_key)
-    if q_raw is None:
-        return None
-    try:
-        q = list(json.loads(q_raw))
-        if len(q) != 7:
-            return None
-    except Exception:
-        return None
-    q[4] = float(q5_rad)
-    r.set(_ns_goal_key(robot_name), json.dumps(q))
-    return q
+    if len(posture) != 7:
+        return False
+    r.set(_ns_goal_key(robot_name), json.dumps([float(v) for v in posture]))
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +407,7 @@ def run(
     z_min_m: float,
     z_max_m: float,
     robot_name: str = 'FrankaRobot',
-    ns_q5_rad: float = _Q5_NS_TARGET_RAD,
+    ns_posture: List[float] = _NS_POSTURE_DEFAULT,
     write_ns_goal: bool = True,
 ) -> None:
 
@@ -590,18 +589,14 @@ def run(
             # ----------------------------------------------------------
             # Null-space goal: re-write every debug tick so it survives
             # a controller restart (controller re-initialises from sensor
-            # state, we push the good q5 goal back within 2 s).
+            # state, we push the posture goal back within 2 s).
             # ----------------------------------------------------------
-            ns_q5_goal_deg = math.degrees(ns_q5_rad)
             if write_ns_goal:
-                ns_result = _write_nullspace_goal(r, robot_name, ns_q5_rad)
-                ns_last_ok = ns_result is not None
+                ns_last_ok = _write_nullspace_goal(r, robot_name, ns_posture)
 
             # ----------------------------------------------------------
-            # Joint positions — read once, re-use for both the joints line
-            # and the ns_goal line so we only hit Redis once.
+            # Joint positions.
             # ----------------------------------------------------------
-            q5_now_deg: Optional[float] = None
             q_line = (f'[joints]  unavailable'
                       f'  (key: opensai::sensors::{robot_name}::joint_positions)')
             sensor_key = f'opensai::sensors::{robot_name}::joint_positions'
@@ -610,16 +605,10 @@ def run(
                 try:
                     q_vals = json.loads(q_raw)
                     q_deg = [math.degrees(v) for v in q_vals]
-                    q5_now_deg = q_deg[4]   # q5 is index 4 (0-based)
-                    sing_tag = (
-                        ' ⚠SING'
-                        if abs(q5_now_deg) < _Q5_SINGULARITY_DEG else ''
-                    )
                     q_parts = [
                         f'q{i+1}={q_deg[i]:+6.1f}°'
                         for i in range(len(q_deg))
                     ]
-                    q_parts[4] += sing_tag   # annotate q5
                     q_line = '[joints]  ' + '  '.join(q_parts)
                 except Exception:
                     pass
@@ -628,25 +617,12 @@ def run(
             # Null-space goal status line.
             # ----------------------------------------------------------
             if write_ns_goal:
-                if q5_now_deg is not None:
-                    dq5 = q5_now_deg - ns_q5_goal_deg
-                    ns_status = '[written OK]' if ns_last_ok else '[WRITE FAILED]'
-                    ns_line = (
-                        f'[ns_goal]  q5_tgt={ns_q5_goal_deg:+.1f}°'
-                        f'  q5_now={q5_now_deg:+.1f}°'
-                        f'  Δq5={dq5:+.1f}°'
-                        f'  {ns_status}'
-                    )
-                    if not ns_last_ok:
-                        ns_line += (f'  sensor key missing:'
-                                    f' opensai::sensors::{robot_name}::joint_positions')
-                else:
-                    ns_status = '[written OK]' if ns_last_ok else '[WRITE FAILED — joints key missing]'
-                    ns_line = (
-                        f'[ns_goal]  q5_tgt={ns_q5_goal_deg:+.1f}°'
-                        f'  q5_now=?'
-                        f'  {ns_status}'
-                    )
+                ns_status = '[written OK]' if ns_last_ok else '[WRITE FAILED]'
+                ns_tgt_str = '  '.join(
+                    f'q{i+1}={math.degrees(v):+.1f}°'
+                    for i, v in enumerate(ns_posture)
+                )
+                ns_line = f'[ns_goal]  {ns_status}  tgt: {ns_tgt_str}'
             else:
                 ns_line = '[ns_goal]  DISABLED (--no-ns-goal)'
 
@@ -739,15 +715,14 @@ def main() -> None:
                          'Default: canonical sports_bot/optitrack/ location.')
     ap.add_argument('--redis-host', default='localhost')
     ap.add_argument('--redis-port', type=int, default=6379)
-    # --- Null-space / singularity fix ---
-    ap.add_argument('--ns-q5-deg', type=float, default=-45.0, metavar='DEG',
-                    help='Null-space goal for joint 5 (degrees). '
-                         'Default -45° keeps the wrist away from the singularity '
-                         'at q5=0°. Try -60° if -45° is still insufficient.')
+    # --- Null-space posture ---
+    ap.add_argument('--ns-posture', type=float, nargs=7, metavar='RAD',
+                    default=None,
+                    help='Full 7-joint null-space posture goal (radians). '
+                         'Default: the built-in dextrous mid-range configuration '
+                         f'({" ".join(f"{v:.4f}" for v in _NS_POSTURE_DEFAULT)}).')
     ap.add_argument('--no-ns-goal', action='store_true',
-                    help='Disable null-space goal writes entirely. '
-                         'Useful for A/B comparison: run without --no-ns-goal first, '
-                         'then with it, to confirm the fix is the cause of improvement.')
+                    help='Disable null-space goal writes entirely (A/B comparison).')
     args = ap.parse_args()
 
     # ------------------------------------------------------------------
@@ -841,31 +816,29 @@ def main() -> None:
           f'marker jump threshold: {_MARKER_JUMP_M * 100:.0f} cm/tick')
 
     # ------------------------------------------------------------------
-    # Null-space goal — write once at startup.
+    # Null-space posture goal — write once at startup.
     # The run loop re-writes it every 2 s so it survives a controller
     # restart during the session.
     # ------------------------------------------------------------------
-    ns_q5_rad = math.radians(args.ns_q5_deg)
+    ns_posture: List[float] = (
+        list(args.ns_posture) if args.ns_posture is not None
+        else _NS_POSTURE_DEFAULT
+    )
     if not args.no_ns_goal:
-        ns_init = _write_nullspace_goal(r, args.robot_name, ns_q5_rad)
-        if ns_init is None:
-            print(
-                f'\n[cmd_arm] WARNING: null-space goal write skipped at startup\n'
-                f'           Joint sensor key not yet in Redis:\n'
-                f'           opensai::sensors::{args.robot_name}::joint_positions\n'
-                f'           The run loop will retry every 2 s — this is normal if\n'
-                f'           the controller just started and hasn\'t published joints yet.'
+        ns_ok = _write_nullspace_goal(r, args.robot_name, ns_posture)
+        if ns_ok:
+            tgt_str = '  '.join(
+                f'q{i+1}={math.degrees(v):+.1f}°'
+                for i, v in enumerate(ns_posture)
             )
-        else:
-            q5_before_deg = math.degrees(json.loads(
-                r.get(f'opensai::sensors::{args.robot_name}::joint_positions')
-            )[4])
             print(
-                f'\n[cmd_arm] null-space goal written:'
-                f'  q5 {q5_before_deg:+.1f}° → target {args.ns_q5_deg:+.1f}°\n'
+                f'\n[cmd_arm] null-space posture goal written:\n'
+                f'           {tgt_str}\n'
                 f'           key: {_ns_goal_key(args.robot_name)}\n'
                 f'           (re-written every 2 s; use --no-ns-goal to disable)'
             )
+        else:
+            print(f'\n[cmd_arm] WARNING: null-space goal write failed (bad posture list?)')
     else:
         print(f'\n[cmd_arm] null-space goal DISABLED (--no-ns-goal)')
 
@@ -896,7 +869,7 @@ def main() -> None:
             z_min_m=args.z_min_m,
             z_max_m=args.z_max_m,
             robot_name=args.robot_name,
-            ns_q5_rad=ns_q5_rad,
+            ns_posture=ns_posture,
             write_ns_goal=not args.no_ns_goal,
         )
     except KeyboardInterrupt:
