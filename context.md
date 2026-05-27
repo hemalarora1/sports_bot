@@ -239,15 +239,16 @@ T_A_E_desired = T_W_A(t)⁻¹ ⊕ T_W_P_goal ⊕ T_E_P⁻¹    # world goal → 
 **Paddle geometry (MTEN MT-01, as mounted 2026-05-23):**
 - Handle mounted straight along EE +Z — no rotation adapter.
 - Face normal is **perpendicular to the handle** → in the EE XY plane → **face normal = EE +X**.
-- `T_E_P`: translation `[0, 0, 0.35]` (sweet spot 35 cm along EE +Z); rotation maps P's +Z to EE +X:
-  ```
-  R_E_P = [[0, 0, 1],
-            [1, 0, 0],
-            [0, 1, 0]]
-  ```
-- Paddle tip (far end of paddle) is ~**45 cm** along EE +Z from the flange (`PADDLE_TIP_OFFSET_M = 0.45`).
+- Natural operating pose: face toward +X opponent, handle pointing down (-Z world).
+- `picklebot.xml` `compliantFrame xyz="0 0 0.35"` — OpenSai's `current_position`/`goal_position`
+  track the **sweet spot** (35 cm along EE +Z from the flange) directly. No code offset needed.
+- `T_E_P` in `arm_marker_calibration.json`: translation `[0, 0, 0]` (zeroed after compliantFrame fix);
+  rotation unchanged (maps P's +Z to EE +X — kept for legacy `world_racket_to_arm_ee` callers).
+- Paddle tip (far end of paddle) is ~**45 cm** along EE +Z from the flange;
+  **10 cm** past the sweet spot (`PADDLE_TIP_OFFSET_M = 0.10`).
 
 `verify_arm_calibration.py --init` writes these as the starter defaults.
+After the 2026-05-26 fix: `T_W_E ≈ T_W_P` when verifying (sweet spot = compliant frame).
 
 **Floor collision avoidance:** `enforce_paddle_floor(t_A_E, R_A_E, T_W_A)` in `frames.py` computes the world-frame Z of the commanded paddle tip exactly:
 ```
@@ -267,6 +268,7 @@ If below floor + 5 cm clearance, raises the EE goal in arm-frame Z. Called befor
 | `scripts/verify_arm_calibration.py` | `--init` writes starter JSON; bare run prints T_W_A / T_W_E / T_W_P live |
 | `scripts/test_arm_world_track.py` | Hold a fixed world racket pose as cart moves |
 | `scripts/base_intercept.py` | Ball intercept loop; `--arm-track` adds arm tracking to base-only mode |
+| `scripts/cmd_arm_world_clean.py` | Clean interactive world-frame arm commander; no filtering/locking |
 
 **Motive setup (one-time):** Mount two spherical markers (not flat stickers — visible from any angle) standalone — do NOT add to cart rigid body 11. Enable Labeled Markers in Motive. Manually label both in the Markers pane to lock IDs.
 
@@ -344,8 +346,17 @@ python sports_bot/scripts/send_base_goal.py --robot-rigid-body-id 11 \
 ```
 Default tolerances: 100 mm / 5°. Tighten with `--pos-tol-mm 20 --yaw-tol-deg 2` after fresh bridge restart.
 
-**Step 6 — OpenSai cartesian controller** (arm sessions only — started outside this repo):
+**Step 6 — OpenSai cartesian controller** (arm sessions only):
 ```bash
+cd ~/OpenSai
+./scripts/launch.sh sports_bot/picklebot.xml
+# launch.sh starts redis-server if not running, runs ./bin/OpenSai_main,
+# and opens the web UI via tmux. Ctrl-C kills OpenSai_main cleanly.
+#
+# To run without the UI (background / headless):
+#   ./bin/OpenSai_main sports_bot/picklebot.xml
+#
+# Verify controller is live:
 redis-cli get opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::current_position
 redis-cli get opensai::controllers::FrankaRobot::active_controller_name  # → "cartesian_controller"
 ```
@@ -353,9 +364,30 @@ redis-cli get opensai::controllers::FrankaRobot::active_controller_name  # → "
 **Step 7 — Verify arm calibration:**
 ```bash
 python sports_bot/scripts/verify_arm_calibration.py  # prints T_W_A, T_W_E, T_W_P
+# After the 2026-05-26 compliantFrame fix: T_W_E ≈ T_W_P (they coincide,
+# T_E_P translation is now 0 — sweet spot IS the compliant frame).
 ```
 
-**Step 8 — Arm + intercept loop:**
+**Step 8 — Manual arm world-frame commanding (diagnostic / setup):**
+```bash
+cd ~/OpenSai && conda activate opensai
+python sports_bot/scripts/cmd_arm_world_clean.py
+# Starts at current arm pose — no lurch.
+# Prints current orientation as "ori rx ry rz" equivalent.
+#
+# Reference orientation (ori 0 0 0):
+#   face toward +X opponent, handle pointing down (-Z world)
+#
+# Useful first commands:
+#   0.3 0.0 0.8          move sweet spot to (0.3, 0, 0.8) world, keep ori
+#   ori 0 0 0            snap to reference pose (face +X, handle down)
+#   ori 0 10 0           pitch face 10° toward floor
+#   0.3 0.0 0.8 0 0 0    move + set reference orientation simultaneously
+#   r 0.0 0.0 -0.1       nudge 10 cm down, keep orientation
+#   q                    quit (last goals stay in Redis)
+```
+
+**Step 9 — Arm + intercept loop:**
 ```bash
 python sports_bot/scripts/base_intercept.py \
     --ball-rigid-body-id 8 --strike-plane-x 0.60 \
@@ -393,6 +425,7 @@ redis-cli get opensai::controllers::FrankaRobot::cartesian_controller::cartesian
 
 ## Change log
 
+- **2026-05-26** — Double-counted EE offset bug fixed. `picklebot.xml` `compliantFrame` moved from `xyz="0 0 0"` to `xyz="0 0 0.35"` — OpenSai now tracks the sweet spot directly in `current_position`/`goal_position`. `T_E_P.translation_m` zeroed in `arm_marker_calibration.json` (rotation kept for legacy callers). `PADDLE_TIP_OFFSET_M` corrected to `0.10` (from sweet spot, not raw flange). New `cmd_arm_world_clean.py`: no EMA/velocity-clamping/orientation-lock/T_E_P in loop; world-frame RPY commands (`ori rx ry rz`) with reference = face toward +X opponent, handle down; per-marker jump detection; both goals written every tick. OpenSai launch command (`./scripts/launch.sh sports_bot/picklebot.xml`) documented in bringup Step 6.
 - **2026-05-23** — T_E_P corrected: translation `[0,0,0.368]→[0,0,0.35]`; rotation unchanged (face normal = EE +X — handle is along EE +Z, face is perpendicular). `PADDLE_TIP_OFFSET_M=0.45` added. `enforce_paddle_floor` replaces worst-case z_min computation with exact world-Z of commanded paddle tip using live T_W_A and R_A_E.
 - **2026-05-22** — arm world-frame tracking landed. Marker-pair midpoint → T_W_A; T_E_P persisted in `arm_marker_calibration.json`; `world_racket_to_arm_ee` + `clip_to_arm_workspace` in `frames.py`. `base_bridge.py` `--periodic-refresh-s` added to kill held-goal drift. `base_intercept.py` `--arm-track` mode + world-frame tracking-error diagnostic.
 - **2026-05-19** — base-frame calibration captured on cart. `T_B_C=(-0.035, +0.009, -7.16°)`, RMS 3.71 mm/0.37°. Bridge verified end-to-end; `send_base_goal.py` added. Switched to multicast streaming (laptop static IP `172.24.68.204`); patched macOS NatNet data socket bind bug. Phase 3b EKF implemented as analyzer tool (not FSM swap). Tracker switched to volley-only defaults for bring-up.

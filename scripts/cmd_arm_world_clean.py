@@ -49,14 +49,31 @@ ori command convention
   displays its equivalent "ori rx ry rz" so you know where you are.
   The arm holds that orientation until you send the first ori command.
 
+Null-space / wrist-singularity fix
+-----------------------------------
+  At startup (and every 2 s in the run loop) the script writes a null-space
+  joint goal to Redis with q5 = --ns-q5-deg (default -45°).  This keeps the
+  Franka wrist away from the singularity at q5 = 0° where orientation tracking
+  breaks down.  Only q5 is overridden; joints 1-4, 6-7 track the current arm
+  configuration.
+
+  Redis key written:
+    opensai::controllers::<robot>
+        ::cartesian_controller::joint_task::goal_position
+
+  Use --no-ns-goal to disable (useful for A/B comparison).
+
 Commands (all metres / degrees, world frame)
 --------------------------------------------
-  x y z                   absolute position; keep orientation
-  r dx dy dz              relative position delta; keep orientation
-  ori rx ry rz            set orientation (° from reference); keep position
-  x y z rx ry rz          set position + orientation
-  r dx dy dz rx ry rz     relative position + set orientation
-  q / quit                exit (last goals remain in Redis)
+  x y z                      absolute position; keep orientation
+  r dx dy dz                 relative position delta; keep orientation
+  ori rx ry rz               set orientation from reference (°)
+  ori r drx dry drz          nudge orientation by deltas (° added to current goal)
+  x y z rx ry rz             set position + set orientation
+  r dx dy dz rx ry rz        relative position + set orientation
+  x y z r drx dry drz        set position + nudge orientation
+  r dx dy dz r drx dry drz   relative position + nudge orientation
+  q / quit                   exit (last goals remain in Redis)
 
 Debug output
 ------------
@@ -66,6 +83,8 @@ Debug output
     [goal_A]  — computed arm-frame position goal (+ CLIPPED flag if hit limit)
     [current] — sweet-spot world position from FK, position error, angle error,
                 and current orientation expressed as "ori rx ry rz"
+    [joints]  — joint angles; q5 flagged ⚠SING if |q5| < 20° (wrist singularity)
+    [ns_goal] — null-space q5 target, current q5, gap, and write-success status
 
   Marker warnings printed immediately whenever a marker is missing or jumps
   more than 4 cm in a single 20 ms tick (likely OptiTrack ID swap or dropout).
@@ -80,11 +99,19 @@ Examples
   # Start at specific world XY, read Z from current pose:
   python sports_bot/scripts/cmd_arm_world_clean.py --x 0.5 --y 0.0
 
+  # Override null-space q5 target (default -45°):
+  python sports_bot/scripts/cmd_arm_world_clean.py --ns-q5-deg -60
+
+  # Disable null-space goal for comparison:
+  python sports_bot/scripts/cmd_arm_world_clean.py --no-ns-goal
+
   # At the prompt:
   0.5 0.0 0.9             # move sweet spot to (0.5, 0, 0.9) world
   r 0.0 0.0 -0.1          # nudge 10 cm down
-  ori 0 10 0              # tilt face 10° downward from reference
+  ori 0 10 0              # tilt face 10° downward from reference (absolute)
+  ori r 0 5 0             # nudge face 5° further down from current goal
   0.5 0.0 0.9 0 10 0      # move + set orientation simultaneously
+  r 0 0 0 r 0 5 0         # stay put, nudge face 5° down
   q                       # quit
 """
 from __future__ import annotations
@@ -140,6 +167,15 @@ R_W_E_REF: np.ndarray = np.array([
 _MARKER_JUMP_M = 0.04    # position jump threshold per tick (m); 4 cm in 20 ms
                           # is physically impossible for the cart
 _WARN_INTERVAL_S = 1.0   # suppress repeated warnings within this window (s)
+
+# ---------------------------------------------------------------------------
+# Null-space / singularity constants
+# ---------------------------------------------------------------------------
+# The Franka wrist singularity is at q5 = 0°.  The natural IK solution for
+# "face +X, handle -Z" drives q5 toward 0°.  We override q5 in the null-space
+# joint goal to keep the wrist clear of the singularity.
+_Q5_NS_TARGET_RAD: float = math.radians(-45.0)   # default null-space q5 goal
+_Q5_SINGULARITY_DEG: float = 20.0                  # |q5| < this → flag ⚠SING
 
 # ---------------------------------------------------------------------------
 # Rotation helpers
@@ -199,6 +235,47 @@ def _ori_deg_from_R_W_E(R_W_E: np.ndarray) -> Tuple[float, float, float]:
 
 
 # ---------------------------------------------------------------------------
+# Null-space goal helpers
+# ---------------------------------------------------------------------------
+
+def _ns_goal_key(robot_name: str) -> str:
+    """Redis key for the joint-task (null-space) goal in the cartesian controller."""
+    return (f'opensai::controllers::{robot_name}'
+            f'::cartesian_controller::joint_task::goal_position')
+
+
+def _write_nullspace_goal(
+    r: redis.Redis,
+    robot_name: str,
+    q5_rad: float = _Q5_NS_TARGET_RAD,
+) -> Optional[List[float]]:
+    """Read current joints, override q5 to avoid wrist singularity, write to Redis.
+
+    The Franka wrist singularity is at q5 = 0°.  Setting q5 to -45° (default)
+    in the null-space goal directs the redundancy resolver to use the
+    non-singular IK solution, enabling reliable orientation convergence.
+
+    Joints 1-4 and 6-7 are taken from the current sensor reading so the
+    null-space task only pulls on q5, not on the whole arm.
+
+    Returns the written 7-vector (radians), or None if the joints key is absent.
+    """
+    sensor_key = f'opensai::sensors::{robot_name}::joint_positions'
+    q_raw = r.get(sensor_key)
+    if q_raw is None:
+        return None
+    try:
+        q = list(json.loads(q_raw))
+        if len(q) != 7:
+            return None
+    except Exception:
+        return None
+    q[4] = float(q5_rad)
+    r.set(_ns_goal_key(robot_name), json.dumps(q))
+    return q
+
+
+# ---------------------------------------------------------------------------
 # Redis helpers
 # ---------------------------------------------------------------------------
 
@@ -237,10 +314,11 @@ def _write_goal(
 # ---------------------------------------------------------------------------
 # Command parsing
 # ---------------------------------------------------------------------------
-# Return type: (kind, t_delta_or_None, is_relative, rx_or_None, ry, rz)
+# Return type: (kind, t_delta_or_None, is_pos_relative,
+#               rx_or_None, ry, rz, is_ori_relative)
 #   kind in {'pos', 'ori', 'both'}
 _ParseResult = Tuple[str, Optional[np.ndarray], bool,
-                     Optional[float], Optional[float], Optional[float]]
+                     Optional[float], Optional[float], Optional[float], bool]
 
 
 def _parse_cmd(line: str) -> Optional[_ParseResult]:
@@ -248,11 +326,14 @@ def _parse_cmd(line: str) -> Optional[_ParseResult]:
 
     Accepted formats::
 
-      x y z                  → ('pos', [x,y,z], False, None,  None, None)
-      r dx dy dz             → ('pos', [dx,dy,dz], True, None,  None, None)
-      ori rx ry rz           → ('ori', None, False, rx, ry, rz)
-      x y z rx ry rz         → ('both', [x,y,z], False, rx, ry, rz)
-      r dx dy dz rx ry rz    → ('both', [dx,dy,dz], True,  rx, ry, rz)
+      x y z                      → pos, absolute pos, absolute ori (no-op)
+      r dx dy dz                 → pos, relative pos, absolute ori (no-op)
+      ori rx ry rz               → ori, absolute ori
+      ori r drx dry drz          → ori, relative ori (delta added to current goal)
+      x y z rx ry rz             → both, absolute pos + absolute ori
+      r dx dy dz rx ry rz        → both, relative pos + absolute ori
+      x y z r drx dry drz        → both, absolute pos + relative ori
+      r dx dy dz r drx dry drz   → both, relative pos + relative ori
     """
     parts = line.split()
     if not parts:
@@ -260,25 +341,40 @@ def _parse_cmd(line: str) -> Optional[_ParseResult]:
 
     # --- orientation-only ---
     if parts[0].lower() == 'ori':
-        if len(parts) != 4:
-            return None
-        try:
-            rx, ry, rz = float(parts[1]), float(parts[2]), float(parts[3])
-            return ('ori', None, False, rx, ry, rz)
-        except ValueError:
-            return None
+        if len(parts) == 4:
+            # ori rx ry rz  (absolute)
+            try:
+                rx, ry, rz = float(parts[1]), float(parts[2]), float(parts[3])
+                return ('ori', None, False, rx, ry, rz, False)
+            except ValueError:
+                return None
+        if len(parts) == 5 and parts[1].lower() in ('r', 'rel'):
+            # ori r drx dry drz  (relative — adds to current goal)
+            try:
+                rx, ry, rz = float(parts[2]), float(parts[3]), float(parts[4])
+                return ('ori', None, False, rx, ry, rz, True)
+            except ValueError:
+                return None
+        return None
 
     # --- position (+ optional orientation) ---
     relative = parts[0].lower() in ('r', 'rel')
     nums = parts[1:] if relative else parts[:]
     try:
         if len(nums) == 3:
+            # x y z  or  r dx dy dz
             t = np.array([float(v) for v in nums])
-            return ('pos', t, relative, None, None, None)
+            return ('pos', t, relative, None, None, None, False)
         if len(nums) == 6:
+            # x y z rx ry rz  or  r dx dy dz rx ry rz  (absolute ori)
             t = np.array([float(v) for v in nums[:3]])
             rx, ry, rz = float(nums[3]), float(nums[4]), float(nums[5])
-            return ('both', t, relative, rx, ry, rz)
+            return ('both', t, relative, rx, ry, rz, False)
+        if len(nums) == 7 and nums[3].lower() in ('r', 'rel'):
+            # x y z r drx dry drz  or  r dx dy dz r drx dry drz  (relative ori)
+            t = np.array([float(v) for v in nums[:3]])
+            rx, ry, rz = float(nums[4]), float(nums[5]), float(nums[6])
+            return ('both', t, relative, rx, ry, rz, True)
     except ValueError:
         pass
     return None
@@ -311,6 +407,9 @@ def run(
     reach_m: float,
     z_min_m: float,
     z_max_m: float,
+    robot_name: str = 'FrankaRobot',
+    ns_q5_rad: float = _Q5_NS_TARGET_RAD,
+    write_ns_goal: bool = True,
 ) -> None:
 
     cmd_q: 'queue.Queue[str]' = queue.Queue()
@@ -326,6 +425,9 @@ def run(
     prev_pos: List[Optional[np.ndarray]] = [None, None]
     last_warn_t: List[float] = [-math.inf, -math.inf]
     last_both_ok_t: float = -math.inf   # last time both markers were seen
+
+    # Null-space goal tracking.
+    ns_last_ok: bool = False   # did the most recent write succeed?
 
     _print_prompt()
 
@@ -348,15 +450,18 @@ def run(
                 parsed = _parse_cmd(line)
                 if parsed is None:
                     print(f'[cmd_arm] unrecognised: "{line}"')
-                    print('  x y z                 — absolute position')
-                    print('  r dx dy dz            — relative position')
-                    print('  ori rx ry rz          — orientation (° from ref)')
-                    print('  x y z rx ry rz        — position + orientation')
-                    print('  r dx dy dz rx ry rz   — relative pos + orientation')
+                    print('  x y z                      — absolute position')
+                    print('  r dx dy dz                 — relative position')
+                    print('  ori rx ry rz               — set orientation (° from ref)')
+                    print('  ori r drx dry drz          — nudge orientation (° deltas)')
+                    print('  x y z rx ry rz             — position + set orientation')
+                    print('  r dx dy dz rx ry rz        — relative pos + set orientation')
+                    print('  x y z r drx dry drz        — pos + nudge orientation')
+                    print('  r dx dy dz r drx dry drz   — relative pos + nudge ori')
                     _print_prompt()
                     continue
 
-                kind, t_delta, is_rel, rx_new, ry_new, rz_new = parsed
+                kind, t_delta, is_rel, rx_new, ry_new, rz_new, is_ori_rel = parsed
 
                 if kind in ('pos', 'both'):
                     assert t_delta is not None
@@ -366,16 +471,22 @@ def run(
                         t_W_goal = t_delta.copy()
 
                 if kind in ('ori', 'both'):
-                    rx_goal = rx_new  # type: ignore[assignment]
-                    ry_goal = ry_new  # type: ignore[assignment]
-                    rz_goal = rz_new  # type: ignore[assignment]
+                    if is_ori_rel:
+                        rx_goal += rx_new  # type: ignore[assignment]
+                        ry_goal += ry_new  # type: ignore[assignment]
+                        rz_goal += rz_new  # type: ignore[assignment]
+                    else:
+                        rx_goal = rx_new  # type: ignore[assignment]
+                        ry_goal = ry_new  # type: ignore[assignment]
+                        rz_goal = rz_new  # type: ignore[assignment]
 
-                rel_tag = '  (relative)' if is_rel else ''
+                pos_tag = '  (relative pos)' if is_rel else ''
+                ori_tag = '  (relative ori)' if (is_ori_rel and kind in ('ori', 'both')) else ''
                 print(
                     f'[cmd_arm] goal_W  pos=[{t_W_goal[0]:+.3f},'
                     f'{t_W_goal[1]:+.3f},{t_W_goal[2]:+.3f}]'
                     f'  ori=[{rx_goal:+.1f}°,{ry_goal:+.1f}°,'
-                    f'{rz_goal:+.1f}°]{rel_tag}'
+                    f'{rz_goal:+.1f}°]{pos_tag}{ori_tag}'
                 )
                 _print_prompt()
 
@@ -476,23 +587,72 @@ def run(
                 float(R_W_A[1, 0]), float(R_W_A[0, 0])))
             clip_tag = '  [CLIPPED]' if was_clipped else ''
 
-            # Joint positions from hardware sensor key.
-            q_line = '[joints]  unavailable'
-            q_raw = r.get('opensai::sensors::FrankaRobot::joint_positions')
+            # ----------------------------------------------------------
+            # Null-space goal: re-write every debug tick so it survives
+            # a controller restart (controller re-initialises from sensor
+            # state, we push the good q5 goal back within 2 s).
+            # ----------------------------------------------------------
+            ns_q5_goal_deg = math.degrees(ns_q5_rad)
+            if write_ns_goal:
+                ns_result = _write_nullspace_goal(r, robot_name, ns_q5_rad)
+                ns_last_ok = ns_result is not None
+
+            # ----------------------------------------------------------
+            # Joint positions — read once, re-use for both the joints line
+            # and the ns_goal line so we only hit Redis once.
+            # ----------------------------------------------------------
+            q5_now_deg: Optional[float] = None
+            q_line = (f'[joints]  unavailable'
+                      f'  (key: opensai::sensors::{robot_name}::joint_positions)')
+            sensor_key = f'opensai::sensors::{robot_name}::joint_positions'
+            q_raw = r.get(sensor_key)
             if q_raw is not None:
                 try:
-                    q_deg = [math.degrees(v) for v in json.loads(q_raw)]
-                    q_line = (
-                        '[joints]  '
-                        + '  '.join(
-                            f'q{i+1}={q_deg[i]:+6.1f}°'
-                            for i in range(len(q_deg))
-                        )
+                    q_vals = json.loads(q_raw)
+                    q_deg = [math.degrees(v) for v in q_vals]
+                    q5_now_deg = q_deg[4]   # q5 is index 4 (0-based)
+                    sing_tag = (
+                        ' ⚠SING'
+                        if abs(q5_now_deg) < _Q5_SINGULARITY_DEG else ''
                     )
+                    q_parts = [
+                        f'q{i+1}={q_deg[i]:+6.1f}°'
+                        for i in range(len(q_deg))
+                    ]
+                    q_parts[4] += sing_tag   # annotate q5
+                    q_line = '[joints]  ' + '  '.join(q_parts)
                 except Exception:
                     pass
 
-            # Current sweet-spot from FK (Redis current_position).
+            # ----------------------------------------------------------
+            # Null-space goal status line.
+            # ----------------------------------------------------------
+            if write_ns_goal:
+                if q5_now_deg is not None:
+                    dq5 = q5_now_deg - ns_q5_goal_deg
+                    ns_status = '[written OK]' if ns_last_ok else '[WRITE FAILED]'
+                    ns_line = (
+                        f'[ns_goal]  q5_tgt={ns_q5_goal_deg:+.1f}°'
+                        f'  q5_now={q5_now_deg:+.1f}°'
+                        f'  Δq5={dq5:+.1f}°'
+                        f'  {ns_status}'
+                    )
+                    if not ns_last_ok:
+                        ns_line += (f'  sensor key missing:'
+                                    f' opensai::sensors::{robot_name}::joint_positions')
+                else:
+                    ns_status = '[written OK]' if ns_last_ok else '[WRITE FAILED — joints key missing]'
+                    ns_line = (
+                        f'[ns_goal]  q5_tgt={ns_q5_goal_deg:+.1f}°'
+                        f'  q5_now=?'
+                        f'  {ns_status}'
+                    )
+            else:
+                ns_line = '[ns_goal]  DISABLED (--no-ns-goal)'
+
+            # ----------------------------------------------------------
+            # Current sweet-spot from FK.
+            # ----------------------------------------------------------
             ee = _read_ee_pose(r, keys)
             if ee is not None:
                 R_A_E_now, t_A_E_now = ee
@@ -528,7 +688,8 @@ def run(
                 f'[goal_A]  pos=[{t_A_goal[0]:+.3f},{t_A_goal[1]:+.3f},'
                 f'{t_A_goal[2]:+.3f}]{clip_tag}\n'
                 f'{cur_line}\n'
-                f'{q_line}'
+                f'{q_line}\n'
+                f'{ns_line}'
             )
             _print_prompt()
 
@@ -578,6 +739,15 @@ def main() -> None:
                          'Default: canonical sports_bot/optitrack/ location.')
     ap.add_argument('--redis-host', default='localhost')
     ap.add_argument('--redis-port', type=int, default=6379)
+    # --- Null-space / singularity fix ---
+    ap.add_argument('--ns-q5-deg', type=float, default=-45.0, metavar='DEG',
+                    help='Null-space goal for joint 5 (degrees). '
+                         'Default -45° keeps the wrist away from the singularity '
+                         'at q5=0°. Try -60° if -45° is still insufficient.')
+    ap.add_argument('--no-ns-goal', action='store_true',
+                    help='Disable null-space goal writes entirely. '
+                         'Useful for A/B comparison: run without --no-ns-goal first, '
+                         'then with it, to confirm the fix is the cause of improvement.')
     args = ap.parse_args()
 
     # ------------------------------------------------------------------
@@ -669,14 +839,47 @@ def main() -> None:
           f'z∈[{args.z_min_m:+.2f},{args.z_max_m:+.2f}]m')
     print(f'[cmd_arm] rate: {args.rate_hz:.0f} Hz  |  '
           f'marker jump threshold: {_MARKER_JUMP_M * 100:.0f} cm/tick')
+
+    # ------------------------------------------------------------------
+    # Null-space goal — write once at startup.
+    # The run loop re-writes it every 2 s so it survives a controller
+    # restart during the session.
+    # ------------------------------------------------------------------
+    ns_q5_rad = math.radians(args.ns_q5_deg)
+    if not args.no_ns_goal:
+        ns_init = _write_nullspace_goal(r, args.robot_name, ns_q5_rad)
+        if ns_init is None:
+            print(
+                f'\n[cmd_arm] WARNING: null-space goal write skipped at startup\n'
+                f'           Joint sensor key not yet in Redis:\n'
+                f'           opensai::sensors::{args.robot_name}::joint_positions\n'
+                f'           The run loop will retry every 2 s — this is normal if\n'
+                f'           the controller just started and hasn\'t published joints yet.'
+            )
+        else:
+            q5_before_deg = math.degrees(json.loads(
+                r.get(f'opensai::sensors::{args.robot_name}::joint_positions')
+            )[4])
+            print(
+                f'\n[cmd_arm] null-space goal written:'
+                f'  q5 {q5_before_deg:+.1f}° → target {args.ns_q5_deg:+.1f}°\n'
+                f'           key: {_ns_goal_key(args.robot_name)}\n'
+                f'           (re-written every 2 s; use --no-ns-goal to disable)'
+            )
+    else:
+        print(f'\n[cmd_arm] null-space goal DISABLED (--no-ns-goal)')
+
     print()
     print('Commands (metres / degrees, world frame):')
-    print('  x y z                   — absolute position')
-    print('  r dx dy dz              — relative position')
-    print('  ori rx ry rz            — orientation from reference (°)')
-    print('  x y z rx ry rz          — position + orientation')
-    print('  r dx dy dz rx ry rz     — relative position + orientation')
-    print('  q                       — quit (last goals remain in Redis)')
+    print('  x y z                      — absolute position')
+    print('  r dx dy dz                 — relative position')
+    print('  ori rx ry rz               — set orientation from reference (°)')
+    print('  ori r drx dry drz          — nudge orientation by deltas (°)')
+    print('  x y z rx ry rz             — position + set orientation')
+    print('  r dx dy dz rx ry rz        — relative pos + set orientation')
+    print('  x y z r drx dry drz        — position + nudge orientation')
+    print('  r dx dy dz r drx dry drz   — relative pos + nudge orientation')
+    print('  q                          — quit (last goals remain in Redis)')
     print()
 
     try:
@@ -692,6 +895,9 @@ def main() -> None:
             reach_m=args.reach_m,
             z_min_m=args.z_min_m,
             z_max_m=args.z_max_m,
+            robot_name=args.robot_name,
+            ns_q5_rad=ns_q5_rad,
+            write_ns_goal=not args.no_ns_goal,
         )
     except KeyboardInterrupt:
         print('\n[cmd_arm] interrupted — last goals remain in Redis.')
