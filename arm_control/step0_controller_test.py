@@ -9,8 +9,8 @@ debug anything else in the stack.
 Run from OpenSai root:
     python sports_bot/arm_control/step0_controller_test.py
     python sports_bot/arm_control/step0_controller_test.py --sweep
-    python sports_bot/arm_control/step0_controller_test.py --goal 0.4 0.0 0.6
-    python sports_bot/arm_control/step0_controller_test.py --goal 0.4 0.0 0.6 --with-ori
+    python sports_bot/arm_control/step0_controller_test.py --goal 0.60 0.0 0.35
+    python sports_bot/arm_control/step0_controller_test.py --goal 0.60 0.0 0.35 --with-ori
 
 All positions in arm BASE FRAME (A), meters. current_position = sweet-spot (compliantFrame
 xyz="0 0 0.35" in picklebot.xml). Pass: pos_err < 8 mm held for 0.5 s.
@@ -43,12 +43,12 @@ JOINT_VEL_LIMIT_DEGS = np.degrees([2.175, 2.175, 2.175, 2.175, 2.610, 2.610, 2.6
 WARN_VEL_FRAC = 0.70  # flag if qdot > 70% of limit
 
 SWEEP_GOALS = [
-    (np.array([0.40,  0.00, 0.55]), "center-low"),
-    (np.array([0.45,  0.00, 0.65]), "center-mid"),
-    (np.array([0.45,  0.15, 0.60]), "left"),
-    (np.array([0.45, -0.15, 0.60]), "right"),
-    (np.array([0.50,  0.00, 0.70]), "center-high"),
-    (np.array([0.40,  0.00, 0.55]), "back-to-start"),
+    (np.array([0.62,  0.00, 0.32]), "center-low"),
+    (np.array([0.60,  0.00, 0.36]), "center-mid"),
+    (np.array([0.58,  0.10, 0.36]), "left-small"),
+    (np.array([0.58, -0.10, 0.36]), "right-small"),
+    (np.array([0.64,  0.00, 0.40]), "center-higher"),
+    (np.array([0.62,  0.00, 0.32]), "back-to-start"),
 ]
 
 
@@ -229,7 +229,7 @@ def main():
             print(f"  {label:<20} {status:<12} {err:>7.1f} {t:>7.2f} {qmax:>12}{flag}")
         print(sep)
     else:
-        goal_pos = np.array(args.goal) if args.goal else np.array([0.40, 0.00, 0.60])
+        goal_pos = np.array(args.goal) if args.goal else np.array([0.60, 0.00, 0.35])
         run_test(r, goal_pos, "single", goal_ori, args.timeout, pos_tol, args.ang_tol_deg)
 
 

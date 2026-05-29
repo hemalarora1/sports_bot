@@ -12,16 +12,16 @@
 			linkName="end-effector">
 			<velocitySaturation enabled="false" />
 			<otg type="acceleration"
-				maxLinearVelocity="0.5"
-				maxAngularVelocity="3.0"
-				maxLinearAcceleration="2.0"
-				maxAngularAcceleration="6.0"
-				maxLinearJerk="10.0"
+				maxLinearVelocity="0.1"
+				maxAngularVelocity="1.0"
+				maxLinearAcceleration="1.5"
+				maxAngularAcceleration="3.0"
+				maxLinearJerk="5.0"
 				maxAngularJerk="100" />
 			<compliantFrame xyz="0 0 0.35"
 							rpy="0 0 0" />
-			<positionGains kp="200.0" kv="28.0" ki="5.0"/>
-			<orientationGains kp="150.0" kv="24.0" ki="0.0"/>
+			<positionGains kp="100.0" kv="20.0" ki="0.0"/>
+			<orientationGains kp="100.0" kv="20.0" ki="0.0"/>
 		</motionForceTask>
 	</controller>
 
