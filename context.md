@@ -302,6 +302,43 @@ python sports_bot/scripts/test_arm_world_track.py --from-current
 - **Floor must be flat** — `z_hat_W = [0,0,1]` is hardcoded (upright cart). Significant tilt breaks it.
 - `marker_specs[0]` = left/−Y, `marker_specs[1]` = right/+Y. Wrong order → Franka +Y inferred backwards → swap to fix.
 
+**EE frame gotcha (2026-05-26):**  OpenSai uses the Franka **link8** frame, not `panda_hand`. `panda_hand_joint` has `rpy="0 0 -0.7854"` — a built-in -45° Z rotation — so the paddle face direction (panda_hand +Y) is `[1/√2, 1/√2, 0]` in link8. Using either pure `+X` or pure `+Y` as the face normal gives a ±40–45° `rz` error in `cmd_arm_world_clean.py`. The correct `R_W_E_REF` is `[[1/√2, 1/√2, 0],[1/√2, -1/√2, 0],[0, 0, -1]]`.
+
+**cmd_arm_world_clean.py — verification test procedure (2026-05-26):**
+
+Pre-conditions: Redis running, OptiTrack streaming, OpenSai cartesian_controller running, arm free-driven to a comfortable mid-range pose facing opponent.
+
+```bash
+python sports_bot/scripts/cmd_arm_world_clean.py
+```
+
+Startup print should show `current orientation equiv: ori ~0 ~0 ~0` (within ±5° of all zeros if paddle is roughly facing opponent). If it shows a large rz (e.g. ±45°), the EE frame is wrong — check `R_W_E_REF` in the script.
+
+**Orientation test sequence** — send at the `>` prompt, wait for `[current]` to show `ang_err < 3°`:
+
+| Command | Expected physical motion | `[current]` ori target |
+|---|---|---|
+| `ori 0 0 0` | face toward opponent, handle down | `[+0°, +0°, +0°]` |
+| `ori 0 20 0` | face tilts 20° downward (ry pitch) | `[~0°, ~+20°, ~0°]` |
+| `ori 0 -20 0` | face tilts 20° upward | `[~0°, ~-20°, ~0°]` |
+| `ori 0 0 20` | face yaws 20° left (+Y world) | `[~0°, ~0°, ~+20°]` |
+| `ori 0 0 -20` | face yaws 20° right (-Y world) | `[~0°, ~0°, ~-20°]` |
+| `ori 20 0 0` | handle sways sideways (roll) | `[~+20°, ~0°, ~0°]` |
+| `ori 0 0 0` | back to reference | `[~0°, ~0°, ~0°]` |
+
+**Position test sequence** — start from reference, each command after the previous settles:
+
+| Command | Expected motion | Pass criterion |
+|---|---|---|
+| `r 0.1 0 0` | 10 cm toward opponent (+X) | `pos_err < 8 mm` at steady state |
+| `r -0.1 0 0` | 10 cm back | returns to start |
+| `r 0 0.1 0` | 10 cm left (+Y) | `pos_err < 8 mm` |
+| `r 0 -0.1 0` | 10 cm right | returns to start |
+| `r 0 0 0.1` | 10 cm up (+Z) | `pos_err < 8 mm` |
+| `r 0 0 -0.1` | 10 cm down | returns to start |
+
+**What to paste back for verification:** the full terminal block from startup through the first `[current]` steady-state line after each command (includes `[goal_W]`, `[goal_A]`, `[current]`, `[joints]`, `[ns_goal]`).
+
 ---
 
 ## Day-to-day bringup (SRC Kitchen, TidyBot `tidybot01`)

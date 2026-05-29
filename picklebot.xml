@@ -20,19 +20,9 @@
 				maxAngularJerk="100" />
 			<compliantFrame xyz="0 0 0.35"
 							rpy="0 0 0" />
-			<positionGains kp="100.0" kv="20.0" ki="0.0"/>
-			<orientationGains kp="100.0" kv="20.0" ki="0.0"/>
+			<positionGains kp="200.0" kv="28.0" ki="5.0"/>
+			<orientationGains kp="150.0" kv="24.0" ki="0.0"/>
 		</motionForceTask>
-
-		<!-- Null-space posture task: keeps arm in a dextrous mid-range configuration.
-		     Goal is written at startup (and every 2 s) by cmd_arm_world_clean.py via
-		     the opensai::controllers::FrankaRobot::cartesian_controller::joint_task::goal_position key.
-		     kp=50 is strong enough to hold posture without competing with the Cartesian task. -->
-		<jointTask name="joint_task">
-			<velocitySaturation enabled="true" />
-			<otg type="disabled" />
-			<gains kp="50.0" kv="14.0" ki="0.0" />
-		</jointTask>
 	</controller>
 
 	<controller name="joint_controller">

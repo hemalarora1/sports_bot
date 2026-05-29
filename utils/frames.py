@@ -551,6 +551,14 @@ class ArmMarkerCalibration:
 
 
 def load_arm_marker_calibration(path: str) -> ArmMarkerCalibration:
+    """Load marker_specs and (optionally) T_E_P from the calibration JSON.
+
+    T_E_P is optional: after the 2026-05-26 compliantFrame fix, OpenSai's
+    current_position/goal_position already track the sweet spot, so the
+    main commander script doesn't need T_E_P. If absent, defaults to
+    identity (R = I, t = 0) — legacy scripts that compose T_E_P will
+    behave as if sweet spot == EE frame, matching the post-fix reality.
+    """
     with open(path, "r") as f:
         data = json.load(f)
     specs = [(int(s[0]), int(s[1])) for s in data["marker_specs"]]
@@ -559,10 +567,11 @@ def load_arm_marker_calibration(path: str) -> ArmMarkerCalibration:
             f"{path}: marker_specs must have exactly 2 entries, got "
             f"{len(specs)}."
         )
-    return ArmMarkerCalibration(
-        marker_specs=specs,
-        T_E_P=_se3_from_dict(data["T_E_P"]),
-    )
+    if "T_E_P" in data:
+        T_E_P = _se3_from_dict(data["T_E_P"])
+    else:
+        T_E_P = (np.eye(3), np.zeros(3))
+    return ArmMarkerCalibration(marker_specs=specs, T_E_P=T_E_P)
 
 
 def world_racket_to_arm_ee(
@@ -666,3 +675,102 @@ def enforce_paddle_floor(
     t = np.asarray(t_A_E, dtype=float).copy()
     t[2] += floor_limit - z_tip_world
     return t, True
+
+
+# ---------- Base-offset arm calibration (rigid body → T_W_A) -----------------
+#
+# Alternative to the two-marker approach: the arm base is rigidly bolted to the
+# cart, so T_W_A = T_W_B · T_B_A where T_B_A is a fixed one-time calibration.
+# The cart's OptiTrack rigid body (camera-tracked, ~120 Hz, immune to wheel
+# slip) gives T_W_B directly. This eliminates reliance on individual labeled
+# markers which can be occluded by the arm during motion.
+
+
+def read_rigid_body_pose_W(r, rigid_body_id: int) -> Optional[SE3]:
+    """Full 3D pose of an OptiTrack rigid body in world frame, or None if missing.
+
+    Reads sai2::optitrack::rigid_body_pos::<id> and rigid_body_ori::<id> as
+    published by StreamDataSkeleton.py after world calibration."""
+    raw_pos = r.get(f"sai2::optitrack::rigid_body_pos::{int(rigid_body_id)}")
+    raw_ori = r.get(f"sai2::optitrack::rigid_body_ori::{int(rigid_body_id)}")
+    if raw_pos is None or raw_ori is None:
+        return None
+    try:
+        pos = json.loads(raw_pos)
+        ori = json.loads(raw_ori)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if len(pos) != 3 or len(ori) != 4:
+        return None
+    R = quat_to_R(float(ori[0]), float(ori[1]), float(ori[2]), float(ori[3]))
+    return (R, np.array([float(pos[0]), float(pos[1]), float(pos[2])]))
+
+
+@dataclass
+class ArmBaseOffsetCalibration:
+    """One-time calibrated offset from the cart rigid body to the arm base frame."""
+    base_rigid_body_id: int
+    v_B: np.ndarray    # 3-vector: arm base origin in base body frame (yaw-only projection)
+    R_B_A: np.ndarray  # 3x3: rotation B→A (= Rz(yaw_offset); constant)
+
+
+def arm_base_offset_calibration_path() -> str:
+    """Conventional location next to the other calibration JSONs."""
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "optitrack",
+        "arm_base_offset_calibration.json",
+    )
+
+
+def save_arm_base_offset_calibration(
+    path: str,
+    *,
+    base_rigid_body_id: int,
+    v_B: np.ndarray,
+    R_B_A: np.ndarray,
+    metadata: Optional[dict] = None,
+) -> None:
+    yaw_offset = math.atan2(float(R_B_A[1, 0]), float(R_B_A[0, 0]))
+    payload: dict = {
+        "comment": (
+            "Arm base offset calibration. v_B is the fixed 3D vector from the "
+            "cart rigid-body centroid to the Franka arm base origin, expressed "
+            "in the base body's yaw-projected frame (Z-up). R_B_A is the "
+            "constant rotation from the base body's yaw frame to the arm base "
+            "frame A (= Rz(yaw_offset)). Re-calibrate only when the arm is "
+            "physically re-mounted on the cart."
+        ),
+        "base_rigid_body_id": int(base_rigid_body_id),
+        "v_B": [float(v) for v in v_B],
+        "yaw_offset_rad": float(yaw_offset),
+        "yaw_offset_deg": float(math.degrees(yaw_offset)),
+        "R_B_A": [[float(v) for v in row] for row in R_B_A],
+    }
+    if metadata:
+        payload.update(metadata)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def load_arm_base_offset_calibration(path: str) -> ArmBaseOffsetCalibration:
+    with open(path, "r") as f:
+        data = json.load(f)
+    return ArmBaseOffsetCalibration(
+        base_rigid_body_id=int(data["base_rigid_body_id"]),
+        v_B=np.asarray(data["v_B"], dtype=float),
+        R_B_A=np.asarray(data["R_B_A"], dtype=float),
+    )
+
+
+def compute_T_W_A_from_base_offset(T_W_B: SE3, cal: ArmBaseOffsetCalibration) -> SE3:
+    """Derive arm base pose T_W_A from the cart rigid body pose T_W_B and the
+    one-time calibrated offset. Uses yaw-only projection of R_W_B to match the
+    upright-cart / Z-up convention of compute_T_W_A_from_markers."""
+    R_W_B, t_W_B = T_W_B
+    yaw_B = math.atan2(float(R_W_B[1, 0]), float(R_W_B[0, 0]))
+    cb, sb = math.cos(yaw_B), math.sin(yaw_B)
+    R_W_B_planar = np.array([[cb, -sb, 0.], [sb, cb, 0.], [0., 0., 1.]])
+    t_W_A = t_W_B + R_W_B_planar @ cal.v_B
+    R_W_A = R_W_B_planar @ cal.R_B_A
+    return (R_W_A, t_W_A)
