@@ -45,6 +45,9 @@ R_W_E_REF = np.array([
 # Franka hardware velocity limits (rad/s → deg/s)
 JOINT_VEL_LIMIT_DEGS = np.degrees([2.175, 2.175, 2.175, 2.175, 2.610, 2.610, 2.610])
 WARN_VEL_FRAC = 0.70  # flag if qdot > 70% of limit
+WARN_RADIUS_M = 0.65
+WARN_LOW_Z_M = 0.25
+READY_POS = np.array([0.55, 0.00, 0.35])
 
 SWEEP_DELTAS = [
     (np.array([ 0.00,  0.00,  0.00]), "hold-start"),
@@ -65,6 +68,19 @@ def get(r, key):
 def rot_err_deg(R_curr, R_goal):
     cos_a = float(np.clip((np.trace(R_goal @ R_curr.T) - 1.0) / 2.0, -1.0, 1.0))
     return float(np.degrees(np.arccos(cos_a)))
+
+
+def print_start_diagnostics(curr, joints):
+    r_xy = float(np.linalg.norm(curr[:2]))
+    print(f"start_radius: {r_xy:.3f} m in XY")
+    if r_xy > WARN_RADIUS_M:
+        print(f"NOTE: start radius > {WARN_RADIUS_M:.2f} m; Cartesian tracking may be more posture-sensitive from this extended pose")
+    if curr[2] < WARN_LOW_Z_M:
+        print(f"NOTE: start z < {WARN_LOW_Z_M:.2f} m; low extended poses can be harder for this paddle TCP to track cleanly")
+    if joints is not None:
+        jdeg = np.degrees(joints)
+        if abs(jdeg[3]) > 85.0 or abs(jdeg[5]) > 105.0:
+            print("NOTE: elbow/wrist posture is extended (q4 or q6 large); compare with a more elbow-bent pose before judging convergence")
 
 
 def print_result_block(label, status, goal_pos, goal_ori, final_pos, final_ori,
@@ -185,6 +201,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--goal", nargs=3, type=float, metavar=("X", "Y", "Z"),
                     help="Single goal in arm base frame (m)")
+    ap.add_argument("--ready", action="store_true",
+                    help="Command a nominal elbow-bent ready pose for bring-up")
     ap.add_argument("--sweep", action="store_true", help="Run 6-point grid test")
     ap.add_argument("--with-ori", action="store_true", help="Also command R_W_E_REF orientation")
     ap.add_argument("--position-only", action="store_true",
@@ -210,6 +228,7 @@ def main():
     if joints is not None:
         jdeg = np.degrees(joints)
         print(f"start_joints: " + "  ".join(f"q{i+1}={jdeg[i]:.1f}" for i in range(len(jdeg))))
+    print_start_diagnostics(curr, joints)
 
     curr_ori = get(r, CURR_ORI)
     if args.position_only:
@@ -250,8 +269,9 @@ def main():
             print(f"  {label:<20} {status:<12} {err:>7.1f} {t:>7.2f} {qmax:>12}{flag}")
         print(sep)
     else:
-        goal_pos = np.array(args.goal) if args.goal else np.array([0.60, 0.00, 0.35])
-        run_test(r, goal_pos, "single", goal_ori, args.timeout, pos_tol, args.ang_tol_deg)
+        goal_pos = READY_POS if args.ready else (np.array(args.goal) if args.goal else READY_POS)
+        label = "ready" if args.ready or args.goal is None else "single"
+        run_test(r, goal_pos, label, goal_ori, args.timeout, pos_tol, args.ang_tol_deg)
 
 
 if __name__ == "__main__":
