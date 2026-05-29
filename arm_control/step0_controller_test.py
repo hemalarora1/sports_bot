@@ -14,6 +14,10 @@ Run from OpenSai root:
 
 All positions in arm BASE FRAME (A), meters. current_position = sweet-spot (compliantFrame
 xyz="0 0 0.35" in picklebot.xml). Pass: pos_err < 8 mm held for 0.5 s.
+The default sweep is deliberately relative to the measured start pose: Step 0
+should test small controller moves before asking the arm to traverse workspace.
+Unless --with-ori is passed, the script holds the measured start orientation to
+avoid fighting a stale goal_orientation key from a previous run.
 
 Output is structured for easy copy-paste to Claude for debugging.
 """
@@ -42,13 +46,14 @@ R_W_E_REF = np.array([
 JOINT_VEL_LIMIT_DEGS = np.degrees([2.175, 2.175, 2.175, 2.175, 2.610, 2.610, 2.610])
 WARN_VEL_FRAC = 0.70  # flag if qdot > 70% of limit
 
-SWEEP_GOALS = [
-    (np.array([0.62,  0.00, 0.32]), "center-low"),
-    (np.array([0.60,  0.00, 0.36]), "center-mid"),
-    (np.array([0.58,  0.10, 0.36]), "left-small"),
-    (np.array([0.58, -0.10, 0.36]), "right-small"),
-    (np.array([0.64,  0.00, 0.40]), "center-higher"),
-    (np.array([0.62,  0.00, 0.32]), "back-to-start"),
+SWEEP_DELTAS = [
+    (np.array([ 0.00,  0.00,  0.00]), "hold-start"),
+    (np.array([ 0.03,  0.00,  0.00]), "x-plus-3cm"),
+    (np.array([-0.03,  0.00,  0.00]), "x-minus-3cm"),
+    (np.array([ 0.00,  0.04,  0.00]), "y-plus-4cm"),
+    (np.array([ 0.00, -0.04,  0.00]), "y-minus-4cm"),
+    (np.array([ 0.00,  0.00, -0.03]), "z-down-3cm"),
+    (np.array([ 0.00,  0.00,  0.00]), "back-to-start"),
 ]
 
 
@@ -182,7 +187,9 @@ def main():
                     help="Single goal in arm base frame (m)")
     ap.add_argument("--sweep", action="store_true", help="Run 6-point grid test")
     ap.add_argument("--with-ori", action="store_true", help="Also command R_W_E_REF orientation")
-    ap.add_argument("--timeout", type=float, default=8.0)
+    ap.add_argument("--position-only", action="store_true",
+                    help="Do not write goal_orientation; useful only when intentionally testing stale/default orientation behavior")
+    ap.add_argument("--timeout", type=float, default=12.0)
     ap.add_argument("--pos-tol-mm", type=float, default=8.0)
     ap.add_argument("--ang-tol-deg", type=float, default=3.0)
     ap.add_argument("--host", default="localhost")
@@ -204,12 +211,26 @@ def main():
         jdeg = np.degrees(joints)
         print(f"start_joints: " + "  ".join(f"q{i+1}={jdeg[i]:.1f}" for i in range(len(jdeg))))
 
-    goal_ori = R_W_E_REF if args.with_ori else None
+    curr_ori = get(r, CURR_ORI)
+    if args.position_only:
+        goal_ori = None
+        print("goal_orientation: not written (--position-only)")
+    elif args.with_ori:
+        goal_ori = R_W_E_REF
+        print("goal_orientation: fixed R_W_E_REF")
+    elif curr_ori is not None:
+        goal_ori = curr_ori.reshape(3, 3)
+        print("goal_orientation: holding measured start orientation")
+    else:
+        goal_ori = None
+        print("goal_orientation: unavailable; not written")
     pos_tol = args.pos_tol_mm / 1000.0
 
     if args.sweep:
         results = []
-        for gp, label in SWEEP_GOALS:
+        sweep_goals = [(curr + delta, label) for delta, label in SWEEP_DELTAS]
+        print("sweep mode:    relative micro-sweep around measured start_pos")
+        for gp, label in sweep_goals:
             ok, err, t, qdot = run_test(r, gp, label, goal_ori, args.timeout, pos_tol, args.ang_tol_deg)
             results.append((label, ok, err, t, qdot))
             time.sleep(1.5)
