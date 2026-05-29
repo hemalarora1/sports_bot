@@ -9,6 +9,7 @@ debug anything else in the stack.
 Run from OpenSai root:
     python sports_bot/arm_control/step0_controller_test.py
     python sports_bot/arm_control/step0_controller_test.py --sweep
+    python sports_bot/arm_control/step0_controller_test.py --delta-mm 10 0 0 --position-only
     python sports_bot/arm_control/step0_controller_test.py --goal 0.60 0.0 0.35
     python sports_bot/arm_control/step0_controller_test.py --goal 0.60 0.0 0.35 --with-ori
 
@@ -51,11 +52,11 @@ READY_POS = np.array([0.55, 0.00, 0.35])
 
 SWEEP_DELTAS = [
     (np.array([ 0.00,  0.00,  0.00]), "hold-start"),
-    (np.array([ 0.03,  0.00,  0.00]), "x-plus-3cm"),
-    (np.array([-0.03,  0.00,  0.00]), "x-minus-3cm"),
-    (np.array([ 0.00,  0.04,  0.00]), "y-plus-4cm"),
-    (np.array([ 0.00, -0.04,  0.00]), "y-minus-4cm"),
-    (np.array([ 0.00,  0.00, -0.03]), "z-down-3cm"),
+    (np.array([ 0.02,  0.00,  0.00]), "x-plus-2cm"),
+    (np.array([-0.02,  0.00,  0.00]), "x-minus-2cm"),
+    (np.array([ 0.00,  0.02,  0.00]), "y-plus-2cm"),
+    (np.array([ 0.00, -0.02,  0.00]), "y-minus-2cm"),
+    (np.array([ 0.00,  0.00, -0.02]), "z-down-2cm"),
     (np.array([ 0.00,  0.00,  0.00]), "back-to-start"),
 ]
 
@@ -201,6 +202,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--goal", nargs=3, type=float, metavar=("X", "Y", "Z"),
                     help="Single goal in arm base frame (m)")
+    ap.add_argument("--delta-mm", nargs=3, type=float, metavar=("DX", "DY", "DZ"),
+                    help="Single relative goal from current_position, in mm")
     ap.add_argument("--ready", action="store_true",
                     help="Command a nominal elbow-bent ready pose for bring-up")
     ap.add_argument("--sweep", action="store_true", help="Run 6-point grid test")
@@ -269,8 +272,18 @@ def main():
             print(f"  {label:<20} {status:<12} {err:>7.1f} {t:>7.2f} {qmax:>12}{flag}")
         print(sep)
     else:
-        goal_pos = READY_POS if args.ready else (np.array(args.goal) if args.goal else READY_POS)
-        label = "ready" if args.ready or args.goal is None else "single"
+        if args.delta_mm is not None:
+            goal_pos = curr + np.array(args.delta_mm) / 1000.0
+            label = "delta-mm"
+        elif args.ready:
+            goal_pos = READY_POS
+            label = "ready"
+        elif args.goal is not None:
+            goal_pos = np.array(args.goal)
+            label = "single"
+        else:
+            goal_pos = curr
+            label = "hold-start"
         run_test(r, goal_pos, label, goal_ori, args.timeout, pos_tol, args.ang_tol_deg)
 
 
