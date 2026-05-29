@@ -116,8 +116,13 @@ def print_result_block(label, status, goal_pos, goal_ori, final_pos, final_ori,
     print(sep)
 
 
-def wait_converge(r, goal_pos, goal_ori, timeout_s, pos_tol_m, ang_tol_deg, settle_s):
-    t0 = time.perf_counter()
+def fmt_vec(v):
+    return "[" + ",".join(f"{x:+.4f}" for x in v) + "]"
+
+
+def wait_converge(r, goal_pos, goal_ori, timeout_s, pos_tol_m, ang_tol_deg, settle_s, t0=None):
+    if t0 is None:
+        t0 = time.perf_counter()
     settled_since = None
     prev_joints = None
     prev_t = None
@@ -184,12 +189,17 @@ def wait_converge(r, goal_pos, goal_ori, timeout_s, pos_tol_m, ang_tol_deg, sett
 
 def run_test(r, goal_pos, label, goal_ori, timeout_s, pos_tol_m, ang_tol_deg):
     print(f"\n[running] {label}  goal=[{goal_pos[0]:.3f},{goal_pos[1]:.3f},{goal_pos[2]:.3f}]")
+    prev_goal = get(r, GOAL_POS)
+    if prev_goal is not None:
+        print(f"  previous Redis goal_position: {fmt_vec(prev_goal)}  "
+              f"(delta from current goal: {np.linalg.norm(prev_goal - goal_pos) * 1000:.1f} mm)")
+    t0 = time.perf_counter()
     r.set(GOAL_POS, json.dumps(goal_pos.tolist()))  # write ONCE
     if goal_ori is not None:
         r.set(GOAL_ORI, json.dumps(goal_ori.tolist()))
 
     status, t_settle, final_pos, final_ori, qdot_peak_degs, final_joints = wait_converge(
-        r, goal_pos, goal_ori, timeout_s, pos_tol_m, ang_tol_deg, settle_s=0.5
+        r, goal_pos, goal_ori, timeout_s, pos_tol_m, ang_tol_deg, settle_s=0.5, t0=t0
     )
     print_result_block(label, status, goal_pos, goal_ori, final_pos, final_ori,
                        t_settle, qdot_peak_degs, final_joints)
