@@ -40,7 +40,7 @@ IK sweet-spot formulation
 
 Safety gates (every IK call, every tick)
 -----------------------------------------
-  1. Workspace clip: r_xy ≤ reach_m, z ∈ [z_min, z_max]  (arm base frame)
+  1. Workspace clip: r_xy ≤ reach_m (default 0.78 m), z ∈ [z_min, z_max]  (arm base frame)
   2. IK convergence: err < ik_tol_m   (skip write, hold last goal otherwise)
   3. Joint limits:   all q within Franka hardware limits
   4. Delta guard:    max per-joint delta from q_cur < max_delta_deg  (tracking only)
@@ -148,16 +148,16 @@ Q_HOME_RAD = np.array([
     -0.0603075, -0.690094, -0.0084536, -2.06741, 0.00632398, 1.48626, -0.793569,
 ])
 
-J6_REACH_M       = 0.60
-J6_Z_MIN_M       = 0.20
-J6_Z_MAX_M       = 0.80
-J6_IK_TOL_M      = 0.008   # 8 mm — same pass threshold as J3
-J6_MAX_DELTA_DEG = 6.0     # per-tick guard against noisy IK target jumps
-J6_ACQUIRE_MAX_DELTA_DEG = 20.0  # allow first move from home into tracking
+J6_REACH_M       = 0.78   # Franka HW ~0.85 m; 0.78 keeps ~7 cm margin vs 0.60 bring-up default
+J6_Z_MIN_M       = 0.15
+J6_Z_MAX_M       = 0.85
+J6_IK_TOL_M      = 0.012  # 12 mm — relaxed from 8 mm so clipped/near-limit targets track
+J6_MAX_DELTA_DEG = 10.0   # per-tick guard against noisy IK target jumps
+J6_ACQUIRE_MAX_DELTA_DEG = 40.0  # first move from home into tracking (was 20° — caused IDLE)
 J6_COMMIT_MAX_DELTA_DEG = 15.0  # refuse large blocking strike jumps
 J6_WORLD_Z_MIN_M = 0.05       # reject obvious tracker/world-frame outliers
 J6_WORLD_Z_MAX_M = 1.40
-J6_TARGET_JUMP_MAX_M = 0.04   # max tracking-target jump accepted per tick
+J6_TARGET_JUMP_MAX_M = 0.08   # max tracking-target jump accepted per tick
 J6_TRACKING_STEP_DEG = 0.25    # max commanded joint-goal step per 100 Hz tick
 J6_SWING_VEL_FRAC = 0.45      # cap blocking swing peak qdot to this fraction of XML limits
 J6_HOME_VEL_FRAC = 0.85       # startup / return-home velocity cap fraction
@@ -503,6 +503,9 @@ def run_loop(
     target_jump_max_m: float,
     tracking_step_deg: float,
     swing_vel_frac: float,
+    acquire_max_delta_deg: float,
+    max_delta_deg: float,
+    ik_tol_m: float,
     z_mode: str,
     fixed_arm_z_m: float,
     w_ori: float,
@@ -533,8 +536,9 @@ def run_loop(
           f"z ∈ [{z_min:+.2f}, {z_max:+.2f}] m")
     print(f"[J6] commit guards: max Δ={commit_max_delta_deg:.1f}°  "
           f"world_z ∈ [{world_z_min_m:.2f}, {world_z_max_m:.2f}] m  no clipped commits")
-    print(f"[J6] tracking guards: acquire Δ≤{J6_ACQUIRE_MAX_DELTA_DEG:.1f}°  "
-          f"track Δ≤{J6_MAX_DELTA_DEG:.1f}°/tick  target jump ≤ {target_jump_max_m*100:.0f} cm  "
+    print(f"[J6] tracking guards: acquire Δ≤{acquire_max_delta_deg:.1f}°  "
+          f"track Δ≤{max_delta_deg:.1f}°/tick  ik_tol={ik_tol_m*1000:.0f} mm  "
+          f"target jump ≤ {target_jump_max_m*100:.0f} cm  "
           f"goal step≤{tracking_step_deg:.2f}°/tick  "
           f"swing vel≤{swing_vel_frac*100:.0f}% XML  "
           f"z_mode={z_mode}" + (f"({fixed_arm_z_m:.2f}m A)" if z_mode == "fixed-arm" else ""))
@@ -660,10 +664,10 @@ def run_loop(
                 R_A_link7_target=R_A_link7_home, w_ori=w_ori,
             )
 
-            max_delta_deg = J6_ACQUIRE_MAX_DELTA_DEG if state == State.IDLE else J6_MAX_DELTA_DEG
-            if (_ik_ok(err_wu, ori_wu, J6_IK_TOL_M, max_ori_err_deg, R_A_link7_home)
+            tick_max_delta_deg = acquire_max_delta_deg if state == State.IDLE else max_delta_deg
+            if (_ik_ok(err_wu, ori_wu, ik_tol_m, max_ori_err_deg, R_A_link7_home)
                     and _joints_ok(q_wu)
-                    and _delta_ok(q_wu, q_cur, max_delta_deg)):
+                    and _delta_ok(q_wu, q_cur, tick_max_delta_deg)):
                 q_cmd = _rate_limited_goal(q_wu, q_cur, tracking_step_deg)
                 set_vec(r, GOAL_JOINTS, q_cmd)
                 last_wu_q = q_wu
@@ -679,9 +683,9 @@ def run_loop(
                     chain, t_A_windup, q_cur, offset_link7,
                     R_A_link7_target=R_A_link7_home, w_ori=w_ori,
                 )
-                if (_ik_ok(err_wu, ori_wu, J6_IK_TOL_M, max_ori_err_deg, R_A_link7_home)
+                if (_ik_ok(err_wu, ori_wu, ik_tol_m, max_ori_err_deg, R_A_link7_home)
                         and _joints_ok(q_wu)
-                        and _delta_ok(q_wu, q_cur, J6_ACQUIRE_MAX_DELTA_DEG)):
+                        and _delta_ok(q_wu, q_cur, acquire_max_delta_deg)):
                     q_cmd = _rate_limited_goal(q_wu, q_cur, tracking_step_deg)
                     set_vec(r, GOAL_JOINTS, q_cmd)
                     last_wu_q = q_wu
@@ -735,7 +739,7 @@ def run_loop(
             commit_delta_deg = float(np.degrees(np.abs(q_strike - q_cur)).max())
 
             if (not _joints_ok(q_strike)
-                    or not _ik_ok(err_st, ori_st, J6_IK_TOL_M * 3, max_ori_err_deg, R_A_link7_home)):
+                    or not _ik_ok(err_st, ori_st, ik_tol_m * 3, max_ori_err_deg, R_A_link7_home)):
                 print(f"[J6] COMMIT IK failed (pos={err_st*1000:.1f} mm, ori={ori_st:.1f}°) — aborting")
                 time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
                 continue
@@ -873,6 +877,12 @@ def main() -> None:
                     help="Reject commit if predicted world-frame strike Z is above this.")
     ap.add_argument("--target-jump-max-m", type=float, default=J6_TARGET_JUMP_MAX_M,
                     help="Reject tracking updates whose arm-frame target jumps farther than this.")
+    ap.add_argument("--acquire-max-delta-deg", type=float, default=J6_ACQUIRE_MAX_DELTA_DEG,
+                    help="Max per-joint delta from current pose to enter TRACKING from IDLE.")
+    ap.add_argument("--max-delta-deg", type=float, default=J6_MAX_DELTA_DEG,
+                    help="Max per-joint IK goal delta from current pose while TRACKING.")
+    ap.add_argument("--ik-tol-mm", type=float, default=J6_IK_TOL_M * 1000.0,
+                    help="Reject IK solutions whose sweet-spot error exceeds this (mm).")
     ap.add_argument("--tracking-step-deg", type=float, default=J6_TRACKING_STEP_DEG,
                     help="Max per-tick joint-goal step during non-blocking tracking.")
     ap.add_argument("--swing-vel-frac", type=float, default=J6_SWING_VEL_FRAC,
@@ -1022,6 +1032,9 @@ def main() -> None:
             target_jump_max_m=args.target_jump_max_m,
             tracking_step_deg=args.tracking_step_deg,
             swing_vel_frac=args.swing_vel_frac,
+            acquire_max_delta_deg=args.acquire_max_delta_deg,
+            max_delta_deg=args.max_delta_deg,
+            ik_tol_m=args.ik_tol_mm / 1000.0,
             z_mode=args.z_mode,
             fixed_arm_z_m=args.fixed_arm_z_m,
             w_ori=args.w_ori,

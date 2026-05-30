@@ -345,6 +345,20 @@ Startup print should show `current orientation equiv: ori ~0 ~0 ~0` (within ±5�
 
 All services run on `tidybot01` → all default to `localhost`. Known IDs: Ball=8, TidyBot=11.
 
+### Pre-flight checklist (easy to forget)
+
+Before trusting Redis keys or running arm scripts (`stepj*`, `cmd_arm_world_clean.py`, etc.):
+
+1. **Franka Desk → Execution mode** (not Programming). If the arm is in Programming, OpenSai may publish **stale** `joint_positions` and ignore goals.
+2. **Motive → Streaming → Transmission Type → Unicast** when `tidybot01` is on SRC wifi / cross-subnet. Match the streamer flag: `u` not `m` (see Step 2).
+3. **TidyBot base driver:** `cd ~/tidybot2 && conda activate tidybot2 && sh launch_driver.sh` (or `python redis_driver.py` if that's what the session uses).
+4. **OpenSai arm controller:** `cd ~/OpenSai && ./scripts/launch.sh sports_bot/picklebot.xml` (starts Redis if needed + `OpenSai_main`).
+5. **Sanity — sensors must be live**, not frozen:
+   ```bash
+   watch -n 0.2 "redis-cli GET 'opensai::sensors::FrankaRobot::joint_positions'"
+   ```
+   Move the arm by hand; values should change every frame. If identical across reads, OpenSai is not connected — fix steps 1 and 4 before debugging Python.
+
 **Step 1 — Redis:**
 ```bash
 redis-server
@@ -352,10 +366,15 @@ redis-cli ping  # → PONG
 ```
 
 **Step 2 — OptiTrack streamer:**
+
+On `tidybot01` (SRC subnet): Motive **Unicast** + streamer mode `u`. Multicast (`m`) only when laptop and Motive share the same L2 subnet *and* Motive is set to Multicast.
+
 ```bash
 cd ~/OpenSai/sports_bot/optitrack && conda activate opensai
 PYTHONPATH=drivers/PythonClient python -u StreamDataSkeleton.py \
-    172.24.69.102 <tidybot01-IP> m
+    172.24.69.102 <tidybot01-IP> u    # 'u'=unicast (default on tidybot01), 'm'=multicast
+# Or:
+STREAMER_MODE=u ./sports_bot/scripts/record_throws.sh
 # Sanity:
 redis-cli get sai2::optitrack::rigid_body_pos::8   # ball
 redis-cli get sai2::optitrack::rigid_body_pos::11  # cart
@@ -364,7 +383,8 @@ redis-cli get sai2::optitrack::rigid_body_pos::11  # cart
 **Step 3 — TidyBot driver:**
 ```bash
 cd ~/tidybot2 && conda activate tidybot2
-python redis_driver.py
+sh launch_driver.sh          # preferred one-shot launcher
+# or: python redis_driver.py
 ```
 
 **Step 4 — Base bridge:**
@@ -385,7 +405,7 @@ python sports_bot/scripts/send_base_goal.py --robot-rigid-body-id 11 \
 ```
 Default tolerances: 100 mm / 5°. Tighten with `--pos-tol-mm 20 --yaw-tol-deg 2` after fresh bridge restart.
 
-**Step 6 — OpenSai cartesian controller** (arm sessions only):
+**Step 6 — OpenSai controller** (arm sessions only; Franka in **Execution** first):
 ```bash
 cd ~/OpenSai
 ./scripts/launch.sh sports_bot/picklebot.xml
@@ -464,6 +484,7 @@ redis-cli get opensai::controllers::FrankaRobot::cartesian_controller::cartesian
 
 ## Change log
 
+- **2026-05-30** — Pre-flight checklist added to day-to-day bringup: Franka Execution mode, Motive unicast on tidybot01, `sh launch_driver.sh`, `./scripts/launch.sh`, live `joint_positions` sanity check.
 - **2026-05-26** — Double-counted EE offset bug fixed. `picklebot.xml` `compliantFrame` moved from `xyz="0 0 0"` to `xyz="0 0 0.35"` — OpenSai now tracks the sweet spot directly in `current_position`/`goal_position`. `T_E_P.translation_m` zeroed in `arm_marker_calibration.json` (rotation kept for legacy callers). `PADDLE_TIP_OFFSET_M` corrected to `0.10` (from sweet spot, not raw flange). New `cmd_arm_world_clean.py`: no EMA/velocity-clamping/orientation-lock/T_E_P in loop; world-frame RPY commands (`ori rx ry rz`) with reference = face toward +X opponent, handle down; per-marker jump detection; both goals written every tick. OpenSai launch command (`./scripts/launch.sh sports_bot/picklebot.xml`) documented in bringup Step 6.
 - **2026-05-23** — T_E_P corrected: translation `[0,0,0.368]→[0,0,0.35]`; rotation unchanged (face normal = EE +X — handle is along EE +Z, face is perpendicular). `PADDLE_TIP_OFFSET_M=0.45` added. `enforce_paddle_floor` replaces worst-case z_min computation with exact world-Z of commanded paddle tip using live T_W_A and R_A_E.
 - **2026-05-22** — arm world-frame tracking landed. Marker-pair midpoint → T_W_A; T_E_P persisted in `arm_marker_calibration.json`; `world_racket_to_arm_ee` + `clip_to_arm_workspace` in `frames.py`. `base_bridge.py` `--periodic-refresh-s` added to kill held-goal drift. `base_intercept.py` `--arm-track` mode + world-frame tracking-error diagnostic.
