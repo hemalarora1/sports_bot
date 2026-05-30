@@ -190,8 +190,8 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
 
     optionsDict = {}
-    optionsDict["clientAddress"] = "172.24.68.64"
-    optionsDict["serverAddress"] = "172.24.68.48"
+    optionsDict["clientAddress"] = "172.24.69.172" 
+    optionsDict["serverAddress"] = "172.24.69.102"
     optionsDict["use_multicast"] = False
 
     # This will create a new NatNet client

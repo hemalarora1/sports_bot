@@ -30,7 +30,11 @@ IK sweet-spot formulation
 
     sweet_spot_A = T[:3,3] + T[:3,:3] @ offset_link7
 
-  IK cost: ||sweet_spot_A(q) - t_A_target||² + w_reg ||q - q_init||²
+  IK cost: ||sweet_spot_A(q) - t_A_target||² + w_ori·angle(R, R_home)² + w_reg||q-q_init||²
+
+  By default R_home is link7 orientation at Q_HOME_RAD — same paddle face / net
+  parallelism as the resting backswing pose. Pass --no-fixed-paddle-ori to revert
+  to position-only IK.
 
   t_A_target = R_W_A.T @ (t_W_intercept - t_W_A)   (same as cmd_arm_world_clean)
 
@@ -58,6 +62,14 @@ Run from OpenSai root:
   python sports_bot/arm_control/stepj6_reactive_intercept.py --no-commit
   python sports_bot/arm_control/stepj6_reactive_intercept.py --print-cal-only
   python sports_bot/arm_control/stepj6_reactive_intercept.py --swing-s 0.5
+
+Mock intercept (no ball tracker / optional no OptiTrack):
+  python sports_bot/arm_control/stepj6_reactive_intercept.py --no-commit \\
+      --mock-intercept 0.65 0.0 0.85 --mock-tti 0.8
+  python sports_bot/arm_control/stepj6_reactive_intercept.py --no-commit \\
+      --mock-intercept 0.45 0.0 0.45 --mock-tti 0.8 --mock-identity-base
+  python sports_bot/arm_control/stepj6_reactive_intercept.py \\
+      --mock-intercept 0.65 0.0 0.85 --mock-tti 0.25   # triggers swing
 """
 from __future__ import annotations
 
@@ -96,7 +108,7 @@ from stepj1_joint_nudge import (  # noqa: E402
     set_vec,
 )
 
-from sports_bot.state_machine.ball_tracker import BallTracker  # noqa: E402
+from sports_bot.state_machine.ball_tracker import BallTracker, Intercept  # noqa: E402
 from sports_bot.state_machine.config import BallTrackerConfig  # noqa: E402
 from sports_bot.state_machine.redis_keys import RedisKeys      # noqa: E402
 from sports_bot.utils.frames import (                          # noqa: E402
@@ -148,6 +160,8 @@ J6_TARGET_JUMP_MAX_M = 0.04   # max tracking-target jump accepted per tick
 J6_TRACKING_STEP_DEG = 0.25    # max commanded joint-goal step per 100 Hz tick
 J6_SWING_VEL_FRAC = 0.45      # cap blocking swing peak qdot to this fraction of XML limits
 J6_FIXED_ARM_Z_M = 0.45       # J6 bringup: trust lateral prediction, hold Z steady
+J6_W_ORI = 2.0                # IK weight on (link7 rotation error from home)²
+J6_MAX_ORI_ERR_DEG = 8.0      # reject IK if link7 rotates farther than this from home
 
 # joint_controller XML velocity limits currently used by picklebot_j5.xml / picklebot.xml
 J6_XML_VEL_LIMIT_RAD_S = np.array([1.2, 1.4, 1.6, 1.8, 1.0, 1.1, 1.2])
@@ -177,22 +191,44 @@ def _sweet_spot_A(T4x4: np.ndarray, offset_link7: np.ndarray) -> np.ndarray:
     return T4x4[:3, 3] + T4x4[:3, :3] @ offset_link7
 
 
+def _rot_angle_rad(R_from: np.ndarray, R_to: np.ndarray) -> float:
+    """Geodesic angle (rad) from R_from to R_to."""
+    R_err = R_from.T @ R_to
+    c = (float(np.trace(R_err)) - 1.0) * 0.5
+    c = float(np.clip(c, -1.0, 1.0))
+    return float(np.arccos(c))
+
+
+def _link7_R_A(chain: ikpy.chain.Chain, q7: np.ndarray) -> np.ndarray:
+    return _fk(chain, q7)[:3, :3]
+
+
 def ik_solve(
     chain: ikpy.chain.Chain,
     t_A_target: np.ndarray,
     q_init: np.ndarray,
     offset_link7: np.ndarray,
     w_reg: float = 0.001,
-) -> tuple[np.ndarray, float]:
+    R_A_link7_target: np.ndarray | None = None,
+    w_ori: float = J6_W_ORI,
+) -> tuple[np.ndarray, float, float]:
     """Solve IK so that the sweet spot reaches t_A_target (arm base frame).
 
-    Regularization toward q_init keeps solutions smooth across ticks and
-    avoids wrist flips.  Returns (q_rad_7, err_m).
+    When ``R_A_link7_target`` is set, penalize deviation of link7 orientation
+    from that matrix so the paddle keeps the same face/net alignment as home.
+
+    Returns (q_rad_7, pos_err_m, ori_err_deg).
     """
     def cost(q: np.ndarray) -> float:
         T = chain.forward_kinematics(np.concatenate([[0.0], q]))
         ss = T[:3, 3] + T[:3, :3] @ offset_link7
-        return float(np.sum((ss - t_A_target) ** 2) + w_reg * np.sum((q - q_init) ** 2))
+        pos_cost = float(np.sum((ss - t_A_target) ** 2))
+        reg = w_reg * float(np.sum((q - q_init) ** 2))
+        ori_cost = 0.0
+        if R_A_link7_target is not None:
+            ang = _rot_angle_rad(R_A_link7_target, T[:3, :3])
+            ori_cost = w_ori * (ang * ang)
+        return pos_cost + reg + ori_cost
 
     result = minimize(cost, q_init, method="L-BFGS-B",
                       bounds=list(zip(Q_LO, Q_HI)),
@@ -200,7 +236,25 @@ def ik_solve(
     q_out = result.x
     T = chain.forward_kinematics(np.concatenate([[0.0], q_out]))
     ss = T[:3, 3] + T[:3, :3] @ offset_link7
-    return q_out, float(np.linalg.norm(ss - t_A_target))
+    pos_err = float(np.linalg.norm(ss - t_A_target))
+    ori_err_deg = 0.0
+    if R_A_link7_target is not None:
+        ori_err_deg = math.degrees(_rot_angle_rad(R_A_link7_target, T[:3, :3]))
+    return q_out, pos_err, ori_err_deg
+
+
+def _ik_ok(
+    pos_err: float,
+    ori_err_deg: float,
+    pos_tol_m: float,
+    max_ori_err_deg: float,
+    R_A_link7_target: np.ndarray | None,
+) -> bool:
+    if pos_err >= pos_tol_m:
+        return False
+    if R_A_link7_target is not None and ori_err_deg > max_ori_err_deg:
+        return False
+    return True
 
 
 def _joints_ok(q: np.ndarray) -> bool:
@@ -357,9 +411,10 @@ def _safe_target(
 def run_loop(
     r: redis.Redis,
     chain: ikpy.chain.Chain,
-    tracker: BallTracker,
+    tracker: BallTracker | None,
     q_home_rad: np.ndarray,
     offset_link7: np.ndarray,
+    R_A_link7_home: np.ndarray | None,
     cal: ArmBaseOffsetCalibration,
     *,
     strike_plane_x_world: float,
@@ -381,6 +436,12 @@ def run_loop(
     swing_vel_frac: float,
     z_mode: str,
     fixed_arm_z_m: float,
+    w_ori: float,
+    max_ori_err_deg: float,
+    mock_intercepts: list[np.ndarray] | None = None,
+    mock_tti: float = 0.50,
+    mock_cycle_s: float = 0.0,
+    mock_identity_base: bool = False,
 ) -> None:
     dt = 1.0 / rate_hz
     state = State.IDLE
@@ -390,6 +451,8 @@ def run_loop(
     print_interval_s = 0.20
     last_wu_q: np.ndarray | None = None  # last valid wind-up IK solution
     last_track_target_A: np.ndarray | None = None
+    mock_t0 = time.monotonic()
+    using_mock = mock_intercepts is not None and len(mock_intercepts) > 0
 
     switch_ctrl(r, JOINT_CTRL)
     set_vec(r, GOAL_JOINTS, q_home_rad)
@@ -408,25 +471,56 @@ def run_loop(
           f"z_mode={z_mode}" + (f"({fixed_arm_z_m:.2f}m A)" if z_mode == "fixed-arm" else ""))
     if no_commit:
         print("[J6] --no-commit: tracking only, swing disabled")
+    if R_A_link7_home is not None:
+        face_A = R_A_link7_home @ (offset_link7 / max(np.linalg.norm(offset_link7), 1e-9))
+        print("[J6] fixed paddle orientation: link7 rotation locked to home")
+        print(f"[J6]   strike-face normal_A ≈ [{face_A[0]:+.3f},{face_A[1]:+.3f},{face_A[2]:+.3f}]  "
+              f"w_ori={w_ori:.2f}  max_ori_err={max_ori_err_deg:.1f}°")
+    else:
+        print("[J6] paddle orientation: position-only IK (--no-fixed-paddle-ori)")
+    if using_mock:
+        pts = ", ".join(
+            f"[{p[0]:+.2f},{p[1]:+.2f},{p[2]:+.2f}]" for p in mock_intercepts
+        )
+        print(f"[J6] MOCK intercept(s) world (m): {pts}")
+        print(f"[J6]   mock_tti={mock_tti:.3f}s  cycle={mock_cycle_s:.1f}s  "
+              f"identity_base={mock_identity_base}")
     print()
 
     while True:
         t0 = time.perf_counter()
 
         # ----------------------------------------------------------------
-        # 1. Ball tracking
+        # 1. Ball tracking (or mock intercept)
         # ----------------------------------------------------------------
-        tracker.update()
-        intercept = tracker.predict_intercept(strike_plane_x_world)
+        if using_mock:
+            idx = 0
+            if mock_cycle_s > 0.0 and len(mock_intercepts) > 1:
+                idx = int((time.monotonic() - mock_t0) / mock_cycle_s) % len(mock_intercepts)
+            t_W_strike = np.asarray(mock_intercepts[idx], dtype=float)
+            intercept = Intercept(
+                position=t_W_strike.copy(),
+                velocity=np.array([-5.0, 0.0, 0.0]),
+                time_to_impact=float(mock_tti),
+                n_bounces=0,
+            )
+        else:
+            assert tracker is not None
+            tracker.update()
+            intercept = tracker.predict_intercept(strike_plane_x_world)
 
         # ----------------------------------------------------------------
         # 2. Arm base frame (cart rigid body + calibrated offset)
         # ----------------------------------------------------------------
-        T_W_B = read_rigid_body_pose_W(r, cal.base_rigid_body_id)
-        if T_W_B is None:
-            time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
-            continue
-        R_W_A, t_W_A = compute_T_W_A_from_base_offset(T_W_B, cal)
+        if mock_identity_base:
+            R_W_A = np.eye(3)
+            t_W_A = np.zeros(3)
+        else:
+            T_W_B = read_rigid_body_pose_W(r, cal.base_rigid_body_id)
+            if T_W_B is None:
+                time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
+                continue
+            R_W_A, t_W_A = compute_T_W_A_from_base_offset(T_W_B, cal)
 
         # ----------------------------------------------------------------
         # 3. Ball lost — decay to home
@@ -435,7 +529,9 @@ def run_loop(
             since_good = t0 - last_good_t
             if state == State.TRACKING and since_good > hold_after_lost_s:
                 set_vec(r, GOAL_JOINTS, q_home_rad)
-                reason = getattr(tracker, "last_reject_reason", "") or "no_data"
+                reason = ""
+                if tracker is not None:
+                    reason = getattr(tracker, "last_reject_reason", "") or "no_data"
                 print(f"[J6] ball lost {since_good:.2f}s (reason={reason}) → home")
                 state = State.IDLE
                 last_wu_q = None
@@ -490,10 +586,13 @@ def run_loop(
                 continue
 
             q_seed = last_wu_q if last_wu_q is not None else q_cur
-            q_wu, err_wu = ik_solve(chain, t_A_windup, q_seed, offset_link7)
+            q_wu, err_wu, ori_wu = ik_solve(
+                chain, t_A_windup, q_seed, offset_link7,
+                R_A_link7_target=R_A_link7_home, w_ori=w_ori,
+            )
 
             max_delta_deg = J6_ACQUIRE_MAX_DELTA_DEG if state == State.IDLE else J6_MAX_DELTA_DEG
-            if (err_wu < J6_IK_TOL_M
+            if (_ik_ok(err_wu, ori_wu, J6_IK_TOL_M, max_ori_err_deg, R_A_link7_home)
                     and _joints_ok(q_wu)
                     and _delta_ok(q_wu, q_cur, max_delta_deg)):
                 q_cmd = _rate_limited_goal(q_wu, q_cur, tracking_step_deg)
@@ -507,8 +606,11 @@ def run_loop(
         # ----------------------------------------------------------------
         else:
             if state != State.TRACKING or last_wu_q is None:
-                q_wu, err_wu = ik_solve(chain, t_A_windup, q_cur, offset_link7)
-                if (err_wu < J6_IK_TOL_M
+                q_wu, err_wu, ori_wu = ik_solve(
+                    chain, t_A_windup, q_cur, offset_link7,
+                    R_A_link7_target=R_A_link7_home, w_ori=w_ori,
+                )
+                if (_ik_ok(err_wu, ori_wu, J6_IK_TOL_M, max_ori_err_deg, R_A_link7_home)
                         and _joints_ok(q_wu)
                         and _delta_ok(q_wu, q_cur, J6_ACQUIRE_MAX_DELTA_DEG)):
                     q_cmd = _rate_limited_goal(q_wu, q_cur, tracking_step_deg)
@@ -553,12 +655,19 @@ def run_loop(
 
             # Solve strike IK seeded from last wind-up solution (smooth)
             q_seed = last_wu_q if last_wu_q is not None else q_cur
-            q_strike, err_st = ik_solve(chain, t_A_strike, q_seed, offset_link7)
-            q_follow, err_fw = ik_solve(chain, t_A_follow, q_strike, offset_link7)
+            q_strike, err_st, ori_st = ik_solve(
+                chain, t_A_strike, q_seed, offset_link7,
+                R_A_link7_target=R_A_link7_home, w_ori=w_ori,
+            )
+            q_follow, err_fw, ori_fw = ik_solve(
+                chain, t_A_follow, q_strike, offset_link7,
+                R_A_link7_target=R_A_link7_home, w_ori=w_ori,
+            )
             commit_delta_deg = float(np.degrees(np.abs(q_strike - q_cur)).max())
 
-            if not _joints_ok(q_strike) or err_st > J6_IK_TOL_M * 3:
-                print(f"[J6] COMMIT IK failed (err={err_st*1000:.1f} mm) — aborting")
+            if (not _joints_ok(q_strike)
+                    or not _ik_ok(err_st, ori_st, J6_IK_TOL_M * 3, max_ori_err_deg, R_A_link7_home)):
+                print(f"[J6] COMMIT IK failed (pos={err_st*1000:.1f} mm, ori={ori_st:.1f}°) — aborting")
                 time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
                 continue
             if commit_delta_deg > commit_max_delta_deg:
@@ -576,9 +685,9 @@ def run_loop(
             print(f"\n{'='*60}")
             print(f"[J6] COMMIT  tti={tti:.3f}s")
             print(f"[J6]   strike_A=[{t_A_strike[0]:+.3f},{t_A_strike[1]:+.3f},{t_A_strike[2]:+.3f}]  "
-                  f"err={err_st*1000:.1f} mm")
+                  f"err={err_st*1000:.1f} mm  ori={ori_st:.1f}°")
             print(f"[J6]   follow_A=[{t_A_follow[0]:+.3f},{t_A_follow[1]:+.3f},{t_A_follow[2]:+.3f}]  "
-                  f"err={err_fw*1000:.1f} mm")
+                  f"err={err_fw*1000:.1f} mm  ori={ori_fw:.1f}°")
             print(f"[J6]   q_cur  → q_strike max Δ={commit_delta_deg:.1f}°")
             print(f"{'='*60}\n")
 
@@ -645,6 +754,19 @@ def main() -> None:
     # Ball / geometry
     ap.add_argument("--ball-rigid-body-id", type=int, default=1,
                     help="OptiTrack streaming ID for the pickleball.")
+    ap.add_argument("--mock-intercept", nargs=3, type=float, action="append",
+                    metavar=("X", "Y", "Z"),
+                    help="World-frame mock strike point (m). Repeat for multiple "
+                         "waypoints. Skips ball tracker.")
+    ap.add_argument("--mock-tti", type=float, default=0.50,
+                    help="Fixed time-to-impact for --mock-intercept (s). "
+                         "Use > commit_tti for tracking-only; smaller triggers swing.")
+    ap.add_argument("--mock-cycle-s", type=float, default=0.0,
+                    help="Cycle through mock intercepts every N seconds (0 = first only).")
+    ap.add_argument("--mock-identity-base", action="store_true",
+                    help="Skip cart OptiTrack; treat arm base frame as world "
+                         "(origin-aligned). Use with --mock-intercept when "
+                         "streamer is off — coords are then arm-frame targets.")
     ap.add_argument("--strike-plane-x", type=float, default=0.65,
                     help="World-X of the strike plane (m).")
     ap.add_argument("--wind-up-offset", type=float, default=0.15,
@@ -684,6 +806,14 @@ def main() -> None:
                     help="Use fixed arm-frame Z for J6 bringup, or raw predicted Z.")
     ap.add_argument("--fixed-arm-z-m", type=float, default=J6_FIXED_ARM_Z_M,
                     help="Arm-frame strike Z used when --z-mode=fixed-arm.")
+    ap.add_argument("--no-fixed-paddle-ori", action="store_true",
+                    help="Position-only IK (old behavior). Default locks link7 "
+                         "orientation to home so the paddle face stays toward the net.")
+    ap.add_argument("--w-ori", type=float, default=J6_W_ORI,
+                    help="IK weight on squared link7 rotation error from home (rad²).")
+    ap.add_argument("--max-ori-err-deg", type=float, default=J6_MAX_ORI_ERR_DEG,
+                    help="Reject IK solutions whose link7 orientation deviates "
+                         "farther than this from home.")
 
     # Loop behaviour
     ap.add_argument("--rate-hz", type=float, default=100.0,
@@ -729,10 +859,15 @@ def main() -> None:
     cal = load_arm_base_offset_calibration(cal_path)
     print(f"[J6] arm base calibration: {cal_path}  (rigid body {cal.base_rigid_body_id})")
 
-    # Verify cart is visible before doing anything
-    if read_rigid_body_pose_W(r, cal.base_rigid_body_id) is None:
-        sys.exit(f"[J6] cart rigid body {cal.base_rigid_body_id} not visible in Redis. "
-                 f"Check OptiTrack streamer.")
+    mock_intercepts: list[np.ndarray] | None = None
+    if args.mock_intercept:
+        mock_intercepts = [np.array(triple, dtype=float) for triple in args.mock_intercept]
+
+    # Verify cart is visible before doing anything (unless mock + identity base)
+    if not (mock_intercepts and args.mock_identity_base):
+        if read_rigid_body_pose_W(r, cal.base_rigid_body_id) is None:
+            sys.exit(f"[J6] cart rigid body {cal.base_rigid_body_id} not visible in Redis. "
+                     f"Check OptiTrack streamer, or use --mock-identity-base.")
 
     # ---- Build ikpy chain ----
     if not os.path.isfile(URDF_PATH):
@@ -750,27 +885,39 @@ def main() -> None:
     print("[J6] moving to home pose ...")
     run_segment(r, "→home", q_at_cal, Q_HOME_RAD,
                 move_s=3.0, hold_s=1.0, publish_hz=100.0)
-    q_home_rad = Q_HOME_RAD
+    q_home_rad = Q_HOME_RAD.copy()
+    q_settled = get_vec(r, SENSOR_JOINTS, 7)
+    if q_settled is not None:
+        q_home_rad = q_settled
     set_vec(r, GOAL_JOINTS, q_home_rad)
     print("[J6] at home.\n")
 
-    # ---- Ball tracker ----
-    cfg = BallTrackerConfig()
-    if args.min_lookahead is not None:
-        cfg.min_lookahead = args.min_lookahead
-    if args.max_lookahead is not None:
-        cfg.max_lookahead = args.max_lookahead
+    R_A_link7_home = None
+    if not args.no_fixed_paddle_ori:
+        R_A_link7_home = _link7_R_A(chain, q_home_rad)
+        face_A = R_A_link7_home @ (offset_link7 / max(np.linalg.norm(offset_link7), 1e-9))
+        print("[J6] home link7 orientation captured from settled home joints")
+        print(f"[J6]   strike-face normal_A ≈ [{face_A[0]:+.3f},{face_A[1]:+.3f},{face_A[2]:+.3f}]")
 
-    keys = RedisKeys(ball_source="optitrack")
-    keys.ball.__dict__["optitrack_rigid_body_id"] = args.ball_rigid_body_id
+    # ---- Ball tracker (skipped in mock mode) ----
+    tracker: BallTracker | None = None
+    if mock_intercepts is None:
+        cfg = BallTrackerConfig()
+        if args.min_lookahead is not None:
+            cfg.min_lookahead = args.min_lookahead
+        if args.max_lookahead is not None:
+            cfg.max_lookahead = args.max_lookahead
 
-    ball_key = keys.ball.optitrack_position
-    if r.get(ball_key) is None:
-        print(f"[J6] WARNING: {ball_key} is empty — is the OptiTrack streamer running?")
-    else:
-        print(f"[J6] reading ball from {ball_key}")
+        keys = RedisKeys(ball_source="optitrack")
+        keys.ball.__dict__["optitrack_rigid_body_id"] = args.ball_rigid_body_id
 
-    tracker = BallTracker(r, keys, cfg)
+        ball_key = keys.ball.optitrack_position
+        if r.get(ball_key) is None:
+            print(f"[J6] WARNING: {ball_key} is empty — is the OptiTrack streamer running?")
+        else:
+            print(f"[J6] reading ball from {ball_key}")
+
+        tracker = BallTracker(r, keys, cfg)
 
     # ---- Go ----
     try:
@@ -780,6 +927,7 @@ def main() -> None:
             tracker=tracker,
             q_home_rad=q_home_rad,
             offset_link7=offset_link7,
+            R_A_link7_home=R_A_link7_home,
             cal=cal,
             strike_plane_x_world=args.strike_plane_x,
             commit_tti=commit_tti,
@@ -800,6 +948,12 @@ def main() -> None:
             swing_vel_frac=args.swing_vel_frac,
             z_mode=args.z_mode,
             fixed_arm_z_m=args.fixed_arm_z_m,
+            w_ori=args.w_ori,
+            max_ori_err_deg=args.max_ori_err_deg,
+            mock_intercepts=mock_intercepts,
+            mock_tti=args.mock_tti,
+            mock_cycle_s=args.mock_cycle_s,
+            mock_identity_base=args.mock_identity_base,
         )
     except KeyboardInterrupt:
         print("\n[J6] stopped — leaving last joint goal in Redis.")
