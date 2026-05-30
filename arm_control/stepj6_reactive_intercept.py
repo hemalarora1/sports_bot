@@ -103,6 +103,7 @@ from stepj1_joint_nudge import (  # noqa: E402
     GOAL_JOINTS,
     SAFETY_TORQUES,
     SENSOR_JOINTS,
+    ensure_joint_controller,
     get_vec,
     run_segment,
     set_vec,
@@ -159,6 +160,8 @@ J6_WORLD_Z_MAX_M = 1.40
 J6_TARGET_JUMP_MAX_M = 0.04   # max tracking-target jump accepted per tick
 J6_TRACKING_STEP_DEG = 0.25    # max commanded joint-goal step per 100 Hz tick
 J6_SWING_VEL_FRAC = 0.45      # cap blocking swing peak qdot to this fraction of XML limits
+J6_HOME_VEL_FRAC = 0.85       # startup / return-home velocity cap fraction
+J6_HOME_SETTLE_TOL_DEG = 5.0  # accept settled joints as home if within this of nominal
 J6_FIXED_ARM_Z_M = 0.45       # J6 bringup: trust lateral prediction, hold Z steady
 J6_W_ORI = 2.0                # IK weight on (link7 rotation error from home)²
 J6_MAX_ORI_ERR_DEG = 8.0      # reject IK if link7 rotates farther than this from home
@@ -378,9 +381,75 @@ def calibrate_offset_link7(
     # Switch to joint_controller, seed goal = current joints (no lurch)
     print("[J6 cal] switching to joint_controller ...")
     set_vec(r, GOAL_JOINTS, q_at_cal)
-    switch_ctrl(r, JOINT_CTRL)
+    if not ensure_joint_controller(r, timeout_s=2.0):
+        sys.exit(
+            f"ERROR: could not activate {JOINT_CTRL} after calibration — "
+            "is OpenSai running with joint_controller in the XML?"
+        )
     print("[J6 cal] calibration done.\n")
     return q_at_cal, offset_link7
+
+
+def move_to_home_pose(
+    r: redis.Redis,
+    q_nominal_home: np.ndarray,
+    *,
+    move_s: float,
+    hold_s: float,
+    vel_frac: float,
+) -> np.ndarray:
+    """Smoothstep move from live sensor joints to nominal home.
+
+    Re-reads sensors (not stale calibration samples), ensures joint_controller
+    is active, and stretches duration for large joint deltas.  Never treats a
+    failed move as home — keeps commanding Q_HOME until settled within tol.
+    """
+    q_cur = get_vec(r, SENSOR_JOINTS, 7)
+    if q_cur is None:
+        sys.exit(f"[J6] cannot read {SENSOR_JOINTS} for home move")
+
+    max_delta_deg = float(np.max(np.abs(np.degrees(q_nominal_home - q_cur))))
+    print(f"[J6] home move: max joint delta {max_delta_deg:.1f}° from nominal")
+    if max_delta_deg < 2.0:
+        print("[J6] already near home — holding current joints")
+        set_vec(r, GOAL_JOINTS, q_cur)
+        ensure_joint_controller(r, timeout_s=2.0)
+        return q_nominal_home.copy()
+
+    set_vec(r, GOAL_JOINTS, q_cur)
+    if not ensure_joint_controller(r, timeout_s=2.0):
+        sys.exit(
+            f"[J6] {JOINT_CTRL} not active — cannot move to home. "
+            f"Check OpenSai and active_controller_name in Redis."
+        )
+    time.sleep(0.05)
+
+    home_s = _move_s_with_velocity_floor(
+        q_cur, q_nominal_home, move_s, vel_frac, "→home",
+    )
+    run_segment(
+        r, "→home", q_cur, q_nominal_home,
+        move_s=home_s, hold_s=hold_s, publish_hz=100.0,
+    )
+
+    q_settled = get_vec(r, SENSOR_JOINTS, 7)
+    if q_settled is None:
+        q_settled = q_nominal_home.copy()
+
+    err_deg = float(np.max(np.abs(np.degrees(q_nominal_home - q_settled))))
+    if err_deg > J6_HOME_SETTLE_TOL_DEG:
+        print(
+            f"[J6] WARNING: home move incomplete — max joint error {err_deg:.1f}° "
+            f"(need ≤ {J6_HOME_SETTLE_TOL_DEG:.1f}°). "
+            "Keeping nominal home as goal; tracking may be degraded.",
+            file=sys.stderr,
+        )
+        set_vec(r, GOAL_JOINTS, q_nominal_home)
+        return q_nominal_home.copy()
+
+    set_vec(r, GOAL_JOINTS, q_settled)
+    print(f"[J6] at home (max joint error {err_deg:.2f}° from nominal).\n")
+    return q_settled.copy()
 
 
 
@@ -782,6 +851,12 @@ def main() -> None:
                          "Default: swing_s + 0.05.")
     ap.add_argument("--return-s", type=float, default=2.0,
                     help="Move time for follow→home (s).")
+    ap.add_argument("--home-s", type=float, default=3.0,
+                    help="Minimum move time for startup →home (s); stretched for large deltas.")
+    ap.add_argument("--home-hold-s", type=float, default=1.0,
+                    help="Hold time at home after startup move (s).")
+    ap.add_argument("--home-vel-frac", type=float, default=J6_HOME_VEL_FRAC,
+                    help="Velocity cap fraction for startup →home.")
 
     # Workspace safety
     ap.add_argument("--reach-m", type=float, default=J6_REACH_M,
@@ -883,20 +958,21 @@ def main() -> None:
 
     # ---- Move to home before tracking ----
     print("[J6] moving to home pose ...")
-    run_segment(r, "→home", q_at_cal, Q_HOME_RAD,
-                move_s=3.0, hold_s=1.0, publish_hz=100.0)
-    q_home_rad = Q_HOME_RAD.copy()
-    q_settled = get_vec(r, SENSOR_JOINTS, 7)
-    if q_settled is not None:
-        q_home_rad = q_settled
-    set_vec(r, GOAL_JOINTS, q_home_rad)
-    print("[J6] at home.\n")
+    q_home_rad = move_to_home_pose(
+        r,
+        Q_HOME_RAD,
+        move_s=args.home_s,
+        hold_s=args.home_hold_s,
+        vel_frac=args.home_vel_frac,
+    )
 
     R_A_link7_home = None
     if not args.no_fixed_paddle_ori:
-        R_A_link7_home = _link7_R_A(chain, q_home_rad)
+        # Paddle face / net alignment comes from the designed home pose, not wherever
+        # the arm happened to stop if the move was only partial.
+        R_A_link7_home = _link7_R_A(chain, Q_HOME_RAD)
         face_A = R_A_link7_home @ (offset_link7 / max(np.linalg.norm(offset_link7), 1e-9))
-        print("[J6] home link7 orientation captured from settled home joints")
+        print("[J6] home link7 orientation from nominal Q_HOME")
         print(f"[J6]   strike-face normal_A ≈ [{face_A[0]:+.3f},{face_A[1]:+.3f},{face_A[2]:+.3f}]")
 
     # ---- Ball tracker (skipped in mock mode) ----
