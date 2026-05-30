@@ -54,10 +54,11 @@ Prereqs
   redis-server
   OptiTrack streamer (cart rigid body streaming)
   arm_base_offset_calibration.json  (run calibrate_arm_base_offset.py once)
-  OpenSai running with joint_controller AND cartesian_controller in the XML
-    (cartesian_controller is only read at startup for offset calibration)
+  OpenSai running with joint_controller in the XML (cartesian_controller only
+    needed for live offset cal — use --skip-cal if that switch kills OpenSai)
 
 Run from OpenSai root:
+  python sports_bot/arm_control/stepj6_reactive_intercept.py --skip-cal --no-commit
   python sports_bot/arm_control/stepj6_reactive_intercept.py
   python sports_bot/arm_control/stepj6_reactive_intercept.py --no-commit
   python sports_bot/arm_control/stepj6_reactive_intercept.py --print-cal-only
@@ -168,6 +169,10 @@ J6_MAX_ORI_ERR_DEG = 8.0      # reject IK if link7 rotates farther than this fro
 
 # joint_controller XML velocity limits currently used by picklebot_j5.xml / picklebot.xml
 J6_XML_VEL_LIMIT_RAD_S = np.array([1.2, 1.4, 1.6, 1.8, 1.0, 1.1, 1.2])
+
+# picklebot.xml compliantFrame z=0.35 m + URDF flange → ~0.43 m in ikpy link7 +Z.
+# Matches live cartesian cal on tidybot01; use --skip-cal when that switch kills OpenSai.
+J6_DEFAULT_OFFSET_LINK7 = np.array([0.0, 0.0, 0.43])
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +393,35 @@ def calibrate_offset_link7(
         )
     print("[J6 cal] calibration done.\n")
     return q_at_cal, offset_link7
+
+
+def seed_offset_link7_no_cartesian(
+    r: redis.Redis,
+    offset_link7: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Use a fixed link7 sweet-spot offset — no cartesian_controller switch.
+
+    Switching active_controller to cartesian_controller for live cal can fault
+    or kill OpenSai on some bring-up setups.  This path stays on joint_controller.
+    """
+    q_cur = get_vec(r, SENSOR_JOINTS, 7)
+    if q_cur is None:
+        sys.exit(f"ERROR: {SENSOR_JOINTS} not available — is OpenSai running?")
+
+    mag_m = float(np.linalg.norm(offset_link7))
+    print("[J6 cal] --skip-cal: using fixed offset_link7 (no cartesian switch)")
+    print(f"[J6 cal]   q_cur:        {_fmt_q(q_cur)}")
+    print(f"[J6 cal]   offset_link7: [{offset_link7[0]:+.4f}, {offset_link7[1]:+.4f}, "
+          f"{offset_link7[2]:+.4f}] m  |{mag_m*100:.1f} cm|")
+
+    set_vec(r, GOAL_JOINTS, q_cur)
+    if not ensure_joint_controller(r, timeout_s=2.0):
+        sys.exit(
+            f"ERROR: could not activate {JOINT_CTRL} — "
+            "is OpenSai running with joint_controller in the XML?"
+        )
+    print("[J6 cal] joint_controller seeded at current joints.\n")
+    return q_cur, offset_link7.copy()
 
 
 def move_to_home_pose(
@@ -908,6 +942,13 @@ def main() -> None:
                          "Good for verifying IK/tracking before first throw.")
     ap.add_argument("--print-cal-only", action="store_true",
                     help="Calibrate offset_link7, print it, and exit.")
+    ap.add_argument("--skip-cal", action="store_true",
+                    help="Skip cartesian_controller cal (avoids OpenSai fault on "
+                         "controller switch). Uses --offset-link7 or 0.43 m default.")
+    ap.add_argument("--offset-link7", nargs=3, type=float, metavar=("X", "Y", "Z"),
+                    default=None,
+                    help="Sweet-spot offset in link7 frame (m). Default with --skip-cal: "
+                         "[0, 0, 0.43].")
 
     # Calibration / infra
     ap.add_argument("--calibration", default=None,
@@ -960,7 +1001,14 @@ def main() -> None:
     chain = build_chain()
 
     # ---- Calibrate offset_link7 at current pose ----
-    q_at_cal, offset_link7 = calibrate_offset_link7(r, chain)
+    if args.skip_cal:
+        if args.offset_link7 is not None:
+            offset_link7 = np.asarray(args.offset_link7, dtype=float)
+        else:
+            offset_link7 = J6_DEFAULT_OFFSET_LINK7.copy()
+        q_at_cal, offset_link7 = seed_offset_link7_no_cartesian(r, offset_link7)
+    else:
+        q_at_cal, offset_link7 = calibrate_offset_link7(r, chain)
 
     if args.print_cal_only:
         print("[J6] --print-cal-only: done.")
