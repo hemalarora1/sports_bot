@@ -283,6 +283,33 @@ class BallTrackerConfig:
     # Treat the ball as "at/below floor" (model breaks down) below this z.
     floor_epsilon: float = 1e-3
 
+    # Maximum physical speed (m/s) the ball can travel between consecutive
+    # OptiTrack samples. Any sample whose implied speed exceeds this is rejected
+    # before it enters the rolling history.
+    #
+    # Rationale: When the ball rises above ~1.4 m world-Z, Motive loses the
+    # marker and returns garbage or interpolated positions. These glitch samples
+    # typically imply 20–50 m/s; real pickleball hand-throws are under ~15 m/s.
+    # Measurements on SRC Kitchen recordings (2026-05-29): max legitimate
+    # implied speed = 14.85 m/s; min observed garbage = 19.6 m/s.
+    # Set to 0 to disable (reverts to the position-only max_position_jump gate).
+    max_implied_speed_mps: float = 15.0
+
+    # If the Redis ball key stops changing, do not keep re-sampling the
+    # frozen value as fresh measurements. This matters for replay, where the
+    # final sample otherwise remains in Redis and can be re-fit as another
+    # throw after the arm returns home. Live OptiTrack moving balls change by
+    # centimeters per tick; a ball at rest or a stopped replay does not.
+    stale_position_epsilon_m: float = 0.001
+    stale_position_timeout_s: float = 0.08
+
+    # Minimum number of samples in the rolling history required before
+    # predict_intercept may produce a prediction. Raises the floor above the
+    # hard LS minimum of 3, ensuring the fit has enough data at throw-start
+    # before the arm commits. At 120 Hz, 6 samples ≈ 50 ms of flight.
+    # Set to 0 or 3 to revert to the 3-sample LS floor.
+    min_history_for_prediction: int = 6
+
     # Parameters for the experimental EKF tracker variant. Ignored by the
     # production least-squares tracker.
     ekf: EKFConfig = field(default_factory=EKFConfig)

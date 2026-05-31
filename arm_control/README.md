@@ -148,6 +148,90 @@ python sports_bot/arm_control/stepj3_ik_roundtrip.py --pose near_home --pause
 python sports_bot/arm_control/stepj3_ik_roundtrip.py --pose all
 ```
 
+---
+
+## J6 bring-up complete (2026-05-31)
+
+**Script:** `stepj6_reactive_intercept.py` — reactive IK-based ball intercept, joint controller only.
+
+### Confirmed working XML: `picklebot.xml`
+
+```xml
+<!-- joint_controller jointTask -->
+<gains kp="200 200 200 200 400 600 400"
+       kv=" 20  20  20  20  28  28  28"
+       ki="  0   0   0   0   0   0   0" />
+<velocitySaturation enabled="true"
+    velocityLimit="1.2 1.4 1.6 1.8 1.0 1.1 1.2" />
+<otg type="disabled"/>
+```
+
+`picklebot_clean.xml` (kp=100 uniform) cannot execute the strike swing — insufficient torque to pull q6 through the 10° wrist arc. Do not use it for J6.
+
+### Three code fixes applied
+
+1. **Commit keep-tracking**: when commit fires but arm is still en route to wind-up (`commit_delta_deg > max` but `tti > 0`), the loop keeps tracking toward q_wu instead of oscillating home.
+2. **strike→home actual-position start**: `run_segment("strike→home", ...)` now uses `get_vec(SENSOR_JOINTS)` as start — avoids a setpoint snap caused by wu→strike tracking error.
+3. **Active pre-swing settle**: before wu→strike, the loop holds `last_wu_q` (IK wind-up goal) for 200 ms at 200 Hz. This lets all joints converge — especially q6 which is the slowest — before the swing fires. Passive settle (hold current joints) left q6 at gravitational equilibrium, 9.5° from target.
+
+### Verified performance (mock-identity-base, z=0.45)
+
+| Metric | Value |
+|---|---|
+| Home move max error | ≤ 2.2° |
+| Tracking settled residual | 1.1°@q5 |
+| wu→strike qdot_max | 12–20°/s (16% of hardware limit) |
+| wu→strike goal_err | ~2.8°@q4, ~1.9°@q6 |
+| Live cart T_W_A (OptiTrack) | SETTLED 1.1°@q5 |
+
+### Standard bring-up command (mock, with commit)
+
+```bash
+python sports_bot/arm_control/stepj6_reactive_intercept.py \
+  --skip-cal --offset-link7 0 0 0.49 \
+  --mock-intercept 0.45 0.0 0.45 \
+  --mock-tti 0.25 \
+  --mock-identity-base \
+  --gentle-swing --mini-swing \
+  --wind-up-offset 0.02 \
+  --fixed-arm-z-m 0.45 \
+  --tracking-step-deg 0.75 \
+  --tracking-accel-deg-s2 250 \
+  --verbose-tracking \
+  --log-period-s 0.25
+```
+
+### Live ball intercept (next milestone)
+
+```bash
+# Step 1: live cart, mock ball, no commit
+python sports_bot/arm_control/stepj6_reactive_intercept.py \
+  --skip-cal --offset-link7 0 0 0.49 \
+  --no-commit \
+  --mock-intercept 0.45 0.0 0.45 --mock-tti 1.0 \
+  --wind-up-offset 0.02 --fixed-arm-z-m 0.45 \
+  --tracking-step-deg 0.75 --tracking-accel-deg-s2 250 \
+  --verbose-tracking --log-period-s 0.25
+# Push cart by hand — wu_A should stay constant in world frame.
+
+# Step 2: live cart, live ball, no commit (ball ID=1)
+python sports_bot/arm_control/stepj6_reactive_intercept.py \
+  --skip-cal --offset-link7 0 0 0.49 --no-commit \
+  --ball-rigid-body-id 1 --strike-plane-x 0.45 \
+  --wind-up-offset 0.02 --tracking-step-deg 0.75 \
+  --tracking-accel-deg-s2 250 --verbose-tracking --log-period-s 0.10
+
+# Step 3: live ball with commit
+python sports_bot/arm_control/stepj6_reactive_intercept.py \
+  --skip-cal --offset-link7 0 0 0.49 \
+  --ball-rigid-body-id 1 --strike-plane-x 0.45 \
+  --wind-up-offset 0.02 --gentle-swing --mini-swing \
+  --tracking-step-deg 0.75 --tracking-accel-deg-s2 250 \
+  --verbose-tracking --log-period-s 0.10
+```
+
+---
+
 ## Safe Step J1/J2 commands
 
 ```bash

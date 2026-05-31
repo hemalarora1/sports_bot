@@ -413,8 +413,14 @@ class _ReplayTracker(BallTracker):
             self._history.popleft()
         if self._history:
             last = self._history[-1]
-            if np.linalg.norm(pos - last.pos) > self._cfg.max_position_jump:
+            dist = np.linalg.norm(pos - last.pos)
+            if dist > self._cfg.max_position_jump:
                 return None
+            # Mirror BallTracker.update()'s velocity-based outlier rejection.
+            if self._cfg.max_implied_speed_mps > 0:
+                dt_sample = float(t) - last.t
+                if dt_sample > 1e-6 and dist / dt_sample > self._cfg.max_implied_speed_mps:
+                    return None
         sample = BallSample(t=float(t), pos=pos)
         self._history.append(sample)
         self._last_seen_t = float(t)
@@ -784,6 +790,12 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         cfg.tracker.max_bounces = args.max_bounces
     if args.no_online_bounce_pruning:
         cfg.tracker.online_bounce_pruning = False
+    if args.max_implied_speed_mps is not None:
+        cfg.tracker.max_implied_speed_mps = args.max_implied_speed_mps
+    if args.no_speed_filter:
+        cfg.tracker.max_implied_speed_mps = 0.0
+    if args.min_history_for_prediction is not None:
+        cfg.tracker.min_history_for_prediction = args.min_history_for_prediction
 
     # EKF-specific overrides (no-ops for the LS tracker).
     if args.ekf_process_accel_std_xy is not None:
@@ -803,6 +815,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     print(f"[analyze] tracker: history_size={cfg.tracker.history_size}, "
           f"max_age={cfg.tracker.history_max_age_s:.2f}s, "
           f"max_jump={cfg.tracker.max_position_jump:.3f}m, "
+          f"max_speed={cfg.tracker.max_implied_speed_mps:.1f}m/s, "
+          f"min_hist={cfg.tracker.min_history_for_prediction}, "
           f"min_incoming={cfg.tracker.min_incoming_speed:.2f}m/s, "
           f"lookahead=[{cfg.tracker.min_lookahead:.2f}, {cfg.tracker.max_lookahead:.2f}]s, "
           f"g={cfg.tracker.gravity:.2f}m/s^2, "
@@ -1353,6 +1367,19 @@ def main() -> int:
     an.add_argument("--no-online-bounce-pruning", action="store_true",
                     help="Disable BallTracker's online bounce-triggered history pruning (3a). For A/B with the "
                          "pre-3a behavior on the same recording.")
+    an.add_argument("--max-implied-speed-mps", type=float, default=None,
+                    help="Override BallTrackerConfig.max_implied_speed_mps — velocity-based outlier "
+                         "rejection threshold (m/s). Samples whose implied speed since the last "
+                         "accepted sample exceeds this are dropped before entering the LS fit "
+                         "window. Default 15.0 m/s; set to 0 to disable.")
+    an.add_argument("--no-speed-filter", action="store_true",
+                    help="Shortcut for --max-implied-speed-mps 0 — disables velocity-based "
+                         "outlier rejection. Useful for A/B comparing filtered vs. raw ingest "
+                         "on the same recording.")
+    an.add_argument("--min-history-for-prediction", type=int, default=None,
+                    help="Override BallTrackerConfig.min_history_for_prediction — minimum number "
+                         "of history samples required before predict_intercept may return a "
+                         "prediction. Default 6; set to 3 to revert to the LS minimum.")
 
     # ----- tracker selection + EKF overrides
     an.add_argument("--tracker", choices=["leastsq", "ekf"], default="leastsq",

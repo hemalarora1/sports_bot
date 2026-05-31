@@ -110,11 +110,20 @@ if [[ -n "$(redis-cli get "$KEY" 2>/dev/null || true)" ]]; then
     echo "[startup] streamer already running (saw $KEY appear)"
 else
     if [[ -z "${MY_IP:-}" ]]; then
-        MY_IP="$(ifconfig en0 2>/dev/null | awk '/inet / {print $2}')"
+        # macOS uses en0; tidybot/Linux usually does not. Keep failures from
+        # tripping `set -e` so we can fall through to Linux auto-detection.
+        MY_IP="$(ifconfig en0 2>/dev/null | awk '/inet / {print $2}' || true)"
+    fi
+    if [[ -z "${MY_IP:-}" ]] && command -v ip >/dev/null 2>&1; then
+        # Prefer the source address the kernel would use to reach Motive.
+        MY_IP="$(ip -o route get "$MOTIVE_SERVER" 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' || true)"
+    fi
+    if [[ -z "${MY_IP:-}" ]] && command -v hostname >/dev/null 2>&1; then
+        MY_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
     fi
     if [[ -z "${MY_IP:-}" ]]; then
-        echo "[startup] couldn't read en0 IP and MY_IP not set. Connect to wifi" >&2
-        echo "          (Stanford or SRC) first, or pass MY_IP=… explicitly." >&2
+        echo "[startup] couldn't auto-detect MY_IP for NatNet." >&2
+        echo "          Pass it explicitly, e.g.: MY_IP=172.24.69.172 STREAMER_MODE=u ..." >&2
         exit 1
     fi
     case "$STREAMER_MODE" in

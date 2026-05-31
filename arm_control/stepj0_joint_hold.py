@@ -65,6 +65,14 @@ def set_vec(r, key, vec):
     r.set(key, json.dumps(np.asarray(vec, dtype=float).reshape(-1).tolist()))
 
 
+def hold_current_joints(r):
+    q_cur = get_vec(r, SENSOR_JOINTS, expected_len=7)
+    if q_cur is not None:
+        set_vec(r, GOAL_JOINTS, q_cur)
+        print("\n[J0] interrupted — holding current measured joints")
+    return q_cur
+
+
 def ensure_joint_controller(r, timeout_s=1.0):
     t0 = time.monotonic()
     while True:
@@ -147,48 +155,52 @@ def main():
     qdot_source = "finite-diff"
     last_q = q_hold.copy()
 
-    while True:
-        now = time.perf_counter()
-        elapsed = now - t0
-        if now >= next_publish:
-            set_vec(r, GOAL_JOINTS, q_hold)
-            next_publish = now + publish_period_s
+    try:
+        while True:
+            now = time.perf_counter()
+            elapsed = now - t0
+            if now >= next_publish:
+                set_vec(r, GOAL_JOINTS, q_hold)
+                next_publish = now + publish_period_s
 
-        if now >= next_sample:
-            q = get_vec(r, SENSOR_JOINTS, expected_len=7)
-            if q is not None:
-                last_q = q
-                drift = q - q_hold
-                max_abs_drift = np.maximum(max_abs_drift, np.abs(drift))
+            if now >= next_sample:
+                q = get_vec(r, SENSOR_JOINTS, expected_len=7)
+                if q is not None:
+                    last_q = q
+                    drift = q - q_hold
+                    max_abs_drift = np.maximum(max_abs_drift, np.abs(drift))
 
-                dq_sensor = get_vec(r, SENSOR_JOINT_VELS, expected_len=7)
-                if dq_sensor is not None:
-                    qdot_peak_degs = np.maximum(qdot_peak_degs, np.abs(np.degrees(dq_sensor)))
-                    qdot_source = "sensor"
-                elif prev_q is not None and prev_t is not None:
-                    dt = now - prev_t
-                    if dt > 1e-6:
-                        qdot_peak_degs = np.maximum(
-                            qdot_peak_degs, np.abs(np.degrees((q - prev_q) / dt))
+                    dq_sensor = get_vec(r, SENSOR_JOINT_VELS, expected_len=7)
+                    if dq_sensor is not None:
+                        qdot_peak_degs = np.maximum(qdot_peak_degs, np.abs(np.degrees(dq_sensor)))
+                        qdot_source = "sensor"
+                    elif prev_q is not None and prev_t is not None:
+                        dt = now - prev_t
+                        if dt > 1e-6:
+                            qdot_peak_degs = np.maximum(
+                                qdot_peak_degs, np.abs(np.degrees((q - prev_q) / dt))
+                            )
+                        qdot_source = "finite-diff"
+                    prev_q = q
+                    prev_t = now
+
+                    if args.verbose:
+                        drift_deg = np.degrees(drift)
+                        print(
+                            f"  t={elapsed:5.2f}s  max_drift={np.max(np.abs(drift_deg)):.3f}deg  "
+                            f"qdot_max={np.max(qdot_peak_degs):.1f}deg/s",
+                            end="\r",
                         )
-                    qdot_source = "finite-diff"
-                prev_q = q
-                prev_t = now
+                next_sample = now + sample_period_s
 
+            if elapsed >= args.duration:
                 if args.verbose:
-                    drift_deg = np.degrees(drift)
-                    print(
-                        f"  t={elapsed:5.2f}s  max_drift={np.max(np.abs(drift_deg)):.3f}deg  "
-                        f"qdot_max={np.max(qdot_peak_degs):.1f}deg/s",
-                        end="\r",
-                    )
-            next_sample = now + sample_period_s
-
-        if elapsed >= args.duration:
-            if args.verbose:
-                print()
-            break
-        time.sleep(0.005)
+                    print()
+                break
+            time.sleep(0.005)
+    except KeyboardInterrupt:
+        hold_current_joints(r)
+        return
 
     active_after = decode_redis_value(r.get(ACTIVE_CONTROLLER))
     final_drift_deg = np.degrees(last_q - q_hold)

@@ -471,6 +471,13 @@ def compute_T_W_A_from_markers(
     if p0 is None or p1 is None:
         return None
 
+    # Auto-assign left/right by world-Y so Motive ID swaps don't flip the arm
+    # frame.  Convention: spec[0]=left(−Y), spec[1]=right(+Y).  As long as the
+    # cart never rotates past ±90° from forward-facing the lower-Y marker is
+    # always the left one and this assignment is stable without fixed IDs.
+    if p0[1] > p1[1]:
+        p0, p1 = p1, p0
+
     # Centroid → arm base origin.
     t_W_A = 0.5 * (p0 + p1)
 

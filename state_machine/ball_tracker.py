@@ -158,6 +158,8 @@ class BallTracker:
         self._raw_buffer: Deque[np.ndarray] = deque(maxlen=med_w)
         self._t0 = time.perf_counter()
         self._last_seen_t: Optional[float] = None
+        self._last_raw_pos: Optional[np.ndarray] = None
+        self._last_raw_change_t: Optional[float] = None
         # Diagnostic — set by predict_intercept whenever it returns None.
         # Used by the offline analyzer to render rejection reasons; the FSM
         # ignores it.
@@ -206,6 +208,26 @@ class BallTracker:
             return None
         pos = pos.astype(float)
 
+        # Redis only stores the latest position, not the producer timestamp. If
+        # a replay stops or OptiTrack leaves a final rigid-body pose in Redis, a
+        # consumer running at 100 Hz can otherwise re-ingest that frozen value as
+        # a fresh trajectory and repeatedly "hit" the same stale throw. Treat an
+        # unchanged raw position as stale after a short grace period.
+        eps = max(0.0, self._cfg.stale_position_epsilon_m)
+        stale_s = max(0.0, self._cfg.stale_position_timeout_s)
+        if eps > 0.0 and stale_s > 0.0:
+            if self._last_raw_pos is None:
+                self._last_raw_pos = pos.copy()
+                self._last_raw_change_t = now
+            elif np.linalg.norm(pos - self._last_raw_pos) > eps:
+                self._last_raw_pos = pos.copy()
+                self._last_raw_change_t = now
+            elif self._last_raw_change_t is not None and (now - self._last_raw_change_t) > stale_s:
+                self.reset()
+                self._last_raw_pos = pos.copy()
+                self._last_raw_change_t = now
+                return None
+
         # Optional 3-sample (default) median filter, applied per-axis on raw
         # OptiTrack positions before they hit `_history`. Single-sample
         # outliers (marker mislabels, brief reflection artifacts) get
@@ -227,8 +249,17 @@ class BallTracker:
         # against a recent sample.
         if self._history:
             last = self._history[-1]
-            if np.linalg.norm(pos - last.pos) > self._cfg.max_position_jump:
+            dist = np.linalg.norm(pos - last.pos)
+            if dist > self._cfg.max_position_jump:
                 return None
+            # Velocity-based outlier rejection. OptiTrack garbage positions
+            # during high-Z tracking loss imply 20–50 m/s; real ball flight is
+            # under ~15 m/s. The existing max_position_jump gate is equivalent
+            # to ~60 m/s at 120 Hz — far too loose to catch these.
+            if self._cfg.max_implied_speed_mps > 0:
+                dt_sample = now - last.t
+                if dt_sample > 1e-6 and dist / dt_sample > self._cfg.max_implied_speed_mps:
+                    return None
 
         sample = BallSample(t=now, pos=pos)
         self._history.append(sample)
@@ -286,6 +317,8 @@ class BallTracker:
         self._history.clear()
         self._raw_buffer.clear()
         self._last_seen_t = None
+        self._last_raw_pos = None
+        self._last_raw_change_t = None
         self.last_reject_reason = REJECT_NONE
 
     # ----------------------------------------------------------- estimation
@@ -344,6 +377,13 @@ class BallTracker:
         Used by the offline analyzer; the FSM ignores it.
         """
         self.last_reject_reason = REJECT_NONE
+        # Require a minimum number of history samples so early-throw predictions
+        # (from 3–5 samples) don't produce noisy Z estimates that can prematurely
+        # lock the arm onto a bad target.
+        min_hist = max(3, self._cfg.min_history_for_prediction)
+        if len(self._history) < min_hist:
+            self.last_reject_reason = REJECT_INSUFFICIENT_HISTORY
+            return None
         fit = self._fit_state()
         if fit is None:
             self.last_reject_reason = REJECT_INSUFFICIENT_HISTORY

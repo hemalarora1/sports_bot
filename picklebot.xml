@@ -30,12 +30,7 @@
 			<velocitySaturation enabled="true"
 				velocityLimit="1.2 1.4 1.6 1.8 1.0 1.1 1.2" />
 			<otg type="disabled"/>
-			<!-- q2/q4 at intermediate 400/28 — same progression as q1 (200→400→800).
-			     800/40 caused tau_sensed_peak q2=68 Nm during fast swing, triggering
-			     Franka hardware reflex and freezing the arm after the strike. -->
-			<gains kp="800 400 800 400 800 800 800"
-				kv=" 40  28  40  28  40  40  40"
-				ki="  0   0   0   0   0   0   0" />
+			<gains kp="100.0" kv="20.0" ki="0.0" />
 		</jointTask>
 	</controller>
 

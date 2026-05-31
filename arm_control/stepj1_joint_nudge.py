@@ -79,6 +79,14 @@ def set_vec(r, key, vec):
     r.set(key, json.dumps(np.asarray(vec, dtype=float).reshape(-1).tolist()))
 
 
+def hold_current_joints(r):
+    q_cur = get_vec(r, SENSOR_JOINTS, expected_len=7)
+    if q_cur is not None:
+        set_vec(r, GOAL_JOINTS, q_cur)
+        print("\n[J1] interrupted — holding current measured joints")
+    return q_cur
+
+
 def ensure_joint_controller(r, timeout_s=1.0):
     t0 = time.monotonic()
     while True:
@@ -329,39 +337,44 @@ def main():
 
     summaries = []
     current_home = q_start.copy()
-    for j in joints:
-        for sign in signs:
-            delta = np.zeros(7)
-            delta[j - 1] = math.radians(sign * abs(args.deg))
-            q_target = current_home + delta
-            bad_limits = check_joint_limits(q_target)
-            if bad_limits:
-                for ji, q, lo, hi in bad_limits:
-                    print(f"SKIP q{ji}: target {q:.1f} deg outside [{lo:.1f}, {hi:.1f}] deg")
-                continue
-
-            label = f"q{j}_{'plus' if sign > 0 else 'minus'}_{abs(args.deg):.1f}deg"
-            summaries.append(run_segment(
-                r, label, current_home, q_target,
-                move_s=args.move_s, hold_s=args.hold_s,
-                publish_hz=max(1.0, args.publish_hz),
-                verbose=args.verbose,
-            ))
-
-            if args.pause_between:
-                input("Press Enter to return/continue...")
-
-            if not args.no_return:
+    try:
+        for j in joints:
+            for sign in signs:
+                delta = np.zeros(7)
+                delta[j - 1] = math.radians(sign * abs(args.deg))
+                q_target = current_home + delta
+                bad_limits = check_joint_limits(q_target)
+                if bad_limits:
+                    for ji, q, lo, hi in bad_limits:
+                        print(f"SKIP q{ji}: target {q:.1f} deg outside [{lo:.1f}, {hi:.1f}] deg")
+                    continue
+    
+                label = f"q{j}_{'plus' if sign > 0 else 'minus'}_{abs(args.deg):.1f}deg"
                 summaries.append(run_segment(
-                    r, f"return_after_{label}", q_target, current_home,
+                    r, label, current_home, q_target,
                     move_s=args.move_s, hold_s=args.hold_s,
                     publish_hz=max(1.0, args.publish_hz),
                     verbose=args.verbose,
                 ))
+    
                 if args.pause_between:
-                    input("Press Enter for next nudge...")
-            else:
-                current_home = q_target.copy()
+                    input("Press Enter to return/continue...")
+    
+                if not args.no_return:
+                    summaries.append(run_segment(
+                        r, f"return_after_{label}", q_target, current_home,
+                        move_s=args.move_s, hold_s=args.hold_s,
+                        publish_hz=max(1.0, args.publish_hz),
+                        verbose=args.verbose,
+                    ))
+                    if args.pause_between:
+                        input("Press Enter for next nudge...")
+                else:
+                    current_home = q_target.copy()
+    
+    except KeyboardInterrupt:
+        hold_current_joints(r)
+        return
 
     sep = "-" * 72
     print(f"\n{sep}")
