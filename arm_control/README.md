@@ -232,6 +232,40 @@ python sports_bot/arm_control/stepj6_reactive_intercept.py \
 
 ---
 
+---
+
+## J7 — Production strike planner (2026-05-31)
+
+**Script:** `stepj7_strike_planner.py` — replaces J6 for real ball intercept. Reads ball from Redis, LS-predicts intercept, locks first safe prediction, tracks arm to wind-up, commits swing.
+
+**Full context and commands:** See `CLAUDE.md` at repo root and `sports_bot/context.md`.
+
+### Confirmed working state (replay tests 2026-05-31)
+
+- XML: **`picklebot.xml`** (standard swing) / **`picklebot_j7.xml`** (wrist flick — q6 vel raised to 2.5 rad/s)
+- Ball rigid body ID: **31**
+- Replay test outcome: `target_delta` 26° → 10° with new Q_HOME_RAD; both 2A (replay23) and 2B (replay10) outcome=OK
+
+### Known issues
+
+| Issue | Symptom | Status |
+|---|---|---|
+| Standard swing is soft | qdot_max=35-44°/s, paddle ~0.09 m/s at contact | By design — forward push = tiny angular sweep |
+| Q6 barely moves in standard swing | User observation: "no strong q6 swing" | Correct — q6 locked for orientation; use flick mode |
+| wu_hold_s=0 fails 5° goal_err | `WARN goal_err=5.72° > 5.00°` → no follow-through | Keep wu_hold_s=0.10 |
+
+### Wrist flick mode
+
+```bash
+# Load picklebot_j7.xml, then add to J7 command:
+--flick-q6-deg 30 --flick-s 0.25 --flick-vel-frac 1.0 --flick-wu-delta-deg 8
+```
+- 30° q6 rotation at 143°/s → paddle tip ~1 m/s (vs ~0.09 m/s from forward swing)
+- NOT yet tested on hardware (2026-05-31)
+- Requires `picklebot_j7.xml` — without it, q6 vel limit 63°/s stretches flick to 0.71s
+
+---
+
 ## Safe Step J1/J2 commands
 
 ```bash

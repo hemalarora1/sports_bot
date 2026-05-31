@@ -152,8 +152,12 @@ Q_HI = np.radians([ 166,  101,  166,   -4,  166, 215,  166])
 # Home / ready pose — free-driven to a forward-reach position, paddle face
 # toward opponent, elbow up, comfortable for mid-height volleys (2026-05-28).
 # Arm extends forward-left, paddle at roughly shoulder height.
+# Pre-positioned near q_wu for typical shots (world z≈0.75–0.97m, arm-frame z≈0.30–0.36m).
+# Derived 2026-05-31 as centroid of 5 locked wu_A IK solutions from tonight's recordings.
+# Reduces tracking distance from ~16-20° to ~2-5° for most balls.
+# Old home: [-3.5°, -39.5°, -0.5°, -118.5°, +0.4°, +85.2°, -45.5°]
 Q_HOME_RAD = np.array([
-    -0.0603075, -0.690094, -0.0084536, -2.06741, 0.00632398, 1.48626, -0.793569,
+    0.0374488, -0.9673054, 0.2752411, -2.3494738, 0.2078330, 1.5117640, -0.4948271,
 ])
 
 J6_REACH_M       = 0.78   # Franka HW ~0.85 m; 0.78 keeps ~7 cm margin vs 0.60 bring-up default
@@ -788,6 +792,12 @@ def run_loop(
     lock_first_safe_prediction: bool = True,
     lock_release_after_impact_s: float = J6_LOCK_RELEASE_AFTER_IMPACT_S,
     post_impact_idle_s: float = 1.5,
+    wu_hold_s: float = 0.10,
+    max_swings: int = 0,
+    flick_q6_deg: float = 0.0,
+    flick_s: float = 0.25,
+    flick_vel_frac: float = 1.0,
+    flick_wu_delta_deg: float = 8.0,
 ) -> None:
     dt = 1.0 / rate_hz
     state = State.IDLE
@@ -970,9 +980,12 @@ def run_loop(
     _hold_current_joints(r)
 
     print(f"[J7] running at {rate_hz:.0f} Hz  —  Ctrl-C to stop")
+    flick_info = f"  flick_q6={flick_q6_deg:+.1f}° flick_s={flick_s:.2f}s" if flick_q6_deg > 0 else ""
     print(f"[J7] strike_plane_x={strike_plane_x_world:+.3f} m  "
           f"commit_tti_max={commit_tti:.3f} s  swing_s={swing_s:.2f} s  "
-          f"contact_margin={contact_margin_s:+.3f} s  pre_settle={pre_swing_settle_s:.2f} s")
+          f"contact_margin={contact_margin_s:+.3f} s  pre_settle={pre_swing_settle_s:.2f} s  "
+          f"wu_hold={wu_hold_s:.2f} s  max_swings={'∞' if max_swings == 0 else max_swings}"
+          f"{flick_info}")
     print(f"[J7] swing vector: windup={wind_up_offset_m*100:.1f} cm  "
           f"follow=+{follow_offset_m*100:.1f} cm forward, +{follow_up_offset_m*100:.1f} cm up")
     print(f"[J7] workspace (arm frame):  r_xy ≤ {reach_m:.2f} m  "
@@ -1164,20 +1177,34 @@ def run_loop(
         dynamic_commit_txt = ""
         if (not no_commit and locked_intercept is not None
                 and state == State.TRACKING and last_wu_q is not None):
-            q_probe_seed = last_wu_q
-            q_strike_probe, err_probe, ori_probe = ik_solve(
-                chain, t_A_strike, q_probe_seed, offset_link7,
-                R_A_link7_target=R_A_link7_home, w_ori=w_ori,
-            )
-            if (_joints_ok(q_strike_probe)
-                    and _ik_ok(err_probe, ori_probe, ik_tol_m * 3, max_ori_err_deg, R_A_link7_home)):
-                est_strike_s = _move_s_estimate(q_cur, q_strike_probe, swing_s, swing_vel_frac)
-                dynamic_threshold_s = max(0.0, est_strike_s + max(0.0, pre_swing_settle_s) + contact_margin_s)
+            if flick_q6_deg > 0.0:
+                # Flick commit: estimate settle-to-wu + q6 flick time
+                settle_est_s = _move_s_estimate(q_cur, last_wu_q, 0.02, swing_vel_frac)
+                q_flick_probe = last_wu_q.copy()
+                q_flick_probe[5] += math.radians(flick_q6_deg)
+                flick_est_s = _move_s_estimate(last_wu_q, q_flick_probe, flick_s, flick_vel_frac)
+                est_strike_s = settle_est_s + flick_est_s
+                dynamic_threshold_s = max(0.0, est_strike_s + contact_margin_s)
                 commit_due = (tti <= dynamic_threshold_s) or (tti <= 0.0)
                 dynamic_commit_txt = (
                     f"  dyn_commit≤{dynamic_threshold_s:.3f}s"
-                    f" est_swing={est_strike_s:.3f}s"
+                    f" est_settle={settle_est_s:.3f}s est_flick={flick_est_s:.3f}s"
                 )
+            else:
+                q_probe_seed = last_wu_q
+                q_strike_probe, err_probe, ori_probe = ik_solve(
+                    chain, t_A_strike, q_probe_seed, offset_link7,
+                    R_A_link7_target=R_A_link7_home, w_ori=w_ori,
+                )
+                if (_joints_ok(q_strike_probe)
+                        and _ik_ok(err_probe, ori_probe, ik_tol_m * 3, max_ori_err_deg, R_A_link7_home)):
+                    est_strike_s = _move_s_estimate(q_cur, q_strike_probe, swing_s, swing_vel_frac)
+                    dynamic_threshold_s = max(0.0, est_strike_s + max(0.0, pre_swing_settle_s) + contact_margin_s)
+                    commit_due = (tti <= dynamic_threshold_s) or (tti <= 0.0)
+                    dynamic_commit_txt = (
+                        f"  dyn_commit≤{dynamic_threshold_s:.3f}s"
+                        f" est_swing={est_strike_s:.3f}s"
+                    )
 
         # ----------------------------------------------------------------
         # 6b. TRACKING — solve IK for wind-up, write directly each tick
@@ -1280,7 +1307,6 @@ def run_loop(
                     if debug_joints:
                         print(f"[J7 lock]   q_cur_deg={_fmt_deg_vec(q_cur)}")
                         print(f"[J7 lock]   q_tgt_deg={_fmt_deg_vec(q_wu)}")
-
                 now_goal_t = time.perf_counter()
                 elapsed_goal_s = max(0.0, now_goal_t - last_goal_write_t)
                 step_scale = max(1.0, elapsed_goal_s * rate_hz)
@@ -1520,7 +1546,13 @@ def run_loop(
                 finish_lock(reason + f"; home_ok={home_ok}", status="WARN")
                 time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
                 continue
-            if commit_delta_deg > commit_max_delta_deg:
+            # For flick mode use a tighter windup-proximity gate so the arm is
+            # near q_wu when the flick fires (settle step stays short).
+            effective_delta_max = (
+                flick_wu_delta_deg if (flick_q6_deg > 0.0 and flick_wu_delta_deg > 0.0)
+                else commit_max_delta_deg
+            )
+            if commit_delta_deg > effective_delta_max:
                 if tti < 0.0:
                     # Ball has passed and arm never made it to wind-up — abort.
                     reason = (
@@ -1578,7 +1610,61 @@ def run_loop(
             if q_cur_settled is not None:
                 q_cur = q_cur_settled
 
-            # Wind-up → strike
+            # ---- Wrist flick path ----
+            if flick_q6_deg > 0.0:
+                q_wu_target = last_wu_q if last_wu_q is not None else q_cur
+                # Settle to windup position first
+                settle_to_wu_s = _move_s_with_velocity_floor(q_cur, q_wu_target, 0.02, swing_vel_frac, "settle→wu")
+                tti_elapsed = time.monotonic() - commit_wall_t
+                print(
+                    f"[J7 flick] settle={settle_to_wu_s:.3f}s  flick_q6={flick_q6_deg:+.1f}°  "
+                    f"tti_remaining≈{tti - tti_elapsed:.3f}s"
+                )
+                settle_seg = segment("settle→wu", q_cur, q_wu_target,
+                                     move_s=settle_to_wu_s, hold_s=0.0, publish_hz=200.0)
+                audit_wu_goal_err_deg = settle_seg["goal_err_max_deg"]
+
+                q_wu_settled = get_vec(r, SENSOR_JOINTS, 7)
+                if q_wu_settled is None:
+                    q_wu_settled = q_wu_target
+
+                # Flick: single q6 rotation from windup pose
+                q_flick = q_wu_settled.copy()
+                q_flick[5] += math.radians(flick_q6_deg)
+                flick_s_actual = _move_s_with_velocity_floor(
+                    q_wu_settled, q_flick, flick_s, flick_vel_frac, "flick"
+                )
+                tti_at_flick_start = tti - (time.monotonic() - commit_wall_t)
+                flick_margin_s = tti_at_flick_start - flick_s_actual
+                audit_timing_margin_s = flick_margin_s
+                print(
+                    f"[J7 flick] flick_s={flick_s_actual:.3f}s  "
+                    f"impact_in≈{tti_at_flick_start:.3f}s  margin={flick_margin_s:+.3f}s"
+                )
+                flick_seg = segment("flick", q_wu_settled, q_flick,
+                                    move_s=flick_s_actual, hold_s=0.05, publish_hz=200.0)
+                audit_follow_goal_err_deg = flick_seg["goal_err_max_deg"]
+
+                if flick_seg["goal_err_max_deg"] > 5.0:
+                    reason = f"flick did not track (goal_err={flick_seg['goal_err_max_deg']:.1f}°)"
+                    print(f"[J7] *** {reason} — recovering home ***")
+                    home_ok = recover_home_blocking("flick-failed→home", idle_after=True)
+                    audit_home_ok = home_ok
+                    finish_lock(reason + f"; home_ok={home_ok}", status="WARN")
+                    if max_swings > 0 and locked_throw_id >= max_swings:
+                        print(f"[J7] --max-swings={max_swings} reached; exiting")
+                        break
+                    continue
+
+                home_ok = recover_home_blocking("post-flick→home", idle_after=True)
+                audit_home_ok = home_ok
+                finish_lock(f"flick completed; home_ok={home_ok}", status="OK" if home_ok else "WARN")
+                if max_swings > 0 and locked_throw_id >= max_swings:
+                    print(f"[J7] --max-swings={max_swings} reached after throw {locked_throw_id}; exiting")
+                    break
+                continue
+
+            # ---- Standard swing path ----
             wu_strike_s = _move_s_with_velocity_floor(q_cur, q_strike, swing_s, swing_vel_frac, "wu→strike")
             tti_at_swing_start = tti - (time.monotonic() - commit_wall_t)
             arrival_margin_s = tti_at_swing_start - wu_strike_s
@@ -1590,7 +1676,7 @@ def run_loop(
                 f"({'ON_TIME' if arrival_margin_s >= -0.03 else 'LATE'})"
             )
             seg = segment("wu→strike", q_cur, q_strike,
-                          move_s=wu_strike_s, hold_s=0.10, publish_hz=200.0)
+                          move_s=wu_strike_s, hold_s=wu_hold_s, publish_hz=200.0)
             audit_wu_goal_err_deg = seg["goal_err_max_deg"]
 
             if seg["goal_err_max_deg"] > 5.0:
@@ -1635,6 +1721,9 @@ def run_loop(
             home_ok = recover_home_blocking("post-swing→home", idle_after=True)
             audit_home_ok = home_ok
             finish_lock(f"swing sequence completed; home_ok={home_ok}", status="OK" if home_ok else "WARN")
+            if max_swings > 0 and locked_throw_id >= max_swings:
+                print(f"[J7] --max-swings={max_swings} reached after throw {locked_throw_id}; exiting")
+                break
 
         time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
 
@@ -1824,6 +1913,27 @@ def main() -> None:
                     help="Position-change threshold used to detect frozen Redis ball keys.")
     ap.add_argument("--tracker-stale-timeout-s", type=float, default=None,
                     help="How long an unchanged Redis ball key may be sampled before reset/reject.")
+    ap.add_argument("--wu-hold-s", type=float, default=0.10,
+                    help="Hold at the strike pose before starting follow-through (s). "
+                         "Default 0.10 matches original behavior; use 0 for arm-moving-at-contact.")
+    ap.add_argument("--max-swings", type=int, default=0,
+                    help="Exit cleanly after N successful swings (0 = unlimited). "
+                         "Use 1 for single-throw replay tests.")
+    ap.add_argument("--flick-q6-deg", type=float, default=0.0,
+                    help="Wrist-flick mode: after tracking to windup, snap q6 by this many "
+                         "degrees instead of the multi-joint swing. 0 = disabled (use normal swing). "
+                         "Try 25–35° for a strong flick. Requires picklebot_j7.xml for higher q6 vel limit.")
+    ap.add_argument("--flick-s", type=float, default=0.25,
+                    help="Requested move time for the q6 flick (s). Will be stretched to "
+                         "respect the q6 velocity limit. With picklebot_j7.xml q6 limit of "
+                         "2.5 rad/s, a 30° flick needs ~0.21s minimum.")
+    ap.add_argument("--flick-vel-frac", type=float, default=1.0,
+                    help="Velocity cap fraction for the flick segment (applied to q6 XML limit). "
+                         "1.0 = use full q6 velocity limit for maximum flick speed.")
+    ap.add_argument("--flick-wu-delta-deg", type=float, default=8.0,
+                    help="Flick mode only: commit only when q_cur→q_strike delta is below this "
+                         "(degrees). Tighter than commit_max_delta_deg so arm is near q_wu before "
+                         "the flick fires and settle stays short. Default 8°.")
 
     args = ap.parse_args()
 
@@ -2011,6 +2121,12 @@ def main() -> None:
             lock_first_safe_prediction=args.lock_prediction,
             lock_release_after_impact_s=args.lock_release_after_impact_s,
             post_impact_idle_s=args.post_impact_idle_s,
+            wu_hold_s=args.wu_hold_s,
+            max_swings=args.max_swings,
+            flick_q6_deg=args.flick_q6_deg,
+            flick_s=args.flick_s,
+            flick_vel_frac=args.flick_vel_frac,
+            flick_wu_delta_deg=args.flick_wu_delta_deg,
         )
     except KeyboardInterrupt:
         if args.shutdown_hold_s > 0.0:

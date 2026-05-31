@@ -482,6 +482,36 @@ redis-cli get opensai::controllers::FrankaRobot::cartesian_controller::cartesian
 
 ---
 
+## J7 — Production strike planner (`arm_control/stepj7_strike_planner.py`)
+
+**Status (2026-05-31):** Replay tests passing (outcome=OK). Hit quality soft — wrist flick not yet hardware tested.
+
+**Quick-start (see CLAUDE.md at repo root for full command):**
+```bash
+# Load controller:
+cd ~/OpenSai && ./scripts/launch.sh config_folder/xml_config_files/picklebot.xml
+# Standard swing (soft hits, confirmed timing works):
+python sports_bot/arm_control/stepj7_strike_planner.py --skip-cal --offset-link7 0 0 0.39 \
+  --ball-rigid-body-id 31 --strike-plane-x 0.45 --wu-hold-s 0.10 --max-swings 1 \
+  [... see CLAUDE.md for full flag list]
+# Wrist flick (hard hits, needs picklebot_j7.xml):
+  add --flick-q6-deg 30 --flick-s 0.25 --flick-vel-frac 1.0 --flick-wu-delta-deg 8
+```
+
+**Architecture:**
+- Redis ball position → LS predictor → lock first safe prediction → track arm to q_wu → commit swing at TTI threshold → smoothstep wu→strike→follow
+- Orientation locked to Q_HOME_RAD throughout (fixed paddle face direction)
+- Ball rigid body ID for J7 sessions: **31** (`--ball-rigid-body-id 31`)
+
+**Why forward swing is soft:** 2.4 cm wind-up offset = ~3° joint rotation → paddle tip ~0.09 m/s. Wrist flick (30° q6, picklebot_j7.xml) → ~1 m/s. Flick is the priority.
+
+**Do not re-introduce:**
+- `just_locked` 1-tick delay after lock — causes late commit → arm can't track → goal_err fail
+- `wu_hold_s=0` — no PD settling time → 5.7° goal_err fails 5° threshold
+- High kp/kv on q1-q4 in any XML — buzzes with TCP
+
+---
+
 ## Change log
 
 - **2026-05-31** (live ball testing) — End-to-end arm intercept tested with live throws. 7 swings at 150°/s tracking, 45% vel cap, full follow-through, no Franka safety faults. `tau_sensed_peak q2` reached 25 Nm max (threshold ~68 Nm). Arm reaches tracker-predicted contact point to within roughly 3–5 cm at the sweet spot — adequate for paddle contact if the prediction is accurate. The arm appears to be the less limiting factor at this stage; ball tracker prediction quality (particularly Z noise and high-ball outliers) is responsible for most misses. Outlier rejection in the tracker pipeline is likely the highest-value improvement. `--z-mode fixed-arm(0.45)` used throughout; `--z-mode predicted` not yet evaluated with live balls. `post_impact_idle_s=1.5s` added to prevent re-lock on stationary ball after impact.
