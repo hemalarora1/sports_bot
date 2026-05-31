@@ -326,6 +326,15 @@ def switch_ctrl(r: redis.Redis, name: str, timeout: float = 2.0) -> bool:
         time.sleep(0.02)
 
 
+def _hold_joint_controller(r: redis.Redis) -> None:
+    """Re-assert joint_controller if OpenSai reverted to cartesian (goals then ignored)."""
+    got = r.get(ACTIVE_CONTROLLER)
+    if isinstance(got, bytes):
+        got = got.decode()
+    if got != JOINT_CTRL:
+        switch_ctrl(r, JOINT_CTRL)
+
+
 # ---------------------------------------------------------------------------
 # Startup: calibrate offset_link7
 # ---------------------------------------------------------------------------
@@ -548,6 +557,8 @@ def run_loop(
     mock_tti: float = 0.50,
     mock_cycle_s: float = 0.0,
     mock_identity_base: bool = False,
+    direct_tracking: bool = False,
+    verbose_tracking: bool = False,
 ) -> None:
     dt = 1.0 / rate_hz
     state = State.IDLE
@@ -592,10 +603,15 @@ def run_loop(
         print(f"[J6] MOCK intercept(s) world (m): {pts}")
         print(f"[J6]   mock_tti={mock_tti:.3f}s  cycle={mock_cycle_s:.1f}s  "
               f"identity_base={mock_identity_base}")
+        if not mock_identity_base:
+            print("[J6]   mock needs cart rigid body in Redis (or pass --mock-identity-base)")
+    if direct_tracking:
+        print("[J6] --direct-tracking: writing full IK goal each tick (no rate limit)")
     print()
 
     while True:
         t0 = time.perf_counter()
+        _hold_joint_controller(r)
 
         # ----------------------------------------------------------------
         # 1. Ball tracking (or mock intercept)
@@ -702,8 +718,14 @@ def run_loop(
             if (_ik_ok(err_wu, ori_wu, ik_tol_m, max_ori_err_deg, R_A_link7_home)
                     and _joints_ok(q_wu)
                     and _delta_ok(q_wu, q_cur, tick_max_delta_deg)):
-                q_cmd = _rate_limited_goal(q_wu, q_cur, tracking_step_deg)
+                q_cmd = q_wu if direct_tracking else _rate_limited_goal(
+                    q_wu, q_cur, tracking_step_deg,
+                )
                 set_vec(r, GOAL_JOINTS, q_cmd)
+                if verbose_tracking and t0 - last_print_t >= print_interval_s:
+                    step_deg = float(np.max(np.abs(np.degrees(q_cmd - q_cur))))
+                    active = r.get(ACTIVE_CONTROLLER)
+                    print(f"[J6] goal_step max={step_deg:.2f}°  active={active!r}")
                 last_wu_q = q_wu
                 last_track_target_A = t_A_windup.copy()
                 state = State.TRACKING
@@ -720,7 +742,9 @@ def run_loop(
                 if (_ik_ok(err_wu, ori_wu, ik_tol_m, max_ori_err_deg, R_A_link7_home)
                         and _joints_ok(q_wu)
                         and _delta_ok(q_wu, q_cur, acquire_max_delta_deg)):
-                    q_cmd = _rate_limited_goal(q_wu, q_cur, tracking_step_deg)
+                    q_cmd = q_wu if direct_tracking else _rate_limited_goal(
+                        q_wu, q_cur, tracking_step_deg,
+                    )
                     set_vec(r, GOAL_JOINTS, q_cmd)
                     last_wu_q = q_wu
                     last_track_target_A = t_A_windup.copy()
@@ -919,6 +943,11 @@ def main() -> None:
                     help="Reject IK solutions whose sweet-spot error exceeds this (mm).")
     ap.add_argument("--tracking-step-deg", type=float, default=J6_TRACKING_STEP_DEG,
                     help="Max per-tick joint-goal step during non-blocking tracking.")
+    ap.add_argument("--direct-tracking", action="store_true",
+                    help="Write full IK wind-up goal each tick (no rate limit). "
+                         "Use for mock/bring-up when 0.25°/tick looks like no motion.")
+    ap.add_argument("--verbose-tracking", action="store_true",
+                    help="Print goal_step deg and active_controller ~5 Hz while tracking.")
     ap.add_argument("--swing-vel-frac", type=float, default=J6_SWING_VEL_FRAC,
                     help="Max blocking-swing peak velocity as a fraction of XML velocity limits.")
     ap.add_argument("--z-mode", choices=["fixed-arm", "predicted"], default="fixed-arm",
@@ -1091,6 +1120,8 @@ def main() -> None:
             mock_tti=args.mock_tti,
             mock_cycle_s=args.mock_cycle_s,
             mock_identity_base=args.mock_identity_base,
+            direct_tracking=args.direct_tracking,
+            verbose_tracking=args.verbose_tracking,
         )
     except KeyboardInterrupt:
         print("\n[J6] stopped — leaving last joint goal in Redis.")
