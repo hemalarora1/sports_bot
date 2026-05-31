@@ -59,7 +59,8 @@ Prereqs
 
 Run from OpenSai root:
   python sports_bot/arm_control/stepj6_reactive_intercept.py --skip-cal --no-commit
-  python sports_bot/arm_control/stepj6_reactive_intercept.py
+  python sports_bot/arm_control/stepj6_reactive_intercept.py --skip-cal --gentle-swing
+  python sports_bot/arm_control/stepj6_reactive_intercept.py --skip-cal --gentle-swing --mini-swing
   python sports_bot/arm_control/stepj6_reactive_intercept.py --no-commit
   python sports_bot/arm_control/stepj6_reactive_intercept.py --print-cal-only
   python sports_bot/arm_control/stepj6_reactive_intercept.py --swing-s 0.5
@@ -161,6 +162,12 @@ J6_WORLD_Z_MAX_M = 1.40
 J6_TARGET_JUMP_MAX_M = 0.08   # max tracking-target jump accepted per tick
 J6_TRACKING_STEP_DEG = 0.25    # max commanded joint-goal step per 100 Hz tick
 J6_SWING_VEL_FRAC = 0.45      # cap blocking swing peak qdot to this fraction of XML limits
+# --gentle-swing preset (slow poke, keeps orientation; pair with --mini-swing)
+J6_GENTLE_SWING_S = 0.55
+J6_GENTLE_SWING_VEL_FRAC = 0.25
+J6_GENTLE_FOLLOW_OFFSET_M = 0.05
+J6_GENTLE_COMMIT_TTI_S = 0.50
+J6_GENTLE_RETURN_S = 2.5
 J6_HOME_VEL_FRAC = 0.85       # startup / return-home velocity cap fraction
 J6_HOME_SETTLE_TOL_DEG = 5.0  # accept settled joints as home if within this of nominal
 J6_FIXED_ARM_Z_M = 0.45       # J6 bringup: trust lateral prediction, hold Z steady
@@ -559,6 +566,7 @@ def run_loop(
     mock_identity_base: bool = False,
     direct_tracking: bool = False,
     verbose_tracking: bool = False,
+    mini_swing: bool = False,
 ) -> None:
     dt = 1.0 / rate_hz
     state = State.IDLE
@@ -590,6 +598,8 @@ def run_loop(
           f"z_mode={z_mode}" + (f"({fixed_arm_z_m:.2f}m A)" if z_mode == "fixed-arm" else ""))
     if no_commit:
         print("[J6] --no-commit: tracking only, swing disabled")
+    elif mini_swing:
+        print("[J6] --mini-swing: wu→strike→home (no follow-through segment)")
     if R_A_link7_home is not None:
         face_A = R_A_link7_home @ (offset_link7 / max(np.linalg.norm(offset_link7), 1e-9))
         print("[J6] fixed paddle orientation: link7 rotation locked to home")
@@ -771,13 +781,13 @@ def run_loop(
                 time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
                 continue
 
-            if wu_clipped or st_clipped or fw_clipped:
+            if wu_clipped or st_clipped or (fw_clipped and not mini_swing):
                 clips = []
                 if wu_clipped:
                     clips.append("windup")
                 if st_clipped:
                     clips.append("strike")
-                if fw_clipped:
+                if fw_clipped and not mini_swing:
                     clips.append("follow")
                 print(f"[J6] COMMIT rejected: clipped target(s) {','.join(clips)}")
                 set_vec(r, GOAL_JOINTS, q_home_rad)
@@ -793,10 +803,13 @@ def run_loop(
                 chain, t_A_strike, q_seed, offset_link7,
                 R_A_link7_target=R_A_link7_home, w_ori=w_ori,
             )
-            q_follow, err_fw, ori_fw = ik_solve(
-                chain, t_A_follow, q_strike, offset_link7,
-                R_A_link7_target=R_A_link7_home, w_ori=w_ori,
-            )
+            if mini_swing:
+                q_follow, err_fw, ori_fw = q_strike, 0.0, 0.0
+            else:
+                q_follow, err_fw, ori_fw = ik_solve(
+                    chain, t_A_follow, q_strike, offset_link7,
+                    R_A_link7_target=R_A_link7_home, w_ori=w_ori,
+                )
             commit_delta_deg = float(np.degrees(np.abs(q_strike - q_cur)).max())
 
             if (not _joints_ok(q_strike)
@@ -820,8 +833,9 @@ def run_loop(
             print(f"[J6] COMMIT  tti={tti:.3f}s")
             print(f"[J6]   strike_A=[{t_A_strike[0]:+.3f},{t_A_strike[1]:+.3f},{t_A_strike[2]:+.3f}]  "
                   f"err={err_st*1000:.1f} mm  ori={ori_st:.1f}°")
-            print(f"[J6]   follow_A=[{t_A_follow[0]:+.3f},{t_A_follow[1]:+.3f},{t_A_follow[2]:+.3f}]  "
-                  f"err={err_fw*1000:.1f} mm  ori={ori_fw:.1f}°")
+            if not mini_swing:
+                print(f"[J6]   follow_A=[{t_A_follow[0]:+.3f},{t_A_follow[1]:+.3f},{t_A_follow[2]:+.3f}]  "
+                      f"err={err_fw*1000:.1f} mm  ori={ori_fw:.1f}°")
             print(f"[J6]   q_cur  → q_strike max Δ={commit_delta_deg:.1f}°")
             print(f"{'='*60}\n")
 
@@ -858,15 +872,25 @@ def run_loop(
                 set_vec(r, GOAL_JOINTS, q_home_rad)
                 continue
 
-            # Strike → follow-through
-            strike_follow_s = _move_s_with_velocity_floor(q_strike, q_follow, swing_s, swing_vel_frac, "strike→follow")
-            run_segment(r, "strike→follow", q_strike, q_follow,
-                        move_s=strike_follow_s, hold_s=0.30, publish_hz=200.0)
+            # Strike → follow-through (optional) → home
+            if mini_swing:
+                strike_home_s = _move_s_with_velocity_floor(
+                    q_strike, q_home_rad, return_s, swing_vel_frac, "strike→home",
+                )
+                run_segment(r, "strike→home", q_strike, q_home_rad,
+                            move_s=strike_home_s, hold_s=1.0, publish_hz=100.0)
+            else:
+                strike_follow_s = _move_s_with_velocity_floor(
+                    q_strike, q_follow, swing_s, swing_vel_frac, "strike→follow",
+                )
+                run_segment(r, "strike→follow", q_strike, q_follow,
+                            move_s=strike_follow_s, hold_s=0.30, publish_hz=200.0)
 
-            # Follow → home
-            follow_home_s = _move_s_with_velocity_floor(q_follow, q_home_rad, return_s, swing_vel_frac, "follow→home")
-            run_segment(r, "follow→home", q_follow, q_home_rad,
-                        move_s=follow_home_s, hold_s=1.0, publish_hz=100.0)
+                follow_home_s = _move_s_with_velocity_floor(
+                    q_follow, q_home_rad, return_s, swing_vel_frac, "follow→home",
+                )
+                run_segment(r, "follow→home", q_follow, q_home_rad,
+                            move_s=follow_home_s, hold_s=1.0, publish_hz=100.0)
 
             state = State.IDLE
             last_wu_q = None
@@ -911,6 +935,12 @@ def main() -> None:
     # Timing
     ap.add_argument("--swing-s", type=float, default=0.30,
                     help="Move time for wu→strike and strike→follow (s).")
+    ap.add_argument("--gentle-swing", action="store_true",
+                    help="Soft first swing: slower timing, 25%% vel cap, shorter "
+                         "follow. Does not disable --no-commit.")
+    ap.add_argument("--mini-swing", action="store_true",
+                    help="Small swing only: wu→strike→home (skip follow-through). "
+                         "Best when tracking already holds the wind-up pose.")
     ap.add_argument("--commit-tti", type=float, default=None,
                     help="TTI threshold to commit to swing (s). "
                          "Default: swing_s + 0.05.")
@@ -994,6 +1024,17 @@ def main() -> None:
     ap.add_argument("--max-lookahead", type=float, default=None)
 
     args = ap.parse_args()
+
+    if args.gentle_swing:
+        args.swing_s = J6_GENTLE_SWING_S
+        args.swing_vel_frac = J6_GENTLE_SWING_VEL_FRAC
+        args.follow_offset = J6_GENTLE_FOLLOW_OFFSET_M
+        args.return_s = J6_GENTLE_RETURN_S
+        if args.commit_tti is None:
+            args.commit_tti = J6_GENTLE_COMMIT_TTI_S
+        print("[J6] --gentle-swing: "
+              f"swing_s={args.swing_s:.2f}s  vel={args.swing_vel_frac:.0%}  "
+              f"follow={args.follow_offset:.2f}m  commit_tti={args.commit_tti:.2f}s")
 
     commit_tti = args.commit_tti if args.commit_tti is not None else args.swing_s + 0.05
     if commit_tti <= 0:
@@ -1125,6 +1166,7 @@ def main() -> None:
             mock_identity_base=args.mock_identity_base,
             direct_tracking=args.direct_tracking,
             verbose_tracking=args.verbose_tracking,
+            mini_swing=args.mini_swing,
         )
     except KeyboardInterrupt:
         print("\n[J6] stopped — leaving last joint goal in Redis.")
