@@ -22,7 +22,7 @@ IDLE  →  TRACKING  →  [blocking swing]  →  IDLE
     - run_segment(q_strike → q_follow, swing_s)    ~0.3 s
     - run_segment(q_follow → q_home, return_s)     ~2.0 s
 
-IK sweet-spot formulation
+IK sweet-spot formulationgit 
 --------------------------
   Standard ikpy FK gives link7 tip.  The paddle sweet spot is 35 cm along
   EE +Z from the flange — a fixed offset *in link7 frame* (calibrated once
@@ -568,6 +568,7 @@ def run_loop(
     print_interval_s = 0.20
     last_wu_q: np.ndarray | None = None  # last valid wind-up IK solution
     last_track_target_A: np.ndarray | None = None
+    last_q_cmd: np.ndarray | None = None
     mock_t0 = time.monotonic()
     using_mock = mock_intercepts is not None and len(mock_intercepts) > 0
 
@@ -681,19 +682,6 @@ def run_loop(
         t_A_follow, fw_clipped  = _safe_target(
             t_A_strike + np.array([follow_offset_m, 0.0, 0.0]), reach_m, z_min, z_max)
 
-        # ----------------------------------------------------------------
-        # 5. Diagnostic print
-        # ----------------------------------------------------------------
-        if t0 - last_print_t >= print_interval_s:
-            last_print_t = t0
-            clip_tag = " [wu CLIP]" if wu_clipped else ""
-            print(
-                f"[J6] {state.name:8s}  tti={tti:+.3f}s  "
-                f"strike_W=[{t_W_strike[0]:+.3f},{t_W_strike[1]:+.3f},{t_W_strike[2]:+.3f}]  "
-                f"wu_A=[{t_A_windup[0]:+.3f},{t_A_windup[1]:+.3f},{t_A_windup[2]:+.3f}]"
-                f"{clip_tag}"
-            )
-
         q_cur = get_vec(r, SENSOR_JOINTS, 7)
         if q_cur is None:
             time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
@@ -722,18 +710,33 @@ def run_loop(
                     q_wu, q_cur, tracking_step_deg,
                 )
                 set_vec(r, GOAL_JOINTS, q_cmd)
-                if verbose_tracking and t0 - last_print_t >= print_interval_s:
-                    step_deg = float(np.max(np.abs(np.degrees(q_cmd - q_cur))))
-                    active = r.get(ACTIVE_CONTROLLER)
-                    print(f"[J6] goal_step max={step_deg:.2f}°  active={active!r}")
+                last_q_cmd = q_cmd.copy()
                 last_wu_q = q_wu
                 last_track_target_A = t_A_windup.copy()
                 state = State.TRACKING
 
         # ----------------------------------------------------------------
+        # 5. Diagnostic print (after IK so goal_err reflects this tick)
+        # ----------------------------------------------------------------
+        if t0 - last_print_t >= print_interval_s:
+            last_print_t = t0
+            clip_tag = " [wu CLIP]" if wu_clipped else ""
+            extra = ""
+            if verbose_tracking and last_q_cmd is not None:
+                goal_err_deg = float(np.max(np.abs(np.degrees(last_q_cmd - q_cur))))
+                active = r.get(ACTIVE_CONTROLLER)
+                extra = f"  goal_err={goal_err_deg:.1f}°  active={active!r}"
+            print(
+                f"[J6] {state.name:8s}  tti={tti:+.3f}s  "
+                f"strike_W=[{t_W_strike[0]:+.3f},{t_W_strike[1]:+.3f},{t_W_strike[2]:+.3f}]  "
+                f"wu_A=[{t_A_windup[0]:+.3f},{t_A_windup[1]:+.3f},{t_A_windup[2]:+.3f}]"
+                f"{clip_tag}{extra}"
+            )
+
+        # ----------------------------------------------------------------
         # 6b. COMMIT — blocking swing sequence
         # ----------------------------------------------------------------
-        else:
+        if not (tti > commit_tti or no_commit):
             if state != State.TRACKING or last_wu_q is None:
                 q_wu, err_wu, ori_wu = ik_solve(
                     chain, t_A_windup, q_cur, offset_link7,
