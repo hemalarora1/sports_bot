@@ -826,6 +826,7 @@ def run_loop(
     through_q6_deg: float,
     follow_s: float,
     commit_tti: float,
+    launch_margin_s: float,
     contact_margin_s: float,
     timing_guard_s: float,
     return_s: float,
@@ -983,7 +984,8 @@ def run_loop(
     print(f"[J8] running at {rate_hz:.0f} Hz  -- through-strike mode")
     print(
         f"[J8] strike_plane_x={strike_plane_x_world:+.3f}m commit_tti={commit_tti:.3f}s "
-        f"guard={timing_guard_s:.3f}s contact_margin={contact_margin_s:+.3f}s"
+        f"launch_margin={launch_margin_s:.3f}s guard={timing_guard_s:.3f}s "
+        f"contact_margin={contact_margin_s:+.3f}s"
     )
     print(
         f"[J8] pre={pre_offset_m*100:.1f}cm follow=+{follow_offset_m*100:.1f}cm/"
@@ -1241,9 +1243,10 @@ def run_loop(
 
         if loop_t - last_print_t >= max(0.05, log_period_s):
             last_print_t = loop_t
+            launch_ready = feasible and aged_tti <= commit_tti and cand_use.budget_margin_s <= launch_margin_s
             state = "SOFT" if aged_tti <= commit_tti else "PREVIEW"
             if feasible and aged_tti <= commit_tti:
-                state = "READY"
+                state = "LAUNCH" if launch_ready else "AIMING"
             print(
                 f"[J8] {state:7s} tti={aged_tti:+.3f}s strike_W={_fmt_v3(cand_use.strike_W)} "
                 f"strike_A={_fmt_v3(cand_use.strike_A)} Tmin={cand_use.min_strike_s:.3f}s "
@@ -1269,13 +1272,15 @@ def run_loop(
                     f"rejects={_fmt_counts(reject_counts)}{qdot_txt}"
                 )
 
+        launch_ready = feasible and aged_tti <= commit_tti and cand_use.budget_margin_s <= launch_margin_s
         late_try = (
             simple_fast
+            and not feasible
             and aged_tti <= commit_tti
             and strike_time_now > 0.045
             and cand_use.budget_margin_s >= -try_late_slack_s
         )
-        commit_now = (not no_commit) and aged_tti <= commit_tti and (feasible or late_try)
+        commit_now = (not no_commit) and (launch_ready or late_try)
         if commit_now:
             if late_try and not feasible:
                 cand_use.strike_time_s = max(0.08, cand_use.min_strike_s)
@@ -1383,6 +1388,8 @@ def main() -> None:
     ap.add_argument("--paddle-open-deg", type=float, default=6.0)
 
     ap.add_argument("--commit-tti", type=float, default=0.62)
+    ap.add_argument("--launch-margin-s", type=float, default=0.060,
+                    help="Retarget until budget_margin_s <= this value, then hard-commit. Smaller waits longer for better ball predictions.")
     ap.add_argument("--contact-margin-s", type=float, default=0.0)
     ap.add_argument("--timing-guard-s", type=float, default=0.045)
     ap.add_argument("--swing-vel-frac", type=float, default=0.85)
@@ -1639,6 +1646,7 @@ def main() -> None:
             through_q6_deg=args.through_q6_deg,
             follow_s=args.follow_s,
             commit_tti=args.commit_tti,
+            launch_margin_s=args.launch_margin_s,
             contact_margin_s=args.contact_margin_s,
             timing_guard_s=args.timing_guard_s,
             return_s=args.return_s,
