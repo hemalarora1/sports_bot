@@ -78,12 +78,32 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import json
 import math
 import os
 import sys
 import time
 import warnings
 from enum import Enum, auto
+
+
+class _Tee:
+    """Write to both the original stdout and a log file simultaneously."""
+    def __init__(self, log_path: str) -> None:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        self._file = open(log_path, "a", buffering=1)
+        self._stdout = sys.stdout
+    def write(self, data: str) -> int:
+        self._stdout.write(data)
+        self._file.write(data)
+        return len(data)
+    def flush(self) -> None:
+        self._stdout.flush()
+        self._file.flush()
+    def fileno(self) -> int:
+        return self._stdout.fileno()
+    def close(self) -> None:
+        self._file.close()
 
 import numpy as np
 import redis
@@ -151,14 +171,16 @@ Q_HI = np.radians([ 166,  101,  166,   -4,  166, 215,  166])
 # z_max = 0.80 m: well within comfortable range, avoids arm fully extended up.
 # Home / ready pose — free-driven to a forward-reach position, paddle face
 # toward opponent, elbow up, comfortable for mid-height volleys (2026-05-28).
-# Arm extends forward-left, paddle at roughly shoulder height.
-# Pre-positioned near q_wu for typical shots (world z≈0.75–0.97m, arm-frame z≈0.30–0.36m).
-# Derived 2026-05-31 as centroid of 5 locked wu_A IK solutions from tonight's recordings.
-# Reduces tracking distance from ~16-20° to ~2-5° for most balls.
-# Old home: [-3.5°, -39.5°, -0.5°, -118.5°, +0.4°, +85.2°, -45.5°]
+# Old reliable home — arm extends forward, paddle at mid-height.
+# Higher than the 2026-05-31 centroid home; better coverage for tonight's
+# typical throws (z_arm 0.40–0.60m) without the rightward bias.
+# Centroid home (kept for reference):
+#   [+2.1°, -55.4°, +15.8°, -134.6°, +11.9°, +86.6°, -28.4°]
+#   (too low: z_arm≈0.35m, biased right, misses most of tonight's balls)
 Q_HOME_RAD = np.array([
-    0.0374488, -0.9673054, 0.2752411, -2.3494738, 0.2078330, 1.5117640, -0.4948271,
+    -0.06108652, -0.68940505, -0.00872665, -2.06821516, 0.00698132, 1.48702052, -0.79412481,
 ])
+# Degrees: q1=-3.5  q2=-39.5  q3=-0.5  q4=-118.5  q5=+0.4  q6=+85.2  q7=-45.5
 
 J6_REACH_M       = 0.78   # Franka HW ~0.85 m; 0.78 keeps ~7 cm margin vs 0.60 bring-up default
 J6_Z_MIN_M       = 0.15
@@ -790,6 +812,7 @@ def run_loop(
     quiet_after_settle_s: float = 0.0,
     quiet_settle_deadband_deg: float = 1.0,
     lock_first_safe_prediction: bool = True,
+    lock_tti_max: float = 0.0,
     lock_release_after_impact_s: float = J6_LOCK_RELEASE_AFTER_IMPACT_S,
     post_impact_idle_s: float = 1.5,
     wu_hold_s: float = 0.10,
@@ -1108,7 +1131,7 @@ def run_loop(
                 print(f"[J7] ball lost {since_good:.2f}s (reason={reason}) → home")
                 recover_home_blocking("lost-ball→home", idle_after=False)
             elif state == State.IDLE:
-                if _home_error_deg(r, q_home_rad) > 2.0:
+                if _home_error_deg(r, q_home_rad) > 4.0:
                     if time.monotonic() >= home_retry_after_t:
                         recover_home_blocking("idle→home", idle_after=False)
                     else:
@@ -1148,6 +1171,11 @@ def run_loop(
             time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
             continue
 
+        # pre_positioning: prediction is geometrically valid but TTI is still too large
+        # to trust the extrapolation. Arm tracks toward the predicted wu to pre-position
+        # (closes most of the joint gap early), but does NOT lock — lock fires once
+        # TTI drops to lock_tti_max and the LS fit has converged on a stable intercept.
+        _pre_positioning = False
         if lock_first_safe_prediction and locked_intercept is None:
             lock_reject_reason = None
             if not (world_z_min_m <= t_W_strike[2] <= world_z_max_m):
@@ -1168,6 +1196,13 @@ def run_loop(
                 print_lock_wait(lock_reject_reason)
                 time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
                 continue
+            # Prediction passes geometric checks. If TTI is still above lock_tti_max,
+            # pre-position toward the predicted wu without committing to a lock.
+            if lock_tti_max > 0.0 and tti > lock_tti_max:
+                _pre_positioning = True
+                print_lock_wait(
+                    f"pre-positioning tti={tti:.3f}s > lock_tti_max={lock_tti_max:.3f}s"
+                )
 
         # ----------------------------------------------------------------
         # 6a. Dynamic commit decision — J7 commits when the estimated strike
@@ -1258,13 +1293,35 @@ def run_loop(
                 delta_label = "ik_jump"
             delta_good = _delta_ok(q_wu, delta_ref, tick_max_delta_deg)
             if ik_good and joints_good and delta_good:
-                if lock_first_safe_prediction and locked_intercept is None:
+                if lock_first_safe_prediction and locked_intercept is None and not _pre_positioning:
                     if time.monotonic() < idle_until_t:
                         print_lock_wait(
                             f"post-impact idle ({idle_until_t - time.monotonic():.1f}s remaining)"
                         )
                         time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
                         continue
+                    # Reachability pre-screen: reject locks where the arm physically
+                    # can't reach wu and complete the flick before the ball arrives.
+                    # This keeps the arm at home and ready for the next throw instead
+                    # of chasing an impossible target for 0.5s then aborting.
+                    if flick_q6_deg > 0.0:
+                        _settle_est = _move_s_estimate(q_cur, q_wu, 0.02, swing_vel_frac)
+                        _q_fp = q_wu.copy()
+                        _q_fp[5] += math.radians(flick_q6_deg)
+                        _flick_est = _move_s_estimate(q_wu, _q_fp, flick_s, flick_vel_frac)
+                        _total_needed = _settle_est + _flick_est + contact_margin_s
+                        # Reject only if settle ALONE exceeds full TTI — clearly impossible.
+                        # Borderline cases (total > tti but settle < tti) are allowed through;
+                        # the dynamic commit and proximity gate handle the tight timing.
+                        if _settle_est > tti:
+                            _d_deg, _d_j = _max_abs_deg_with_joint(q_wu - q_cur)
+                            print_lock_wait(
+                                f"unreachable: settle={_settle_est:.3f}s > tti={tti:.3f}s  "
+                                f"(+flick={_flick_est:.3f}s total={_total_needed:.3f}s)  "
+                                f"Δ={_d_deg:.1f}°@q{_d_j}"
+                            )
+                            time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
+                            continue
                     locked_throw_id += 1
                     locked_intercept = Intercept(
                         position=t_W_strike.copy(),
@@ -1368,7 +1425,11 @@ def run_loop(
                 last_q_cmd = q_cmd.copy()
                 last_wu_q = q_wu
                 last_track_target_A = t_A_windup.copy()
-                state = State.TRACKING
+                # Stay in IDLE during pre-positioning (unlocked tracking) so the
+                # 60° acquire gate applies — early predictions can shift significantly
+                # in z as more samples arrive. Only transition to TRACKING on lock.
+                if locked_intercept is not None:
+                    state = State.TRACKING
             else:
                 reasons = []
                 if not ik_good:
@@ -1839,6 +1900,10 @@ def main() -> None:
                     help="Print full run_segment tables. Default J7 output is compact for easy pasteback.")
     ap.add_argument("--log-period-s", type=float, default=0.50,
                     help="Seconds between tracking diagnostic prints.")
+    ap.add_argument("--log-file", type=str, default=None, metavar="PATH",
+                    help="Append all stdout to PATH in addition to the terminal. "
+                         "Use 'auto' to create sports_bot/logs/j7_YYYYMMDD_HHMMSS.log "
+                         "automatically.")
     ap.add_argument("--debug-joints", action="store_true",
                     help="Also print q_cur/q_goal/q_target joint vectors in degrees.")
     ap.add_argument("--quiet-after-settle-s", type=float, default=0.0,
@@ -1852,6 +1917,11 @@ def main() -> None:
     ap.add_argument("--no-lock-prediction", dest="lock_prediction", action="store_false",
                     help="Chase each new ball prediction instead of freezing the first safe one.")
     ap.set_defaults(lock_prediction=True)
+    ap.add_argument("--lock-tti-max", type=float, default=0.0,
+                    help="Only lock a prediction when TTI ≤ this value (seconds). "
+                         "0 = lock as soon as a valid prediction exists (default). "
+                         "Set to e.g. 0.65 to wait for a mature, accurate prediction "
+                         "before freezing — early extrapolations are noisy.")
     ap.add_argument("--lock-release-after-impact-s", type=float,
                     default=J6_LOCK_RELEASE_AFTER_IMPACT_S,
                     help="When prediction locking is enabled, release a locked throw this long after impact.")
@@ -1937,6 +2007,15 @@ def main() -> None:
 
     args = ap.parse_args()
 
+    if args.log_file is not None:
+        log_path = args.log_file
+        if log_path == "auto":
+            log_dir = os.path.join(_THIS_DIR, "..", "logs")
+            log_path = os.path.join(log_dir, f"j7_{time.strftime('%Y%m%d_%H%M%S')}.log")
+        log_path = os.path.abspath(log_path)
+        sys.stdout = _Tee(log_path)
+        print(f"[J7] logging to {log_path}")
+
     if args.gentle_swing:
         args.swing_s = J6_GENTLE_SWING_S
         args.swing_vel_frac = J6_GENTLE_SWING_VEL_FRAC
@@ -1962,6 +2041,28 @@ def main() -> None:
         r.ping()
     except redis.exceptions.ConnectionError as e:
         sys.exit(f"[J7] cannot reach Redis at {args.redis_host}:{args.redis_port}: {e}")
+
+    # Read actual velocity limits from OpenSai so flick/swing timing matches whichever
+    # XML was loaded (e.g. picklebot_j7.xml has q6=2.5 rad/s vs picklebot.xml q6=1.1 rad/s).
+    global J6_XML_VEL_LIMIT_RAD_S
+    _vel_key = f"{NS}::{JOINT_CTRL}::joint_task::velocity_saturation_limit"
+    _vel_raw = r.get(_vel_key)
+    if _vel_raw is not None:
+        try:
+            _limits = np.array(json.loads(_vel_raw), dtype=float)
+            if len(_limits) == 7:
+                J6_XML_VEL_LIMIT_RAD_S = _limits
+                print(f"[J7] velocity limits from OpenSai: "
+                      f"{np.degrees(J6_XML_VEL_LIMIT_RAD_S).round(1).tolist()} °/s")
+            else:
+                print(f"[J7] WARNING: velocity limits key has {len(_limits)} values (expected 7), "
+                      f"using hardcoded defaults")
+        except Exception:
+            print(f"[J7] WARNING: could not parse velocity limits from Redis, "
+                  f"using hardcoded defaults")
+    else:
+        print(f"[J7] WARNING: velocity limits key not found ({_vel_key}), "
+              f"OpenSai may not be running — using hardcoded defaults")
 
     # ---- Calibration file ----
     cal_path = args.calibration or arm_base_offset_calibration_path()
@@ -2119,6 +2220,7 @@ def main() -> None:
             quiet_after_settle_s=args.quiet_after_settle_s,
             quiet_settle_deadband_deg=args.quiet_settle_deadband_deg,
             lock_first_safe_prediction=args.lock_prediction,
+            lock_tti_max=args.lock_tti_max,
             lock_release_after_impact_s=args.lock_release_after_impact_s,
             post_impact_idle_s=args.post_impact_idle_s,
             wu_hold_s=args.wu_hold_s,
