@@ -23,6 +23,7 @@ import math
 import os
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -876,8 +877,17 @@ def run_loop(
     ready_arm_A: np.ndarray | None,
     trace: _TraceLogger | None,
     ball_key: str | None,
+    loop_hook: Callable[[dict], None] | None = None,
 ) -> None:
     dt = 1.0 / max(1.0, rate_hz)
+    hook_state: dict = {}
+
+    def end_tick(**fields) -> None:
+        if loop_hook is not None:
+            hook_state.clear()
+            hook_state.update(fields)
+            loop_hook(hook_state)
+        time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
     using_mock = mock_intercepts is not None and len(mock_intercepts) > 0
     mock_t0 = time.monotonic()
     last_print_t = float("-inf")
@@ -1054,7 +1064,7 @@ def run_loop(
             if T_W_B is None:
                 print_reject(f"cart rigid body {cal.base_rigid_body_id} not visible")
                 tr("cart_missing", tick=tick_i, rigid_body_id=cal.base_rigid_body_id)
-                time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+                end_tick(mode="idle", intercept=None, active_cand=active_cand)
                 continue
             R_W_A, t_W_A = compute_T_W_A_from_base_offset(T_W_B, cal)
 
@@ -1062,13 +1072,13 @@ def run_loop(
         if q_cur is None:
             print_reject("no joint sensor")
             tr("no_joint_sensor", tick=tick_i)
-            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+            end_tick(mode="idle", intercept=intercept, active_cand=active_cand)
             continue
 
         if time.monotonic() < idle_until_t:
             publish_limited_goal(q_home_rad, q_cur, "post_impact_ready")
             tr("post_impact_idle", tick=tick_i, q_cur_deg=np.degrees(q_cur), idle_until_t=idle_until_t)
-            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+            end_tick(mode="post_impact", intercept=intercept, active_cand=active_cand)
             continue
 
         if intercept is None and active_cand is not None:
@@ -1084,7 +1094,7 @@ def run_loop(
             home_err = _home_error_deg(r, q_home_rad)
             tr("no_intercept_idle", tick=tick_i, home_err_deg=home_err, q_cur_deg=np.degrees(q_cur), raw_ball=raw_ball_parsed)
             publish_limited_goal(q_home_rad, q_cur, "idle_ready")
-            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+            end_tick(mode="idle", intercept=None, active_cand=active_cand)
             continue
 
         q_seed = active_cand.q_strike if active_cand is not None else q_cur
@@ -1162,7 +1172,7 @@ def run_loop(
         if cand is None:
             print_reject(reason)
             tr("candidate_none", tick=tick_i, reason=reason, q_cur_deg=np.degrees(q_cur), intercept=_intercept_snapshot(intercept))
-            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+            end_tick(mode="reject", intercept=intercept, active_cand=active_cand)
             continue
 
         ok_retarget, retarget_reason = _retarget_ok(
@@ -1238,7 +1248,7 @@ def run_loop(
             )
             active_cand = None
             publish_limited_goal(q_home_rad, q_cur, "reject_ready")
-            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+            end_tick(mode="reject", intercept=intercept, active_cand=active_cand)
             continue
 
         if loop_t - last_print_t >= max(0.05, log_period_s):
@@ -1347,7 +1357,7 @@ def run_loop(
             if max_swings > 0 and swings_done >= max_swings:
                 print(f"[J8] --max-swings={max_swings} reached; exiting")
                 break
-            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+            end_tick(mode="post_impact", intercept=intercept, active_cand=None)
             continue
 
         # Buy timing budget aggressively: if the current plan is behind budget,
@@ -1365,7 +1375,7 @@ def run_loop(
             active_cand = None
             idle_until_t = time.monotonic() + post_impact_idle_s
 
-        time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+        end_tick(mode="tracking", intercept=intercept, active_cand=cand_use)
 
 
 def main() -> None:
