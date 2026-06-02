@@ -23,6 +23,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 import redis
@@ -483,8 +484,18 @@ def run_loop(
     xml_vel_limits: np.ndarray,
     trace: _TraceLogger | None,
     ball_key: str | None,
+    loop_hook: Callable[[dict], None] | None = None,
 ) -> None:
     dt = 1.0 / max(1.0, rate_hz)
+    hook_state: dict = {}
+
+    def end_tick(**fields) -> None:
+        if loop_hook is not None:
+            hook_state.clear()
+            hook_state.update(fields)
+            loop_hook(hook_state)
+        time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+
     using_mock = mock_intercepts is not None and len(mock_intercepts) > 0
     mock_t0 = time.monotonic()
     vel_cap = np.maximum(xml_vel_limits * max(0.05, swing_vel_frac), 1e-6)
@@ -630,20 +641,20 @@ def run_loop(
             T_W_B = read_rigid_body_pose_W(r, cal.base_rigid_body_id)
             if T_W_B is None:
                 print_reject(f"cart rigid body {cal.base_rigid_body_id} not visible")
-                time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+                end_tick(mode="idle", intercept=intercept, active_cand=active_cand)
                 continue
             R_W_A, t_W_A = compute_T_W_A_from_base_offset(T_W_B, cal)
 
         q_cur = get_vec(r, SENSOR_JOINTS, 7)
         if q_cur is None:
             print_reject("no joint sensor")
-            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+            end_tick(mode="idle", intercept=intercept, active_cand=active_cand)
             continue
 
         if time.monotonic() < idle_until_t:
             publish_limited_goal(q_home_rad, q_cur, "post_impact_ready")
             tr("post_impact_idle", tick=tick_i, idle_until_t=idle_until_t, q_cur_deg=np.degrees(q_cur))
-            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+            end_tick(mode="post_impact", intercept=intercept, active_cand=active_cand)
             continue
 
         if intercept is None:
@@ -651,7 +662,7 @@ def run_loop(
             tr("no_intercept_idle", tick=tick_i, home_err_deg=_home_error_deg(r, q_home_rad), q_cur_deg=np.degrees(q_cur))
             publish_limited_goal(q_home_rad, q_cur, "idle_ready")
             active_cand = None
-            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+            end_tick(mode="idle", intercept=None, active_cand=None)
             continue
 
         q_seed = active_cand.q_strike if active_cand is not None else q_cur
@@ -692,7 +703,7 @@ def run_loop(
         if cand is None:
             print_reject(cand_reason)
             publish_limited_goal(q_home_rad, q_cur, "reject_ready")
-            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+            end_tick(mode="reject", intercept=intercept, active_cand=active_cand)
             continue
 
         active_cand = cand
@@ -807,7 +818,7 @@ def run_loop(
             if max_swings > 0 and swings_done >= max_swings:
                 print(f"[J9] --max-swings={max_swings} reached; exiting")
                 break
-            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+            end_tick(mode="post_impact", intercept=intercept, active_cand=None)
             continue
 
         # High-commit J9: always aim directly at the latest strike pose. No pre-pose.
@@ -816,7 +827,7 @@ def run_loop(
             tr("missed_window", tick=tick_i, aged_tti_s=aged_tti, candidate=_candidate_snapshot(cand))
             active_cand = None
             idle_until_t = time.monotonic() + post_impact_idle_s
-        time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
+        end_tick(mode="tracking", intercept=intercept, active_cand=cand)
 
 
 def main() -> None:
