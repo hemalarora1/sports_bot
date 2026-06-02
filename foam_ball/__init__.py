@@ -6,7 +6,7 @@ Quick start
     from foam_ball import make_foam_tracker
 
     r = redis.Redis()
-    tracker = make_foam_tracker(r)          # uses BigSoftBall rigid-body ID 14 + fitted k=0.20
+    tracker = make_foam_tracker(r)          # uses RigidBody002 rigid-body ID 14 + fitted k=0.20
     tracker.update()                         # same interface as BallTracker
     intercept = tracker.predict_intercept(strike_plane_x=0.60)
 
@@ -18,7 +18,7 @@ Manual wiring (if you need custom redis keys or config tweaks):
 
     r = redis.Redis()
     keys = RedisKeys(ball_source="optitrack")
-    keys.ball = dataclasses.replace(keys.ball, optitrack_rigid_body_id=14)  # BigSoftBall
+    keys.ball = dataclasses.replace(keys.ball, optitrack_rigid_body_id=14)  # RigidBody002
     cfg = FoamBallConfig(drag_coefficient=0.20)
     tracker = FoamBallTracker(r, keys, cfg)
 """
@@ -32,8 +32,8 @@ import redis as _redis
 from .config import FoamBallConfig
 from .tracker import FoamBallTracker
 
-# BigSoftBall OptiTrack rigid-body ID (Motive object name: "BigSoftBall").
-FOAM_BALL_RIGID_BODY_ID: int = 14
+# Foam ball OptiTrack rigid-body ID (Motive object name: "RigidBody002").
+FOAM_BALL_RIGID_BODY_ID: int = 13
 
 
 def make_foam_tracker(
@@ -50,7 +50,7 @@ def make_foam_tracker(
     redis_client:
         Shared Redis connection.
     rigid_body_id:
-        OptiTrack Motive rigid-body ID for BigSoftBall (default: 14).
+        OptiTrack Motive rigid-body ID for RigidBody002 (default: 14).
     drag_coefficient:
         Override the fitted k (m^-1). Leave None to use the default from
         FoamBallConfig (currently 0.20, fitted from 2026-06-01 recordings).

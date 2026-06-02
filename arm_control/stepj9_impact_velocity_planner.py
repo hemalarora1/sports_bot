@@ -1025,7 +1025,7 @@ def main() -> None:
         description="J9: high-commit impact-velocity pickleball striker.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("--ball-rigid-body-id", type=int, default=14)  # BigSoftBall
+    ap.add_argument("--ball-rigid-body-id", type=int, default=13)  # RigidBody002
     ap.add_argument("--strike-plane-x", type=float, default=-0.55)
     ap.add_argument("--mock-intercept", nargs=3, type=float, action="append")
     ap.add_argument("--mock-tti", type=float, default=0.60)
