@@ -2,10 +2,10 @@
 """
 Step J10: J9 impact-velocity swing + mobile base push forward.
 
-Same arm pipeline as ``stepj9_impact_velocity_planner.py``, but also writes
-``sports_bot::cmd::base::goal_pose`` each control tick so the TidyBot cart
-nudges forward in world +X while J9 is tracking (default +0.50 m).  Requires
-``base_bridge.py`` and ``redis_driver.py`` running.
+Runs ``stepj9_impact_velocity_planner.py`` unchanged and patches in a base
+forward nudge at swing commit time (default +0.50 m world +X).  The cart stays
+at ready during AIM so base motion does not shift the arm IK target before
+commit.  Requires ``base_bridge.py`` and ``redis_driver.py``.
 
 Prereqs (in order)
 ------------------
@@ -17,7 +17,7 @@ Prereqs (in order)
 Usage
 -----
     python sports_bot/arm_control/stepj10_swing_plus_push.py --skip-cal \\
-        --ball-rigid-body-id 1 --strike-plane-x 0.65 --w-ori 10
+        --ball-rigid-body-id 13 --strike-plane-x 0.7 --w-ori 10
 
     # Custom forward nudge (default 0.50 m):
     python sports_bot/arm_control/stepj10_swing_plus_push.py --skip-cal \\
@@ -29,6 +29,8 @@ import argparse
 import math
 import os
 import sys
+import time
+from typing import Any, Callable
 
 import redis
 
@@ -54,9 +56,60 @@ from sports_bot.utils.frames import (  # noqa: E402
 )
 
 
+class CommitSyncedPusher(BasePusher):
+    """Forward nudge on swing commit only — base stays at ready during AIM."""
+
+    def on_swing_commit(self) -> None:
+        now = time.perf_counter()
+        goal, clipped = self.goal_nudge_forward()
+        self.write_goal(goal)
+        if self.verbose and now - self.last_print_t >= 0.25:
+            self.last_print_t = now
+            clip_tag = " [CLIP]" if clipped else ""
+            print(
+                f"[J10 base] COMMIT   nudge goal_W=({goal[0]:+.3f}, {goal[1]:+.3f}, "
+                f"{math.degrees(goal[2]):+.1f}°)  "
+                f"forward=+{self.forward_nudge_m:.2f} m{clip_tag}"
+            )
+
+
+def _install_j10_patches(
+    j9: Any,
+    pusher: CommitSyncedPusher | None,
+) -> tuple[Callable[..., Any], Callable[..., Any]] | None:
+    """Patch J9 swing/home helpers so base nudge fires at commit, not during AIM."""
+    if pusher is None:
+        return None
+
+    orig_strike = j9._run_impact_strike
+    orig_home = j9._return_home_blocking
+
+    def _run_impact_strike_with_nudge(*args, **kwargs):
+        pusher.on_swing_commit()
+        return orig_strike(*args, **kwargs)
+
+    def _return_home_with_ready(*args, **kwargs):
+        ok = orig_home(*args, **kwargs)
+        pusher.write_ready()
+        return ok
+
+    j9._run_impact_strike = _run_impact_strike_with_nudge
+    j9._return_home_blocking = _return_home_with_ready
+    return orig_strike, orig_home
+
+
+def _restore_j10_patches(
+    j9: Any,
+    saved: tuple[Callable[..., Any], Callable[..., Any]] | None,
+) -> None:
+    if saved is None:
+        return
+    j9._run_impact_strike, j9._return_home_blocking = saved
+
+
 def _build_j10_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        description="J10: J9 impact-velocity swing + base forward push.",
+        description="J10: J9 impact-velocity swing + base forward push on commit.",
         add_help=False,
     )
     ap.add_argument("--ready-base-x", type=float, default=0.0,
@@ -80,18 +133,39 @@ def _build_j10_parser() -> argparse.ArgumentParser:
     ap.add_argument("--base-x-gain", type=float, default=1.0,
                     help="Scale forward push: goal_x = ready_x + gain*(strike_x - strike_plane_x).")
     ap.add_argument("--base-hold-after-lost-s", type=float, default=0.5,
-                    help="Return base to ready after this long without tracking.")
+                    help="Unused (kept for CLI compat); base returns ready after each swing.")
     ap.add_argument("--base-forward-nudge-m", type=float, default=0.50,
-                    help="While J9 is tracking, command ready + this world +X offset (default).")
+                    help="On swing commit, command ready + this world +X offset (default).")
     ap.add_argument("--base-track-intercept", action="store_true",
-                    help="Track strike X/Y instead of a fixed forward nudge.")
+                    help="Ignored in J10 (commit nudge only). Kept for CLI compat.")
+    ap.add_argument("--tracker-min-incoming-speed", type=float, default=0.25,
+                    help="Min world -X speed (m/s) to treat ball as incoming (default: 0.25).")
     ap.add_argument("--verbose-base", action="store_true",
-                    help="Print base goal updates ~4 Hz.")
+                    help="Print base goal updates on commit.")
     ap.add_argument("--no-base-push", action="store_true",
                     help="Run J9 arm planner only (no base goal writes).")
     ap.add_argument("-h", "--help", action="store_true",
                     help="Show J9 help (pass --help after J10-only flags).")
     return ap
+
+
+def _patch_j9_tracker_defaults(j9: Any, *, min_incoming_speed: float) -> Any:
+    """J10-only BallTrackerConfig override without editing J9 source."""
+    from dataclasses import dataclass
+
+    from sports_bot.state_machine.config import BallTrackerConfig as _BaseCfg
+
+    @dataclass
+    class _J10BallTrackerConfig(_BaseCfg):
+        min_incoming_speed: float = min_incoming_speed
+
+    orig = j9.BallTrackerConfig
+    j9.BallTrackerConfig = _J10BallTrackerConfig
+    return orig
+
+
+def _restore_j9_tracker_defaults(j9: Any, orig: Any) -> None:
+    j9.BallTrackerConfig = orig
 
 
 def main() -> None:
@@ -111,8 +185,15 @@ def main() -> None:
 
     import stepj9_impact_velocity_planner as j9  # noqa: WPS433
 
-    base: BasePusher | None = None
+    saved_tracker_cfg = _patch_j9_tracker_defaults(
+        j9, min_incoming_speed=j10_args.tracker_min_incoming_speed,
+    )
+
+    base: CommitSyncedPusher | None = None
     if not j10_args.no_base_push:
+        if j10_args.base_track_intercept:
+            print("[J10] NOTE: --base-track-intercept ignored; J10 nudges forward on commit only")
+
         redis_host = _parse_flag_str(remaining, "--redis-host", "localhost")
         redis_port = _parse_flag_int(remaining, "--redis-port", 6379)
         r = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
@@ -137,7 +218,7 @@ def main() -> None:
                 f"({ready_pose[0]:+.3f}, {ready_pose[1]:+.3f}, {math.degrees(ready_pose[2]):+.1f}°)"
             )
 
-        base = BasePusher(
+        base = CommitSyncedPusher(
             r,
             ready_pose=ready_pose,
             strike_plane_x=strike_plane_x,
@@ -148,36 +229,23 @@ def main() -> None:
             x_gain=j10_args.base_x_gain,
             hold_after_lost_s=j10_args.base_hold_after_lost_s,
             forward_nudge_m=j10_args.base_forward_nudge_m,
-            track_intercept=j10_args.base_track_intercept,
+            track_intercept=False,
             verbose=j10_args.verbose_base,
         )
         base.write_ready()
-        if j10_args.base_track_intercept:
-            mode_txt = (
-                f"track intercept  x∈[{j10_args.base_x_min:+.2f},{j10_args.base_x_max:+.2f}] "
-                f"y∈[{j10_args.base_y_min:+.2f},{j10_args.base_y_max:+.2f}]  "
-                f"x_gain={j10_args.base_x_gain:.2f}  strike_plane_x={strike_plane_x:+.3f}"
-            )
-        else:
-            mode_txt = f"forward nudge +{j10_args.base_forward_nudge_m:.2f} m (world +X)"
+        mode_txt = f"forward nudge +{j10_args.base_forward_nudge_m:.2f} m on COMMIT (world +X)"
         print(
             f"[J10] base push ON → {FSM_BASE_GOAL}  "
             f"ready=({ready_pose[0]:+.3f}, {ready_pose[1]:+.3f}, "
             f"{math.degrees(ready_pose[2]):+.1f}°)  "
             f"{mode_txt}"
         )
+        print("[J10] base stays at ready during AIM; nudges when arm commits to swing")
         print("[J10] requires base_bridge.py + TidyBot redis_driver.py")
     else:
         print("[J10] --no-base-push: arm-only (same as J9)")
 
-    orig_run_loop = j9.run_loop
-    loop_hook = base.on_loop_tick if base is not None else None
-
-    def run_loop_with_base(**kwargs):
-        kwargs["loop_hook"] = loop_hook
-        return orig_run_loop(**kwargs)
-
-    j9.run_loop = run_loop_with_base
+    saved_patches = _install_j10_patches(j9, base)
 
     old_argv = sys.argv
     sys.argv = [old_argv[0]] + remaining
@@ -185,7 +253,8 @@ def main() -> None:
         j9.main()
     finally:
         sys.argv = old_argv
-        j9.run_loop = orig_run_loop
+        _restore_j10_patches(j9, saved_patches)
+        _restore_j9_tracker_defaults(j9, saved_tracker_cfg)
 
 
 if __name__ == "__main__":
