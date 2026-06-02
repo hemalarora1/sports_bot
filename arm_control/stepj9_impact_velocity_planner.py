@@ -1108,6 +1108,9 @@ def main() -> None:
 
     ap.add_argument("--min-lookahead", type=float, default=None)
     ap.add_argument("--max-lookahead", type=float, default=None)
+    ap.add_argument("--tracker-gravity", type=float, default=None,
+                    help="Override BallTrackerConfig.gravity for intercept prediction. "
+                         "Use this to test effective vertical acceleration/drag correction.")
     ap.add_argument("--tracker-history-size", type=int, default=None)
     ap.add_argument("--tracker-history-max-age-s", type=float, default=None)
     ap.add_argument("--tracker-min-history", type=int, default=None)
@@ -1237,6 +1240,10 @@ def main() -> None:
             cfg.min_lookahead = args.min_lookahead
         if args.max_lookahead is not None:
             cfg.max_lookahead = args.max_lookahead
+        if args.tracker_gravity is not None:
+            if args.tracker_gravity <= 0.0:
+                sys.exit(f"[J9] --tracker-gravity must be positive, got {args.tracker_gravity}")
+            cfg.gravity = args.tracker_gravity
         if args.tracker_history_size is not None:
             cfg.history_size = args.tracker_history_size
         if args.tracker_history_max_age_s is not None:
@@ -1254,7 +1261,8 @@ def main() -> None:
         print(
             f"[J9 tracker] hist={cfg.history_size}/{cfg.history_max_age_s:.2f}s "
             f"min_hist={cfg.min_history_for_prediction} median={cfg.median_filter_window} "
-            f"lookahead=[{cfg.min_lookahead:.2f},{cfg.max_lookahead:.2f}]s"
+            f"lookahead=[{cfg.min_lookahead:.2f},{cfg.max_lookahead:.2f}]s "
+            f"gravity={cfg.gravity:.2f}m/s^2"
         )
         keys = RedisKeys(ball_source="optitrack")
         keys.ball.__dict__["optitrack_rigid_body_id"] = args.ball_rigid_body_id
