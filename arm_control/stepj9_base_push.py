@@ -19,8 +19,8 @@ Usage
     python sports_bot/arm_control/stepj9_base_push.py --skip-cal \\
         --ball-rigid-body-id 1 --strike-plane-x 0.65 --w-ori 10
 
-    python sports_bot/arm_control/stepj9_base_push.py --skip-cal --no-commit \\
-        --ball-rigid-body-id 1 --strike-plane-x 0.65 --verbose-tracking
+    # Fixed 30 cm world +X nudge while J8 is tracking (default). Old strike-following:
+    python sports_bot/arm_control/stepj9_base_push.py --skip-cal --base-track-intercept ...
 """
 from __future__ import annotations
 
@@ -78,6 +78,8 @@ class BasePusher:
         base_y_max: float,
         x_gain: float = 1.0,
         hold_after_lost_s: float = 0.5,
+        forward_nudge_m: float = 0.30,
+        track_intercept: bool = False,
         verbose: bool = False,
     ) -> None:
         self.r = r
@@ -89,6 +91,8 @@ class BasePusher:
         self.base_y_max = float(base_y_max)
         self.x_gain = float(x_gain)
         self.hold_after_lost_s = float(hold_after_lost_s)
+        self.forward_nudge_m = float(forward_nudge_m)
+        self.track_intercept = track_intercept
         self.verbose = verbose
         self.last_goal: tuple[float, float, float] | None = None
         self.last_good_t = float("-inf")
@@ -112,6 +116,12 @@ class BasePusher:
         theta = self.ready[2]
         return (x, y, theta), (x_clip or y_clip)
 
+    def goal_nudge_forward(self) -> tuple[tuple[float, float, float], bool]:
+        """Fixed world +X push from ready — no lateral tracking."""
+        x_raw = self.ready[0] + self.forward_nudge_m
+        x, clipped = self._clamp(x_raw, self.base_x_min, self.base_x_max)
+        return (x, self.ready[1], self.ready[2]), clipped
+
     def write_goal(self, pose: tuple[float, float, float]) -> None:
         pose = (float(pose[0]), float(pose[1]), float(pose[2]))
         if self.last_goal is None or any(abs(pose[i] - self.last_goal[i]) > 1e-4 for i in range(3)):
@@ -133,6 +143,22 @@ class BasePusher:
             strike_W = np.asarray(intercept.position, dtype=float)
 
         now = time.perf_counter()
+        if not self.track_intercept:
+            if mode == "tracking":
+                self.last_good_t = now
+            if mode == "tracking" or now - self.last_good_t <= self.hold_after_lost_s:
+                goal, clipped = self.goal_nudge_forward()
+                self.write_goal(goal)
+                if self.verbose and now - self.last_print_t >= 0.25:
+                    self.last_print_t = now
+                    clip_tag = " [CLIP]" if clipped else ""
+                    print(
+                        f"[J9 base] {mode:8s} nudge goal_W=({goal[0]:+.3f}, {goal[1]:+.3f}, "
+                        f"{math.degrees(goal[2]):+.1f}°)  "
+                        f"forward=+{self.forward_nudge_m:.2f} m{clip_tag}"
+                    )
+                return
+
         if strike_W is not None and mode in ("tracking", "reject", "post_impact"):
             goal, clipped = self.goal_for_strike_W(strike_W)
             self.write_goal(goal)
@@ -176,7 +202,11 @@ def _build_j9_parser() -> argparse.ArgumentParser:
     ap.add_argument("--base-x-gain", type=float, default=1.0,
                     help="Scale forward push: goal_x = ready_x + gain*(strike_x - strike_plane_x).")
     ap.add_argument("--base-hold-after-lost-s", type=float, default=0.5,
-                    help="Return base to ready after this long without a strike target.")
+                    help="Return base to ready after this long without tracking.")
+    ap.add_argument("--base-forward-nudge-m", type=float, default=0.30,
+                    help="While J8 is tracking, command ready + this world +X offset (default).")
+    ap.add_argument("--base-track-intercept", action="store_true",
+                    help="Track strike X/Y instead of a fixed forward nudge.")
     ap.add_argument("--verbose-base", action="store_true",
                     help="Print base goal updates ~4 Hz.")
     ap.add_argument("--no-base-push", action="store_true",
@@ -223,16 +253,24 @@ def main() -> None:
             base_y_max=j9_args.base_y_max,
             x_gain=j9_args.base_x_gain,
             hold_after_lost_s=j9_args.base_hold_after_lost_s,
+            forward_nudge_m=j9_args.base_forward_nudge_m,
+            track_intercept=j9_args.base_track_intercept,
             verbose=j9_args.verbose_base,
         )
         base.write_ready()
+        if j9_args.base_track_intercept:
+            mode_txt = (
+                f"track intercept  x∈[{j9_args.base_x_min:+.2f},{j9_args.base_x_max:+.2f}] "
+                f"y∈[{j9_args.base_y_min:+.2f},{j9_args.base_y_max:+.2f}]  "
+                f"x_gain={j9_args.base_x_gain:.2f}  strike_plane_x={strike_plane_x:+.3f}"
+            )
+        else:
+            mode_txt = f"forward nudge +{j9_args.base_forward_nudge_m:.2f} m (world +X)"
         print(
             f"[J9] base push ON → {FSM_BASE_GOAL}  "
             f"ready=({ready_pose[0]:+.3f}, {ready_pose[1]:+.3f}, "
             f"{math.degrees(ready_pose[2]):+.1f}°)  "
-            f"x∈[{j9_args.base_x_min:+.2f},{j9_args.base_x_max:+.2f}] "
-            f"y∈[{j9_args.base_y_min:+.2f},{j9_args.base_y_max:+.2f}]  "
-            f"x_gain={j9_args.base_x_gain:.2f}  strike_plane_x={strike_plane_x:+.3f}"
+            f"{mode_txt}"
         )
         print("[J9] requires base_bridge.py + TidyBot redis_driver.py")
     else:
