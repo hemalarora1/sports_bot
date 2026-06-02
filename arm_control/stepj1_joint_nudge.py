@@ -151,7 +151,7 @@ def sample_state(r, q_goal, q_start, qdot_peak_degs, prev_q, prev_t):
 
 
 def run_segment(r, label, q_start, q_target, move_s, hold_s, publish_hz,
-                verbose=False):
+                verbose=False, trace_cb=None):
     qdot_peak_degs = np.zeros(7)
     torque_peak = {
         "cmd": np.zeros(7),
@@ -206,6 +206,18 @@ def run_segment(r, label, q_start, q_target, move_s, hold_s, publish_hz,
                     torque_seen[key] = True
                     torque_latest[key] = tau
                     torque_peak[key] = np.maximum(torque_peak[key], np.abs(tau))
+            if trace_cb is not None:
+                trace_cb(
+                    elapsed_s=elapsed,
+                    move_s=move_s,
+                    hold_s=hold_s,
+                    q_goal=q_goal.copy(),
+                    q_actual=None if final_info is None else final_info["q"].copy(),
+                    err_deg=None if final_info is None else final_info["err_deg"].copy(),
+                    drift_from_start_deg=None if final_info is None else final_info["drift_from_start_deg"].copy(),
+                    qdot_peak_deg_s=qdot_peak_degs.copy(),
+                    torque_reads=torque_reads,
+                )
             if verbose and final_info is not None:
                 err_max = float(np.max(np.abs(final_info["err_deg"])))
                 qdot_max = float(np.max(qdot_peak_degs))

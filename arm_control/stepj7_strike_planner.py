@@ -407,6 +407,7 @@ def _return_home_blocking(
     hold_s: float = 0.35,
     publish_hz: float = 100.0,
     full_segment_logs: bool = True,
+    trace_cb=None,
 ) -> bool:
     """Actively return to home; soft one-tick nudges are not enough between throws."""
     q_start = get_vec(r, SENSOR_JOINTS, 7)
@@ -428,12 +429,14 @@ def _return_home_blocking(
         seg = run_segment(
             r, label, q_start, q_home_rad,
             move_s=home_s, hold_s=hold_s, publish_hz=publish_hz,
+            trace_cb=trace_cb,
         )
     else:
         with contextlib.redirect_stdout(io.StringIO()):
             seg = run_segment(
                 r, label, q_start, q_home_rad,
                 move_s=home_s, hold_s=hold_s, publish_hz=publish_hz,
+                trace_cb=trace_cb,
             )
         print(
             f"[J7 segment] {label}: move_s={home_s:.3f}s hold_s={hold_s:.2f}s "

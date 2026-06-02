@@ -35,7 +35,12 @@ for _path in (_THIS_DIR, _OPENSAI_DIR):
         sys.path.insert(0, _path)
 
 from stepj1_joint_nudge import (  # noqa: E402
+    ACTIVE_CONTROLLER,
+    COMMAND_TORQUES,
     GOAL_JOINTS,
+    SAFETY_TORQUES,
+    SENSED_TORQUES,
+    SENT_TORQUES,
     SENSOR_JOINTS,
     SENSOR_JOINT_VELS,
     get_vec,
@@ -183,6 +188,140 @@ def _read_xml_velocity_limits(r: redis.Redis) -> np.ndarray:
 def _sweet_spot_A(chain, q: np.ndarray, offset_link7: np.ndarray) -> np.ndarray:
     T = _fk(chain, q)
     return T[:3, 3] + T[:3, :3] @ offset_link7
+
+
+def _fr3_raw_velocity_limits_rad(q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    q = np.asarray(q, dtype=float)
+    dq_max = np.empty(7)
+    dq_max[0] = min(3.0, max(0.0, -0.3 + math.sqrt(max(0.0, 12.0 * (2.75010 - q[0])))))
+    dq_max[1] = min(3.0, max(0.0, -0.2 + math.sqrt(max(0.0, 5.17 * (1.79180 - q[1])))))
+    dq_max[2] = min(3.0, max(0.0, -0.2 + math.sqrt(max(0.0, 7.00 * (2.90650 - q[2])))))
+    dq_max[3] = min(3.0, max(0.0, -0.3 + math.sqrt(max(0.0, 8.00 * (-0.1458 - q[3])))))
+    dq_max[4] = min(3.0, max(0.0, -0.35 + math.sqrt(max(0.0, 34.0 * (2.81010 - q[4])))))
+    dq_max[5] = min(3.0, max(0.0, -0.35 + math.sqrt(max(0.0, 11.0 * (4.52050 - q[5])))))
+    dq_max[6] = min(3.0, max(0.0, -0.35 + math.sqrt(max(0.0, 34.0 * (3.01960 - q[6])))))
+
+    dq_min = np.empty(7)
+    dq_min[0] = max(-3.0, min(0.0, 0.3 - math.sqrt(max(0.0, 12.0 * (2.75010 + q[0])))))
+    dq_min[1] = max(-3.0, min(0.0, 0.2 - math.sqrt(max(0.0, 5.17 * (1.79180 + q[1])))))
+    dq_min[2] = max(-3.0, min(0.0, 0.2 - math.sqrt(max(0.0, 7.00 * (2.90650 + q[2])))))
+    dq_min[3] = max(-3.0, min(0.0, 0.3 - math.sqrt(max(0.0, 8.00 * (3.04810 + q[3])))))
+    dq_min[4] = max(-3.0, min(0.0, 0.35 - math.sqrt(max(0.0, 34.0 * (2.81010 + q[4])))))
+    dq_min[5] = max(-3.0, min(0.0, 0.35 - math.sqrt(max(0.0, 11.0 * (-0.54092 + q[5])))))
+    dq_min[6] = max(-3.0, min(0.0, 0.35 - math.sqrt(max(0.0, 34.0 * (3.01960 + q[6])))))
+    return dq_min, dq_max
+
+
+def _fr3_driver_velocity_bands_rad(q: np.ndarray) -> dict:
+    raw_min, raw_max = _fr3_raw_velocity_limits_rad(q)
+    # Mirrors drivers/FrankaPanda/redis_driver/main.cpp for FR3 with dynamic bounds:
+    # hard zone = 6 * 0.1 rad/s, soft zone = 9 * 0.1 rad/s.
+    hard = 0.6
+    soft = 0.9
+    return {
+        "raw_min": raw_min,
+        "hard_min": raw_min + hard,
+        "soft_min": raw_min + soft,
+        "soft_max": raw_max - soft,
+        "hard_max": raw_max - hard,
+        "raw_max": raw_max,
+    }
+
+
+def _velocity_band_snapshot(q: np.ndarray | None, qdot: np.ndarray | None = None) -> dict | None:
+    if q is None:
+        return None
+    bands = _fr3_driver_velocity_bands_rad(q)
+    snap = {f"{k}_deg_s": np.degrees(v) for k, v in bands.items()}
+    if qdot is not None:
+        allowed_hard = np.where(qdot >= 0.0, bands["hard_max"], -bands["hard_min"])
+        allowed_soft = np.where(qdot >= 0.0, bands["soft_max"], -bands["soft_min"])
+        hard_ratio = np.abs(qdot) / np.maximum(allowed_hard, 1e-6)
+        soft_ratio = np.abs(qdot) / np.maximum(allowed_soft, 1e-6)
+        jh = int(np.argmax(hard_ratio))
+        js = int(np.argmax(soft_ratio))
+        snap.update({
+            "qdot_deg_s": np.degrees(qdot),
+            "hard_ratio": float(hard_ratio[jh]),
+            "hard_joint": jh + 1,
+            "soft_ratio": float(soft_ratio[js]),
+            "soft_joint": js + 1,
+        })
+    return snap
+
+
+def _driver_diag_snapshot(r: redis.Redis) -> dict:
+    q = get_vec(r, SENSOR_JOINTS, 7)
+    dq = get_vec(r, SENSOR_JOINT_VELS, 7)
+    return {
+        "active_controller": r.get(ACTIVE_CONTROLLER),
+        "q_deg": None if q is None else np.degrees(q),
+        "dq_deg_s": None if dq is None else np.degrees(dq),
+        "fr3_velocity": _velocity_band_snapshot(q, dq),
+        "tau_cmd": get_vec(r, COMMAND_TORQUES, 7),
+        "tau_sent": get_vec(r, SENT_TORQUES, 7),
+        "tau_safety": get_vec(r, SAFETY_TORQUES, 7),
+        "tau_sensed": get_vec(r, SENSED_TORQUES, 7),
+        "tau_desired": get_vec(r, f"{NS}::sensors::FrankaRobot::joint_torques_desired", 7),
+        "tau_ext_hat_filtered": get_vec(r, f"{NS}::sensors::FrankaRobot::tau_ext_hat_filtered", 7),
+    }
+
+
+def _trajectory_diagnostics(chain, q_start: np.ndarray, cand: ImpactCandidate, offset_link7: np.ndarray) -> dict:
+    p_start = _sweet_spot_A(chain, q_start, offset_link7)
+    p_strike = _sweet_spot_A(chain, cand.q_strike, offset_link7)
+    p_stop = _sweet_spot_A(chain, cand.q_stop, offset_link7)
+
+    worst_hard = {"ratio": 0.0}
+    worst_soft = {"ratio": 0.0}
+    phases = (
+        ("approach", max(0.045, cand.strike_time_s), q_start, np.zeros(7), cand.q_strike, cand.qdot_strike),
+        ("decel", max(0.05, cand.decel_s), cand.q_strike, cand.qdot_strike, cand.q_stop, np.zeros(7)),
+    )
+    for phase, T, q0, v0, q1, v1 in phases:
+        for t in np.linspace(0.0, T, 160):
+            q, qdot = _hermite(q0, v0, q1, v1, float(t), T)
+            bands = _fr3_driver_velocity_bands_rad(q)
+            hard_allowed = np.where(qdot >= 0.0, bands["hard_max"], -bands["hard_min"])
+            soft_allowed = np.where(qdot >= 0.0, bands["soft_max"], -bands["soft_min"])
+            hard_ratio = np.abs(qdot) / np.maximum(hard_allowed, 1e-6)
+            soft_ratio = np.abs(qdot) / np.maximum(soft_allowed, 1e-6)
+            jh = int(np.argmax(hard_ratio))
+            js = int(np.argmax(soft_ratio))
+            if float(hard_ratio[jh]) > float(worst_hard["ratio"]):
+                worst_hard = {
+                    "ratio": float(hard_ratio[jh]),
+                    "joint": jh + 1,
+                    "phase": phase,
+                    "t_s": float(t),
+                    "q_deg": float(math.degrees(q[jh])),
+                    "qdot_deg_s": float(math.degrees(qdot[jh])),
+                    "hard_min_deg_s": float(math.degrees(bands["hard_min"][jh])),
+                    "hard_max_deg_s": float(math.degrees(bands["hard_max"][jh])),
+                }
+            if float(soft_ratio[js]) > float(worst_soft["ratio"]):
+                worst_soft = {
+                    "ratio": float(soft_ratio[js]),
+                    "joint": js + 1,
+                    "phase": phase,
+                    "t_s": float(t),
+                    "q_deg": float(math.degrees(q[js])),
+                    "qdot_deg_s": float(math.degrees(qdot[js])),
+                    "soft_min_deg_s": float(math.degrees(bands["soft_min"][js])),
+                    "soft_max_deg_s": float(math.degrees(bands["soft_max"][js])),
+                }
+
+    return {
+        "sweet_start_A": p_start,
+        "sweet_strike_A": p_strike,
+        "sweet_stop_A": p_stop,
+        "sweet_dx_pre_m": float(p_strike[0] - p_start[0]),
+        "sweet_dx_after_m": float(p_stop[0] - p_strike[0]),
+        "sweet_dz_after_m": float(p_stop[2] - p_strike[2]),
+        "fr3_worst_hard": worst_hard,
+        "fr3_worst_soft": worst_soft,
+        "fr3_at_strike": _velocity_band_snapshot(cand.q_strike, cand.qdot_strike),
+    }
 
 
 def _sweet_spot_jacobian_A(chain, q: np.ndarray, offset_link7: np.ndarray) -> np.ndarray:
@@ -334,6 +473,7 @@ def _run_impact_strike(
     *,
     publish_hz: float,
     full_segment_logs: bool,
+    trace: _TraceLogger | None = None,
 ) -> dict:
     q_start = get_vec(r, SENSOR_JOINTS, 7)
     if q_start is None:
@@ -355,6 +495,13 @@ def _run_impact_strike(
     next_publish = time.perf_counter()
     next_sample = next_publish
     t0 = time.perf_counter()
+    next_trace_sample = t0
+
+    def tr(event: str, **fields) -> None:
+        if trace is not None:
+            trace.write(event, **fields)
+
+    tr("impact_start", candidate=_candidate_snapshot(cand), diagnostic=_driver_diag_snapshot(r))
 
     print(
         f"[J9 impact] start: strike_s={strike_s:.3f}s decel_s={decel_s:.3f}s "
@@ -397,6 +544,20 @@ def _run_impact_strike(
             elif q is not None and prev_q is not None and prev_t is not None:
                 dt = max(1e-6, now - prev_t)
                 qdot_peak = np.maximum(qdot_peak, np.abs(np.degrees((q - prev_q) / dt)))
+            if trace is not None and now >= next_trace_sample:
+                tr(
+                    "impact_sample",
+                    elapsed_s=elapsed,
+                    phase="approach" if elapsed <= strike_s else "decel",
+                    q_goal_deg=np.degrees(q_goal),
+                    qdot_goal_deg_s=np.degrees(qdot_goal),
+                    q_actual_deg=None if q is None else np.degrees(q),
+                    dq_actual_deg_s=None if dq is None else np.degrees(dq),
+                    cmd_fr3_velocity=_velocity_band_snapshot(q_goal, qdot_goal),
+                    actual_fr3_velocity=None if q is None else _velocity_band_snapshot(q, dq),
+                    diagnostic=_driver_diag_snapshot(r),
+                )
+                next_trace_sample = now + 0.02
             if q is not None:
                 prev_q = q.copy()
                 prev_t = now
@@ -418,7 +579,7 @@ def _run_impact_strike(
         f"cmd_peak={qdot_cmd_peak[qdot_cmd_i]:.1f}deg/s@q{qdot_cmd_i+1} "
         f"v_meas_W=[{measured_v_W[0]:+.2f},{measured_v_W[1]:+.2f},{measured_v_W[2]:+.2f}]"
     )
-    return {
+    result = {
         "strike_err_deg": strike_err_deg,
         "stop_err_deg": stop_err_deg,
         "qdot_max_deg_s": float(qdot_peak[qdot_i]),
@@ -427,6 +588,8 @@ def _run_impact_strike(
         "cmd_qdot_max_joint": qdot_cmd_i + 1,
         "measured_v_W": measured_v_W,
     }
+    tr("impact_done", result=result, diagnostic=_driver_diag_snapshot(r))
+    return result
 
 
 def run_loop(
@@ -564,7 +727,20 @@ def run_loop(
 
     def recover_home(label: str, idle_after: bool) -> bool:
         nonlocal active_cand, last_q_cmd, last_q_cmd_vel, last_goal_write_t, idle_until_t
-        tr("recover_home_start", tick=tick_i, label=label, active_candidate=_candidate_snapshot(active_cand))
+        tr(
+            "recover_home_start", tick=tick_i, label=label,
+            active_candidate=_candidate_snapshot(active_cand),
+            diagnostic=_driver_diag_snapshot(r),
+        )
+
+        def home_trace_cb(**fields) -> None:
+            tr(
+                "home_sample", tick=tick_i, label=label,
+                target_q_deg=np.degrees(q_home_rad),
+                diagnostic=_driver_diag_snapshot(r),
+                **fields,
+            )
+
         ok = _return_home_blocking(
             r, q_home_rad,
             move_s=return_s,
@@ -573,6 +749,7 @@ def run_loop(
             hold_s=0.35,
             publish_hz=100.0,
             full_segment_logs=full_segment_logs,
+            trace_cb=home_trace_cb if trace is not None else None,
         )
         active_cand = None
         last_q_cmd = get_vec(r, SENSOR_JOINTS, 7) if ok else _hold_current_joints(r)
@@ -582,7 +759,7 @@ def run_loop(
         last_goal_write_t = time.perf_counter()
         if idle_after:
             idle_until_t = time.monotonic() + post_impact_idle_s
-        tr("recover_home_done", tick=tick_i, label=label, ok=ok, idle_until_t=idle_until_t)
+        tr("recover_home_done", tick=tick_i, label=label, ok=ok, idle_until_t=idle_until_t, diagnostic=_driver_diag_snapshot(r))
         return ok
 
     switch_ctrl(r, JOINT_CTRL)
@@ -719,6 +896,7 @@ def run_loop(
             max(0.035, strike_time_now), cand.decel_s, vel_cap,
         )
         cand.cmd_peak_frac = peak_frac
+        traj_diag = _trajectory_diagnostics(chain, q_cur, cand, offset_link7)
         q_delta, q_joint = _max_abs_deg_with_joint(cand.q_strike - q_cur)
         feasible = strike_time_now > 0.045 and cand.budget_margin_s >= 0.0 and peak_frac <= 1.0
         late_by_s = cand.min_strike_s - strike_time_now
@@ -740,7 +918,9 @@ def run_loop(
             late_by_s=late_by_s,
             cmd_peak_frac=peak_frac, bottleneck_joint=peak_idx + 1,
             bottleneck_cmd_deg_s=math.degrees(peak[peak_idx]), q_to_strike_deg=q_delta,
-            q_to_strike_joint=q_joint, q_cur_deg=np.degrees(q_cur), candidate=_candidate_snapshot(cand),
+            q_to_strike_joint=q_joint, q_cur_deg=np.degrees(q_cur),
+            trajectory_diagnostics=traj_diag,
+            candidate=_candidate_snapshot(cand),
         )
 
         if loop_t - last_print_t >= max(0.05, log_period_s):
@@ -757,10 +937,15 @@ def run_loop(
                 f"cmd={peak_frac*100:.0f}% vW=[{cand.forward_mps:+.2f},{cand.up_mps:+.2f}]"
             )
             if verbose_tracking:
+                hard = traj_diag["fr3_worst_hard"]
+                soft = traj_diag["fr3_worst_soft"]
                 print(
                     f"[J9]   q_to_strike={q_delta:.1f}deg@q{q_joint} "
                     f"peak_cmd={math.degrees(peak[peak_idx]):.1f}deg/s@q{peak_idx+1} "
                     f"ik={cand.ik_err_mm:.1f}mm ori={cand.ori_err_deg:.1f}deg "
+                    f"path_dx={100*traj_diag['sweet_dx_pre_m']:+.1f}->{100*traj_diag['sweet_dx_after_m']:+.1f}cm "
+                    f"fr3_hard={100*hard['ratio']:.0f}%@q{hard['joint']} "
+                    f"soft={100*soft['ratio']:.0f}%@q{soft['joint']} "
                     f"rejects={_fmt_counts(reject_counts)}{qdot_txt}"
                 )
 
@@ -774,12 +959,17 @@ def run_loop(
                     cand.strike_time_s, cand.decel_s, vel_cap,
                 )
                 cand.cmd_peak_frac = peak_frac
+                traj_diag = _trajectory_diagnostics(chain, q_cur, cand, offset_link7)
                 print(
                     f"[J9] TRY_STRETCH: ball_time={old_strike_s:.3f}s < Tmin={cand.min_strike_s:.3f}s; "
                     f"swinging safely over {cand.strike_time_s:.3f}s"
                 )
             active_throw_id += 1
-            tr("commit_start", tick=tick_i, throw_id=active_throw_id, candidate=_candidate_snapshot(cand), late_try=late_try)
+            tr(
+                "commit_start", tick=tick_i, throw_id=active_throw_id,
+                candidate=_candidate_snapshot(cand), late_try=late_try,
+                trajectory_diagnostics=traj_diag, diagnostic=_driver_diag_snapshot(r),
+            )
             print("\n" + "=" * 64)
             print(
                 f"[J9] COMMIT throw {active_throw_id}: tti={aged_tti:.3f}s "
@@ -790,15 +980,25 @@ def run_loop(
                 f"[J9]   strike_W={_fmt_v3(cand.strike_W)} strike_A={_fmt_v3(cand.strike_A)} "
                 f"v_W desired={_fmt_v3(cand.desired_v_W)} achieved={_fmt_v3(cand.achieved_v_W)}"
             )
+            hard = traj_diag["fr3_worst_hard"]
+            soft = traj_diag["fr3_worst_soft"]
             print(
                 f"[J9]   q_to_strike={q_delta:.1f}deg@q{q_joint} "
                 f"bottleneck q{peak_idx+1}: cmd={math.degrees(peak[peak_idx]):.1f}deg/s"
+            )
+            print(
+                f"[J9]   path_A start={_fmt_v3(traj_diag['sweet_start_A'])} "
+                f"strike={_fmt_v3(traj_diag['sweet_strike_A'])} stop={_fmt_v3(traj_diag['sweet_stop_A'])} "
+                f"dx={100*traj_diag['sweet_dx_pre_m']:+.1f}->{100*traj_diag['sweet_dx_after_m']:+.1f}cm "
+                f"fr3_hard={100*hard['ratio']:.0f}%@q{hard['joint']} "
+                f"soft={100*soft['ratio']:.0f}%@q{soft['joint']}"
             )
             print("=" * 64 + "\n")
             result = _run_impact_strike(
                 r, chain, cand, offset_link7, R_W_A,
                 publish_hz=200.0,
                 full_segment_logs=full_segment_logs,
+                trace=trace,
             )
             if _safety_tripped(r):
                 print("[J9] safety torque after impact; recovering slowly")
@@ -860,6 +1060,8 @@ def main() -> None:
     ap.add_argument("--home-s", type=float, default=3.0)
     ap.add_argument("--home-hold-s", type=float, default=1.0)
     ap.add_argument("--home-vel-frac", type=float, default=J6_HOME_VEL_FRAC)
+    ap.add_argument("--home-joints-deg", nargs=7, type=float, default=None,
+                    help="Override the imported J7 home/ready pose with seven joint angles in degrees.")
     ap.add_argument("--ready-pose", choices=["home", "strike-center"], default="home")
     ap.add_argument("--ready-arm-x", type=float, default=0.28)
     ap.add_argument("--ready-arm-y", type=float, default=0.0)
@@ -977,19 +1179,28 @@ def main() -> None:
         print("[J9] --print-cal-only: done.")
         return
 
+    q_ready_seed = Q_HOME_RAD.copy()
+    if args.home_joints_deg is not None:
+        q_ready_seed = np.radians(np.asarray(args.home_joints_deg, dtype=float))
+        q_delta, q_joint = _max_abs_deg_with_joint(q_ready_seed - Q_HOME_RAD)
+        print(
+            f"[J9] custom home pose: {_fmt_q(q_ready_seed)} "
+            f"(delta imported home {q_delta:.1f}deg@q{q_joint})"
+        )
+
     R_A_link7_home = None
     if not args.no_fixed_paddle_ori:
-        R_home_nominal = _link7_R_A(chain, Q_HOME_RAD)
+        R_home_nominal = _link7_R_A(chain, q_ready_seed)
         R_A_link7_home = _rot_y_rad(math.radians(-args.paddle_open_deg)) @ R_home_nominal
         face_A = R_A_link7_home @ (offset_link7 / max(np.linalg.norm(offset_link7), 1e-9))
-        print("[J9] fixed paddle orientation from nominal Q_HOME")
+        print("[J9] fixed paddle orientation from ready/home pose")
         print(
             f"[J9]   paddle_open={args.paddle_open_deg:+.1f}deg "
             f"strike-face normal_A=[{face_A[0]:+.3f},{face_A[1]:+.3f},{face_A[2]:+.3f}]"
         )
 
     ready_arm_A = None
-    q_ready = Q_HOME_RAD.copy()
+    q_ready = q_ready_seed.copy()
     if args.ready_pose == "strike-center":
         ready_arm_A = np.array([args.ready_arm_x, args.ready_arm_y, args.ready_arm_z], dtype=float)
         q_candidate, ready_err, ready_ori = ik_solve(
@@ -1006,7 +1217,7 @@ def main() -> None:
         else:
             print(
                 f"[J9] WARNING: strike-center ready IK failed pos={ready_err*1000:.1f}mm "
-                f"ori={ready_ori:.1f}deg; using old Q_HOME_RAD"
+                f"ori={ready_ori:.1f}deg; using home pose"
             )
             ready_arm_A = None
 
