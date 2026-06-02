@@ -876,6 +876,12 @@ def run_loop(
     ready_arm_A: np.ndarray | None,
     trace: _TraceLogger | None,
     ball_key: str | None,
+    base_goal_key: str,
+    base_ready_pose: tuple[float, float, float] | None,
+    base_y_min: float,
+    base_y_max: float,
+    base_thrust_m: float,
+    hold_base_after_lost_s: float,
 ) -> None:
     dt = 1.0 / max(1.0, rate_hz)
     using_mock = mock_intercepts is not None and len(mock_intercepts) > 0
@@ -894,6 +900,10 @@ def run_loop(
     vel_cap = np.maximum(xml_vel_limits * max(0.05, swing_vel_frac), 1e-6)
     tick_i = 0
     max_goal_gap_s = max(0.03, 2.5 * dt)
+    last_base_good_t = float("-inf")
+    base_at_ready = base_ready_pose is None
+    if base_ready_pose is not None:
+        r.set(base_goal_key, json.dumps(list(base_ready_pose)))
 
     def tr(event: str, **fields) -> None:
         if trace is not None:
@@ -1012,6 +1022,12 @@ def run_loop(
         print(f"[J8] ready pose '{ready_label}' targets arm_A={_fmt_v3(ready_arm_A)}")
     else:
         print(f"[J8] ready pose '{ready_label}' uses imported Q_HOME_RAD")
+    if base_ready_pose is not None:
+        print(
+            f"[J8] base tracking ON: ready=({base_ready_pose[0]:+.3f},{base_ready_pose[1]:+.3f},"
+            f"{math.degrees(base_ready_pose[2]):+.1f}°) "
+            f"y∈[{base_y_min:.2f},{base_y_max:.2f}] thrust={base_thrust_m:.2f}m"
+        )
     print()
 
     while True:
@@ -1084,6 +1100,10 @@ def run_loop(
             home_err = _home_error_deg(r, q_home_rad)
             tr("no_intercept_idle", tick=tick_i, home_err_deg=home_err, q_cur_deg=np.degrees(q_cur), raw_ball=raw_ball_parsed)
             publish_limited_goal(q_home_rad, q_cur, "idle_ready")
+            if base_ready_pose is not None and not base_at_ready:
+                if time.monotonic() - last_base_good_t > hold_base_after_lost_s:
+                    r.set(base_goal_key, json.dumps(list(base_ready_pose)))
+                    base_at_ready = True
             time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
             continue
 
@@ -1238,6 +1258,10 @@ def run_loop(
             )
             active_cand = None
             publish_limited_goal(q_home_rad, q_cur, "reject_ready")
+            if base_ready_pose is not None and not base_at_ready:
+                if time.monotonic() - last_base_good_t > hold_base_after_lost_s:
+                    r.set(base_goal_key, json.dumps(list(base_ready_pose)))
+                    base_at_ready = True
             time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
             continue
 
@@ -1320,11 +1344,30 @@ def run_loop(
             )
             print("=" * 64 + "\n")
 
+            if base_ready_pose is not None and base_thrust_m > 0.0:
+                arm_fwd_W = R_W_A[:, 0]
+                arm_fwd_xy = arm_fwd_W[:2]
+                arm_fwd_len = float(np.linalg.norm(arm_fwd_xy))
+                if arm_fwd_len > 1e-6:
+                    arm_fwd_xy = arm_fwd_xy / arm_fwd_len
+                thrust_x = float(t_W_A[0] + arm_fwd_xy[0] * base_thrust_m)
+                thrust_y = float(t_W_A[1] + arm_fwd_xy[1] * base_thrust_m)
+                base_yaw_now = math.atan2(float(R_W_A[1, 0]), float(R_W_A[0, 0]))
+                r.set(base_goal_key, json.dumps([thrust_x, thrust_y, base_yaw_now]))
+                base_at_ready = False
+                print(
+                    f"[J8 base] THRUST +{base_thrust_m:.1f}m → "
+                    f"({thrust_x:+.3f},{thrust_y:+.3f},{math.degrees(base_yaw_now):+.1f}°)"
+                )
+
             result = _run_through_strike(
                 r, cand_use,
                 publish_hz=200.0,
                 full_segment_logs=full_segment_logs,
             )
+            if base_ready_pose is not None:
+                r.set(base_goal_key, json.dumps(list(base_ready_pose)))
+                base_at_ready = True
             if _safety_tripped(r):
                 print("[J8] safety torque after through-strike; recovering slowly")
             q_post = get_vec(r, SENSOR_JOINTS, 7)
@@ -1359,6 +1402,12 @@ def run_loop(
             target = cand_use.q_pre
             target_mode = "pre"
         publish_limited_goal(target, q_cur, target_mode)
+
+        if base_ready_pose is not None:
+            y_base = float(np.clip(cand_use.strike_W[1], base_y_min, base_y_max))
+            r.set(base_goal_key, json.dumps([float(base_ready_pose[0]), y_base, float(base_ready_pose[2])]))
+            last_base_good_t = time.monotonic()
+            base_at_ready = False
 
         if aged_tti < -lock_release_after_impact_s:
             tr("missed_window", tick=tick_i, aged_tti_s=aged_tti, active_candidate=_candidate_snapshot(active_cand))
@@ -1478,6 +1527,23 @@ def main() -> None:
     ap.add_argument("--tracker-max-implied-speed-mps", type=float, default=None)
     ap.add_argument("--tracker-stale-position-eps-m", type=float, default=None)
     ap.add_argument("--tracker-stale-timeout-s", type=float, default=None)
+
+    ap.add_argument("--base-ready-x", type=float, default=None,
+                    help="World X of the base ready pose. If set, enables base lateral tracking and strike thrust.")
+    ap.add_argument("--base-ready-y", type=float, default=0.0,
+                    help="World Y of the base ready pose.")
+    ap.add_argument("--base-ready-yaw-deg", type=float, default=0.0,
+                    help="World yaw (deg) of the base ready pose.")
+    ap.add_argument("--base-y-min", type=float, default=-1.5,
+                    help="Min world Y the base may reach when tracking the ball laterally.")
+    ap.add_argument("--base-y-max", type=float, default=1.5,
+                    help="Max world Y the base may reach when tracking the ball laterally.")
+    ap.add_argument("--base-thrust-m", type=float, default=1.0,
+                    help="Drive base forward this many meters at strike commit to add impact velocity (0 = off).")
+    ap.add_argument("--base-goal-key", type=str, default="sports_bot::cmd::base::goal_pose",
+                    help="Redis key for world-frame base goal [x, y, theta]. Must be read by base_bridge.py.")
+    ap.add_argument("--hold-base-after-lost-s", type=float, default=0.6,
+                    help="Hold last base goal this many seconds after the ball is lost before returning to ready.")
 
     args = ap.parse_args()
     run_stamp = time.strftime('%Y%m%d_%H%M%S')
@@ -1630,6 +1696,10 @@ def main() -> None:
             print(f"[J8] reading ball from {ball_key}")
         tracker = BallTracker(r, keys, cfg)
 
+    base_ready_pose = None
+    if args.base_ready_x is not None:
+        base_ready_pose = (args.base_ready_x, args.base_ready_y, math.radians(args.base_ready_yaw_deg))
+
     try:
         run_loop(
             r=r,
@@ -1696,6 +1766,12 @@ def main() -> None:
             ready_arm_A=ready_arm_A,
             trace=trace,
             ball_key=ball_key if mock_intercepts is None else None,
+            base_goal_key=args.base_goal_key,
+            base_ready_pose=base_ready_pose,
+            base_y_min=args.base_y_min,
+            base_y_max=args.base_y_max,
+            base_thrust_m=args.base_thrust_m,
+            hold_base_after_lost_s=args.hold_base_after_lost_s,
         )
     except KeyboardInterrupt:
         if args.shutdown_hold_s > 0.0:
