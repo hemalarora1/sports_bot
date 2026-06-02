@@ -26,6 +26,7 @@ import MoCapData
 import redis 
 import signal
 import sys
+import socket
 
 is_looping = True
 def signal_handler(sig, frame):
