@@ -407,6 +407,7 @@ def _return_home_blocking(
     hold_s: float = 0.35,
     publish_hz: float = 100.0,
     full_segment_logs: bool = True,
+    trace_cb=None,
 ) -> bool:
     """Actively return to home; soft one-tick nudges are not enough between throws."""
     q_start = get_vec(r, SENSOR_JOINTS, 7)
