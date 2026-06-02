@@ -99,24 +99,24 @@ def _build_j10_parser() -> argparse.ArgumentParser:
 
 
 def _patch_j9_tracker_defaults(j9, *, min_incoming_speed: float):
-    """J10-only BallTrackerConfig override without editing J9 source."""
+    """J10-only FoamBallConfig override without editing J9 source."""
     from dataclasses import dataclass
 
-    from sports_bot.state_machine.config import BallTrackerConfig as _BaseCfg
+    from sports_bot.foam_ball.config import FoamBallConfig as _BaseCfg
 
     incoming_speed = min_incoming_speed
 
     @dataclass
-    class _J10BallTrackerConfig(_BaseCfg):
+    class _J10FoamBallConfig(_BaseCfg):
         min_incoming_speed: float = incoming_speed
 
-    orig = j9.BallTrackerConfig
-    j9.BallTrackerConfig = _J10BallTrackerConfig
+    orig = j9.FoamBallConfig
+    j9.FoamBallConfig = _J10FoamBallConfig
     return orig
 
 
 def _restore_j9_tracker_defaults(j9, orig) -> None:
-    j9.BallTrackerConfig = orig
+    j9.FoamBallConfig = orig
 
 
 def main() -> None:
