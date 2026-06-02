@@ -102,7 +102,7 @@ from stepj8_through_strike_planner import (  # noqa: E402
     _jsonable,
     _minimum_feasible_strike_time,
     _parse_raw_json,
-    _tracker_snapshot,
+    _tracker_snapshot as _base_tracker_snapshot,
     _trajectory_peak_profile,
 )
 from sports_bot.state_machine.ball_tracker import Intercept  # noqa: E402
@@ -115,6 +115,14 @@ from sports_bot.utils.frames import (  # noqa: E402
     load_arm_base_offset_calibration,
     read_rigid_body_pose_W,
 )
+
+
+# Fitted from clean new_ball recordings on 2026-06-02 at strike_plane_x=-0.30.
+# The mild gravity boost plus mild drag matched early and commit-window Z best.
+J9_TRACKER_GRAVITY_MPS2 = 11.0
+J9_TRACKER_DRAG_COEFFICIENT = 0.10
+J9_TRACKER_SIMULATION_DT_S = 0.001
+J9_TRACKER_MIN_HISTORY = 4
 
 
 @dataclass
@@ -140,6 +148,38 @@ class ImpactCandidate:
 
     def aged_tti(self) -> float:
         return self.tti_s - (time.monotonic() - self.observed_t)
+
+
+def _tracker_config_snapshot(tracker: FoamBallTracker | None) -> dict:
+    if tracker is None:
+        return {}
+    cfg = getattr(tracker, "_cfg", None)
+    if cfg is None:
+        return {}
+    return {
+        "model": "foam_drag",
+        "gravity": getattr(cfg, "gravity", None),
+        "drag_coefficient": getattr(cfg, "drag_coefficient", None),
+        "simulation_dt": getattr(cfg, "simulation_dt", None),
+        "history_size": getattr(cfg, "history_size", None),
+        "history_max_age_s": getattr(cfg, "history_max_age_s", None),
+        "min_history_for_prediction": getattr(cfg, "min_history_for_prediction", None),
+        "median_filter_window": getattr(cfg, "median_filter_window", None),
+        "min_lookahead": getattr(cfg, "min_lookahead", None),
+        "max_lookahead": getattr(cfg, "max_lookahead", None),
+        "min_incoming_speed": getattr(cfg, "min_incoming_speed", None),
+        "max_implied_speed_mps": getattr(cfg, "max_implied_speed_mps", None),
+        "max_bounces": getattr(cfg, "max_bounces", None),
+        "stale_position_epsilon_m": getattr(cfg, "stale_position_epsilon_m", None),
+        "stale_position_timeout_s": getattr(cfg, "stale_position_timeout_s", None),
+    }
+
+
+def _tracker_snapshot(tracker: FoamBallTracker | None) -> dict:
+    snap = _base_tracker_snapshot(tracker)
+    if tracker is not None:
+        snap["config"] = _tracker_config_snapshot(tracker)
+    return snap
 
 
 def _candidate_snapshot(cand: ImpactCandidate | None) -> dict | None:
@@ -1098,9 +1138,15 @@ def main() -> None:
 
     ap.add_argument("--min-lookahead", type=float, default=None)
     ap.add_argument("--max-lookahead", type=float, default=None)
+    ap.add_argument("--tracker-gravity", type=float, default=J9_TRACKER_GRAVITY_MPS2,
+                    help="Foam-ball prediction gravity; tuned hybrid default from clean J9 recordings.")
+    ap.add_argument("--tracker-drag-coefficient", type=float, default=J9_TRACKER_DRAG_COEFFICIENT,
+                    help="Foam-ball drag coefficient k in dv/dt = -k*|v|*v.")
+    ap.add_argument("--tracker-simulation-dt", type=float, default=J9_TRACKER_SIMULATION_DT_S,
+                    help="Drag propagator integration dt in seconds.")
     ap.add_argument("--tracker-history-size", type=int, default=None)
     ap.add_argument("--tracker-history-max-age-s", type=float, default=None)
-    ap.add_argument("--tracker-min-history", type=int, default=None)
+    ap.add_argument("--tracker-min-history", type=int, default=J9_TRACKER_MIN_HISTORY)
     ap.add_argument("--tracker-median-window", type=int, default=None)
     ap.add_argument("--tracker-max-implied-speed-mps", type=float, default=None)
     ap.add_argument("--tracker-stale-position-eps-m", type=float, default=None)
@@ -1223,6 +1269,18 @@ def main() -> None:
     ball_key = None
     if mock_intercepts is None:
         cfg = FoamBallConfig()
+        if args.tracker_gravity is not None:
+            if args.tracker_gravity <= 0.0:
+                raise ValueError("--tracker-gravity must be positive")
+            cfg.gravity = args.tracker_gravity
+        if args.tracker_drag_coefficient is not None:
+            if args.tracker_drag_coefficient < 0.0:
+                raise ValueError("--tracker-drag-coefficient must be non-negative")
+            cfg.drag_coefficient = args.tracker_drag_coefficient
+        if args.tracker_simulation_dt is not None:
+            if args.tracker_simulation_dt <= 0.0:
+                raise ValueError("--tracker-simulation-dt must be positive")
+            cfg.simulation_dt = args.tracker_simulation_dt
         if args.min_lookahead is not None:
             cfg.min_lookahead = args.min_lookahead
         if args.max_lookahead is not None:
@@ -1242,7 +1300,9 @@ def main() -> None:
         if args.tracker_stale_timeout_s is not None:
             cfg.stale_position_timeout_s = args.tracker_stale_timeout_s
         print(
-            f"[J9 tracker] hist={cfg.history_size}/{cfg.history_max_age_s:.2f}s "
+            f"[J9 tracker] model=foam_drag gravity={cfg.gravity:.2f}m/s^2 "
+            f"drag_k={cfg.drag_coefficient:.3f} sim_dt={cfg.simulation_dt:.4f}s "
+            f"hist={cfg.history_size}/{cfg.history_max_age_s:.2f}s "
             f"min_hist={cfg.min_history_for_prediction} median={cfg.median_filter_window} "
             f"lookahead=[{cfg.min_lookahead:.2f},{cfg.max_lookahead:.2f}]s"
         )
@@ -1254,6 +1314,13 @@ def main() -> None:
         else:
             print(f"[J9] reading ball from {ball_key}")
         tracker = FoamBallTracker(r, keys, cfg)
+        if trace is not None:
+            trace.write(
+                "tracker_config",
+                ball_key=ball_key,
+                ball_rigid_body_id=args.ball_rigid_body_id,
+                tracker_config=_tracker_config_snapshot(tracker),
+            )
 
     try:
         run_loop(
