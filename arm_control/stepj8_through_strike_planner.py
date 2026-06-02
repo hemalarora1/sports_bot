@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Step J8: Through-strike pickleball planner.
+Step J8: Through-strike pickleball planner with mobile base coordination.
 
+Arm strike
+----------
 J8 keeps the robust J7 plumbing (OptiTrack -> LS predictor, arm-base transform,
 sweet-spot IK, Redis joint controller) but removes the wind-up-then-flick state
 machine.  A valid throw is handled as one timed waypoint problem:
@@ -12,6 +14,32 @@ Before the hard commit, predictions may keep improving.  The planner retargets
 only when the new strike point is close enough and the full timing budget stays
 feasible.  At hard commit, the impact waypoint freezes and the arm executes a
 cubic Hermite trajectory that passes through q_strike with nonzero velocity.
+
+Mobile base coordination (pass --base-ready-x to enable)
+---------------------------------------------------------
+1. Lateral tracking (pre-commit): while the arm is planning its swing, the base
+   is continuously commanded to align its Y position with the predicted ball
+   intercept Y (clamped to --base-y-min / --base-y-max).  X and yaw stay fixed
+   at the ready pose.  When the ball is lost, the base returns to ready after
+   --hold-base-after-lost-s seconds.
+
+2. Forward thrust (at commit): the moment J8 commits to a swing, the base is
+   commanded forward --base-thrust-m metres (default 0.5 m) along the arm's
+   world-frame +X axis.  This fires concurrently with the arm strike, so the
+   base is accelerating while the arm swings, adding forward momentum to the
+   hit.  After the strike completes the base is commanded back to ready.
+
+3. Live IK correction during the strike (100 Hz): because the base is moving
+   while the arm swings, the arm's joint trajectory is updated at 100 Hz using
+   live OptiTrack base pose data.  Each correction re-solves IK for the fixed
+   world-frame ball target in the current arm frame, so the arm tracks the ball
+   even as the base moves.  Joint velocity limits are not affected by base
+   translation (limits are angular, not world-frame linear).
+
+Prereqs (in addition to the normal J8 stack):
+   - base_bridge.py running (forwards sports_bot::cmd::base::goal_pose to the
+     TidyBot driver in its odometry frame).
+   - OptiTrack streaming both the ball and the cart rigid bodies.
 """
 from __future__ import annotations
 
@@ -426,14 +454,26 @@ def _run_through_strike(
     *,
     publish_hz: float,
     full_segment_logs: bool,
+    chain=None,
+    offset_link7: np.ndarray | None = None,
+    R_A_link7_home: np.ndarray | None = None,
+    w_ori: float = 0.0,
+    ik_tol_m: float = 0.005,
+    cal=None,
+    base_correction_hz: float = 100.0,
 ) -> dict:
+    live_correction = (
+        cal is not None and chain is not None and offset_link7 is not None
+    )
     q_start = get_vec(r, SENSOR_JOINTS, 7)
     if q_start is None:
         q_start = cand.q_pre.copy()
+    q_strike_live = cand.q_strike.copy()
     follow_s = max(0.05, cand.follow_duration_s)
     total_s = cand.strike_time_s + follow_s
     period_s = 1.0 / max(1.0, publish_hz)
     sample_period_s = 0.01
+    base_ik_period = 1.0 / max(1.0, base_correction_hz)
     qdot_peak = np.zeros(7)
     qdot_cmd_peak = np.zeros(7)
     strike_err_deg = float("nan")
@@ -443,12 +483,14 @@ def _run_through_strike(
     prev_t = None
     next_publish = time.perf_counter()
     next_sample = next_publish
+    next_base_ik = next_publish
     t0 = time.perf_counter()
     zeros = np.zeros(7)
 
     print(
         f"[J8 through] start: strike_s={cand.strike_time_s:.3f}s "
         f"follow_s={follow_s:.3f}s q6_follow={cand.q6_follow_deg:+.1f}°"
+        + (" [live base correction ON]" if live_correction else "")
     )
     if full_segment_logs:
         print("[J8 through] q_start:  " + _fmt_q(q_start))
@@ -458,11 +500,28 @@ def _run_through_strike(
     while True:
         now = time.perf_counter()
         elapsed = now - t0
+
+        # Re-solve strike IK against the current base position so the arm
+        # tracks the fixed world-frame ball target even as the base moves.
+        # Only during the approach (before impact); freeze after contact.
+        if live_correction and now >= next_base_ik and elapsed < cand.strike_time_s:
+            T_W_B = read_rigid_body_pose_W(r, cal.base_rigid_body_id)
+            if T_W_B is not None:
+                R_W_A_live, t_W_A_live = compute_T_W_A_from_base_offset(T_W_B, cal)
+                t_A_strike_live = R_W_A_live.T @ (cand.strike_W - t_W_A_live)
+                q_new, err, _ = ik_solve(
+                    chain, t_A_strike_live, q_strike_live, offset_link7,
+                    R_A_link7_target=R_A_link7_home, w_ori=w_ori,
+                )
+                if _joints_ok(q_new) and err < ik_tol_m * 2.0:
+                    q_strike_live = q_new
+            next_base_ik = now + base_ik_period
+
         if elapsed <= cand.strike_time_s:
-            q_goal, qdot_goal = _hermite(q_start, zeros, cand.q_strike, cand.v_strike,
+            q_goal, qdot_goal = _hermite(q_start, zeros, q_strike_live, cand.v_strike,
                                          elapsed, cand.strike_time_s)
         else:
-            q_goal, qdot_goal = _hermite(cand.q_strike, cand.v_strike, cand.q_follow, zeros,
+            q_goal, qdot_goal = _hermite(q_strike_live, cand.v_strike, cand.q_follow, zeros,
                                          elapsed - cand.strike_time_s, follow_s)
         qdot_cmd_peak = np.maximum(qdot_cmd_peak, np.abs(np.degrees(qdot_goal)))
 
@@ -1364,6 +1423,12 @@ def run_loop(
                 r, cand_use,
                 publish_hz=200.0,
                 full_segment_logs=full_segment_logs,
+                chain=chain,
+                offset_link7=offset_link7,
+                R_A_link7_home=R_A_link7_home,
+                w_ori=w_ori,
+                ik_tol_m=ik_tol_m,
+                cal=cal if not mock_identity_base else None,
             )
             if base_ready_pose is not None:
                 r.set(base_goal_key, json.dumps(list(base_ready_pose)))
@@ -1538,7 +1603,7 @@ def main() -> None:
                     help="Min world Y the base may reach when tracking the ball laterally.")
     ap.add_argument("--base-y-max", type=float, default=1.5,
                     help="Max world Y the base may reach when tracking the ball laterally.")
-    ap.add_argument("--base-thrust-m", type=float, default=1.0,
+    ap.add_argument("--base-thrust-m", type=float, default=0.5,
                     help="Drive base forward this many meters at strike commit to add impact velocity (0 = off).")
     ap.add_argument("--base-goal-key", type=str, default="sports_bot::cmd::base::goal_pose",
                     help="Redis key for world-frame base goal [x, y, theta]. Must be read by base_bridge.py.")
