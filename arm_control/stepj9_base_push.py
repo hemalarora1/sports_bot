@@ -33,6 +33,21 @@ import time
 import numpy as np
 import redis
 
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_OPENSAI_DIR = os.path.dirname(os.path.dirname(_THIS_DIR))
+for _path in (_THIS_DIR, _OPENSAI_DIR):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+from sports_bot.utils.frames import (  # noqa: E402
+    arm_base_offset_calibration_path,
+    load_arm_base_offset_calibration,
+    load_robot_marker_calibration,
+    read_rigid_body_pose_W,
+    robot_marker_calibration_path,
+    se2_compose,
+)
+
 FSM_BASE_GOAL = "sports_bot::cmd::base::goal_pose"
 
 
@@ -51,6 +66,19 @@ def _parse_flag_int(argv: list[str], flag: str, default: int) -> int:
             except ValueError:
                 return default
     return default
+
+
+def _se3_to_se2_xy_yaw(R: np.ndarray, t: np.ndarray) -> tuple[float, float, float]:
+    return float(t[0]), float(t[1]), float(math.atan2(R[1, 0], R[0, 0]))
+
+
+def _read_cart_control_pose_W(r: redis.Redis, cart_rb_id: int, T_B_C) -> tuple[float, float, float] | None:
+    """Cart odometry control point T_W_C = T_W_B ⊕ T_B_C (same frame as base goals)."""
+    T_W_B = read_rigid_body_pose_W(r, cart_rb_id)
+    if T_W_B is None:
+        return None
+    R, t = T_W_B
+    return se2_compose(_se3_to_se2_xy_yaw(R, t), T_B_C)
 
 
 def _parse_flag_float(argv: list[str], flag: str, default: float) -> float:
@@ -190,7 +218,11 @@ def _build_j9_parser() -> argparse.ArgumentParser:
     ap.add_argument("--ready-base-y", type=float, default=0.0,
                     help="World-frame base Y while waiting (m).")
     ap.add_argument("--ready-base-yaw-deg", type=float, default=0.0,
-                    help="Base yaw at ready (deg).")
+                    help="Base yaw at ready (deg); ignored with --ready-from-cart.")
+    ap.add_argument("--ready-from-cart", dest="ready_from_cart", action="store_true", default=True,
+                    help="Set ready pose from current cart OptiTrack pose at startup (default).")
+    ap.add_argument("--no-ready-from-cart", dest="ready_from_cart", action="store_false",
+                    help="Use --ready-base-x/y/yaw-deg literally (may lurch if not where cart is).")
     ap.add_argument("--base-x-min", type=float, default=-0.30,
                     help="Min world X for base goals (m).")
     ap.add_argument("--base-x-max", type=float, default=0.30,
@@ -242,6 +274,22 @@ def main() -> None:
             r.ping()
         except redis.exceptions.ConnectionError as e:
             sys.exit(f"[J9] cannot reach Redis: {e}")
+
+        if j9_args.ready_from_cart:
+            arm_cal = load_arm_base_offset_calibration(arm_base_offset_calibration_path())
+            T_B_C = load_robot_marker_calibration(robot_marker_calibration_path())
+            cart_pose = _read_cart_control_pose_W(r, arm_cal.base_rigid_body_id, T_B_C)
+            if cart_pose is None:
+                sys.exit(
+                    f"[J9] --ready-from-cart: cart rigid body {arm_cal.base_rigid_body_id} "
+                    f"not visible in OptiTrack. Start the streamer or pass --no-ready-from-cart "
+                    f"with explicit --ready-base-x/y."
+                )
+            ready_pose = cart_pose
+            print(
+                f"[J9] ready from cart rb={arm_cal.base_rigid_body_id}: "
+                f"({ready_pose[0]:+.3f}, {ready_pose[1]:+.3f}, {math.degrees(ready_pose[2]):+.1f}°)"
+            )
 
         base = BasePusher(
             r,
