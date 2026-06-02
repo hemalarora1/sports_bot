@@ -23,7 +23,6 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Callable
 
 import numpy as np
 import redis
@@ -103,11 +102,12 @@ from stepj8_through_strike_planner import (  # noqa: E402
     _jsonable,
     _minimum_feasible_strike_time,
     _parse_raw_json,
-    _tracker_snapshot,
+    _tracker_snapshot as _base_tracker_snapshot,
     _trajectory_peak_profile,
 )
-from sports_bot.state_machine.ball_tracker import BallTracker, Intercept  # noqa: E402
-from sports_bot.state_machine.config import BallTrackerConfig  # noqa: E402
+from sports_bot.state_machine.ball_tracker import Intercept  # noqa: E402
+from sports_bot.foam_ball import FoamBallTracker  # noqa: E402
+from sports_bot.foam_ball.config import FoamBallConfig  # noqa: E402
 from sports_bot.state_machine.redis_keys import RedisKeys  # noqa: E402
 from sports_bot.utils.frames import (  # noqa: E402
     arm_base_offset_calibration_path,
@@ -115,6 +115,14 @@ from sports_bot.utils.frames import (  # noqa: E402
     load_arm_base_offset_calibration,
     read_rigid_body_pose_W,
 )
+
+
+# Fitted from clean new_ball recordings on 2026-06-02 at strike_plane_x=-0.30.
+# The mild gravity boost plus mild drag matched early and commit-window Z best.
+J9_TRACKER_GRAVITY_MPS2 = 11.0
+J9_TRACKER_DRAG_COEFFICIENT = 0.10
+J9_TRACKER_SIMULATION_DT_S = 0.001
+J9_TRACKER_MIN_HISTORY = 4
 
 
 @dataclass
@@ -140,6 +148,38 @@ class ImpactCandidate:
 
     def aged_tti(self) -> float:
         return self.tti_s - (time.monotonic() - self.observed_t)
+
+
+def _tracker_config_snapshot(tracker: FoamBallTracker | None) -> dict:
+    if tracker is None:
+        return {}
+    cfg = getattr(tracker, "_cfg", None)
+    if cfg is None:
+        return {}
+    return {
+        "model": "foam_drag",
+        "gravity": getattr(cfg, "gravity", None),
+        "drag_coefficient": getattr(cfg, "drag_coefficient", None),
+        "simulation_dt": getattr(cfg, "simulation_dt", None),
+        "history_size": getattr(cfg, "history_size", None),
+        "history_max_age_s": getattr(cfg, "history_max_age_s", None),
+        "min_history_for_prediction": getattr(cfg, "min_history_for_prediction", None),
+        "median_filter_window": getattr(cfg, "median_filter_window", None),
+        "min_lookahead": getattr(cfg, "min_lookahead", None),
+        "max_lookahead": getattr(cfg, "max_lookahead", None),
+        "min_incoming_speed": getattr(cfg, "min_incoming_speed", None),
+        "max_implied_speed_mps": getattr(cfg, "max_implied_speed_mps", None),
+        "max_bounces": getattr(cfg, "max_bounces", None),
+        "stale_position_epsilon_m": getattr(cfg, "stale_position_epsilon_m", None),
+        "stale_position_timeout_s": getattr(cfg, "stale_position_timeout_s", None),
+    }
+
+
+def _tracker_snapshot(tracker: FoamBallTracker | None) -> dict:
+    snap = _base_tracker_snapshot(tracker)
+    if tracker is not None:
+        snap["config"] = _tracker_config_snapshot(tracker)
+    return snap
 
 
 def _candidate_snapshot(cand: ImpactCandidate | None) -> dict | None:
@@ -596,7 +636,7 @@ def run_loop(
     *,
     r: redis.Redis,
     chain,
-    tracker: BallTracker | None,
+    tracker: FoamBallTracker | None,
     q_home_rad: np.ndarray,
     offset_link7: np.ndarray,
     R_A_link7_home: np.ndarray | None,
@@ -647,18 +687,8 @@ def run_loop(
     xml_vel_limits: np.ndarray,
     trace: _TraceLogger | None,
     ball_key: str | None,
-    loop_hook: Callable[[dict], None] | None = None,
 ) -> None:
     dt = 1.0 / max(1.0, rate_hz)
-    hook_state: dict = {}
-
-    def end_tick(**fields) -> None:
-        if loop_hook is not None:
-            hook_state.clear()
-            hook_state.update(fields)
-            loop_hook(hook_state)
-        time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
-
     using_mock = mock_intercepts is not None and len(mock_intercepts) > 0
     mock_t0 = time.monotonic()
     vel_cap = np.maximum(xml_vel_limits * max(0.05, swing_vel_frac), 1e-6)
@@ -818,20 +848,20 @@ def run_loop(
             T_W_B = read_rigid_body_pose_W(r, cal.base_rigid_body_id)
             if T_W_B is None:
                 print_reject(f"cart rigid body {cal.base_rigid_body_id} not visible")
-                end_tick(mode="idle", intercept=None, active_cand=active_cand)
+                time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
                 continue
             R_W_A, t_W_A = compute_T_W_A_from_base_offset(T_W_B, cal)
 
         q_cur = get_vec(r, SENSOR_JOINTS, 7)
         if q_cur is None:
             print_reject("no joint sensor")
-            end_tick(mode="idle", intercept=intercept, active_cand=active_cand)
+            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
             continue
 
         if time.monotonic() < idle_until_t:
             publish_limited_goal(q_home_rad, q_cur, "post_impact_ready")
             tr("post_impact_idle", tick=tick_i, idle_until_t=idle_until_t, q_cur_deg=np.degrees(q_cur))
-            end_tick(mode="post_impact", intercept=intercept, active_cand=active_cand)
+            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
             continue
 
         if intercept is None:
@@ -839,7 +869,7 @@ def run_loop(
             tr("no_intercept_idle", tick=tick_i, home_err_deg=_home_error_deg(r, q_home_rad), q_cur_deg=np.degrees(q_cur))
             publish_limited_goal(q_home_rad, q_cur, "idle_ready")
             active_cand = None
-            end_tick(mode="idle", intercept=None, active_cand=None)
+            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
             continue
 
         q_seed = active_cand.q_strike if active_cand is not None else q_cur
@@ -880,7 +910,7 @@ def run_loop(
         if cand is None:
             print_reject(cand_reason)
             publish_limited_goal(q_home_rad, q_cur, "reject_ready")
-            end_tick(mode="reject", intercept=intercept, active_cand=active_cand)
+            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
             continue
 
         active_cand = cand
@@ -1018,7 +1048,7 @@ def run_loop(
             if max_swings > 0 and swings_done >= max_swings:
                 print(f"[J9] --max-swings={max_swings} reached; exiting")
                 break
-            end_tick(mode="post_impact", intercept=intercept, active_cand=None)
+            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
             continue
 
         # High-commit J9: always aim directly at the latest strike pose. No pre-pose.
@@ -1027,7 +1057,7 @@ def run_loop(
             tr("missed_window", tick=tick_i, aged_tti_s=aged_tti, candidate=_candidate_snapshot(cand))
             active_cand = None
             idle_until_t = time.monotonic() + post_impact_idle_s
-        end_tick(mode="tracking", intercept=intercept, active_cand=cand)
+        time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
 
 
 def main() -> None:
@@ -1035,7 +1065,7 @@ def main() -> None:
         description="J9: high-commit impact-velocity pickleball striker.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("--ball-rigid-body-id", type=int, default=13)
+    ap.add_argument("--ball-rigid-body-id", type=int, default=13)  # RigidBody002
     ap.add_argument("--strike-plane-x", type=float, default=-0.55)
     ap.add_argument("--mock-intercept", nargs=3, type=float, action="append")
     ap.add_argument("--mock-tti", type=float, default=0.60)
@@ -1108,12 +1138,15 @@ def main() -> None:
 
     ap.add_argument("--min-lookahead", type=float, default=None)
     ap.add_argument("--max-lookahead", type=float, default=None)
-    ap.add_argument("--tracker-gravity", type=float, default=None,
-                    help="Override BallTrackerConfig.gravity for intercept prediction. "
-                         "Use this to test effective vertical acceleration/drag correction.")
+    ap.add_argument("--tracker-gravity", type=float, default=J9_TRACKER_GRAVITY_MPS2,
+                    help="Foam-ball prediction gravity; tuned hybrid default from clean J9 recordings.")
+    ap.add_argument("--tracker-drag-coefficient", type=float, default=J9_TRACKER_DRAG_COEFFICIENT,
+                    help="Foam-ball drag coefficient k in dv/dt = -k*|v|*v.")
+    ap.add_argument("--tracker-simulation-dt", type=float, default=J9_TRACKER_SIMULATION_DT_S,
+                    help="Drag propagator integration dt in seconds.")
     ap.add_argument("--tracker-history-size", type=int, default=None)
     ap.add_argument("--tracker-history-max-age-s", type=float, default=None)
-    ap.add_argument("--tracker-min-history", type=int, default=None)
+    ap.add_argument("--tracker-min-history", type=int, default=J9_TRACKER_MIN_HISTORY)
     ap.add_argument("--tracker-median-window", type=int, default=None)
     ap.add_argument("--tracker-max-implied-speed-mps", type=float, default=None)
     ap.add_argument("--tracker-stale-position-eps-m", type=float, default=None)
@@ -1235,15 +1268,23 @@ def main() -> None:
     tracker = None
     ball_key = None
     if mock_intercepts is None:
-        cfg = BallTrackerConfig()
+        cfg = FoamBallConfig()
+        if args.tracker_gravity is not None:
+            if args.tracker_gravity <= 0.0:
+                raise ValueError("--tracker-gravity must be positive")
+            cfg.gravity = args.tracker_gravity
+        if args.tracker_drag_coefficient is not None:
+            if args.tracker_drag_coefficient < 0.0:
+                raise ValueError("--tracker-drag-coefficient must be non-negative")
+            cfg.drag_coefficient = args.tracker_drag_coefficient
+        if args.tracker_simulation_dt is not None:
+            if args.tracker_simulation_dt <= 0.0:
+                raise ValueError("--tracker-simulation-dt must be positive")
+            cfg.simulation_dt = args.tracker_simulation_dt
         if args.min_lookahead is not None:
             cfg.min_lookahead = args.min_lookahead
         if args.max_lookahead is not None:
             cfg.max_lookahead = args.max_lookahead
-        if args.tracker_gravity is not None:
-            if args.tracker_gravity <= 0.0:
-                sys.exit(f"[J9] --tracker-gravity must be positive, got {args.tracker_gravity}")
-            cfg.gravity = args.tracker_gravity
         if args.tracker_history_size is not None:
             cfg.history_size = args.tracker_history_size
         if args.tracker_history_max_age_s is not None:
@@ -1259,10 +1300,11 @@ def main() -> None:
         if args.tracker_stale_timeout_s is not None:
             cfg.stale_position_timeout_s = args.tracker_stale_timeout_s
         print(
-            f"[J9 tracker] hist={cfg.history_size}/{cfg.history_max_age_s:.2f}s "
+            f"[J9 tracker] model=foam_drag gravity={cfg.gravity:.2f}m/s^2 "
+            f"drag_k={cfg.drag_coefficient:.3f} sim_dt={cfg.simulation_dt:.4f}s "
+            f"hist={cfg.history_size}/{cfg.history_max_age_s:.2f}s "
             f"min_hist={cfg.min_history_for_prediction} median={cfg.median_filter_window} "
-            f"lookahead=[{cfg.min_lookahead:.2f},{cfg.max_lookahead:.2f}]s "
-            f"gravity={cfg.gravity:.2f}m/s^2"
+            f"lookahead=[{cfg.min_lookahead:.2f},{cfg.max_lookahead:.2f}]s"
         )
         keys = RedisKeys(ball_source="optitrack")
         keys.ball.__dict__["optitrack_rigid_body_id"] = args.ball_rigid_body_id
@@ -1271,7 +1313,14 @@ def main() -> None:
             print(f"[J9] WARNING: {ball_key} is empty")
         else:
             print(f"[J9] reading ball from {ball_key}")
-        tracker = BallTracker(r, keys, cfg)
+        tracker = FoamBallTracker(r, keys, cfg)
+        if trace is not None:
+            trace.write(
+                "tracker_config",
+                ball_key=ball_key,
+                ball_rigid_body_id=args.ball_rigid_body_id,
+                tracker_config=_tracker_config_snapshot(tracker),
+            )
 
     try:
         run_loop(
