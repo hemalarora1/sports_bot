@@ -155,9 +155,11 @@ def _patch_j9_tracker_defaults(j9: Any, *, min_incoming_speed: float) -> Any:
 
     from sports_bot.state_machine.config import BallTrackerConfig as _BaseCfg
 
+    incoming_speed = min_incoming_speed
+
     @dataclass
     class _J10BallTrackerConfig(_BaseCfg):
-        min_incoming_speed: float = min_incoming_speed
+        min_incoming_speed: float = incoming_speed
 
     orig = j9.BallTrackerConfig
     j9.BallTrackerConfig = _J10BallTrackerConfig
