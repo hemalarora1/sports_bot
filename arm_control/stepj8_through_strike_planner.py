@@ -1,5 +1,51 @@
 #!/usr/bin/env python3
 """
+python sports_bot/scripts/send_base_goal.py --robot-rigid-body-id <CART_ID> --read
+
+
+PYTHONUNBUFFERED=1 python sports_bot/arm_control/stepj8_through_strike_planner.py \
+  --skip-cal \
+  --offset-link7 0 0 0.39 \
+  --ball-rigid-body-id 13 \
+  --strike-plane-x -0.55 \
+  --ready-pose strike-center \
+  --ready-arm-x 0.28 \
+  --ready-arm-y -0.05 \
+  --ready-arm-z 0.35 \
+  --paddle-open-deg 8 \
+  --z-mode predicted \
+  --simple-fast \
+  --commit-tti 0.75 \
+  --launch-margin-s 0.06 \
+  --try-late-slack-s 0.05 \
+  --timing-guard-s 0.025 \
+  --contact-margin-s 0.0 \
+  --through-q6-deg 20 \
+  --follow-s 0.34 \
+  --swing-vel-frac 0.90 \
+  --impact-vel-frac 0.70 \
+  --return-s 5.0 \
+  --return-vel-frac 0.30 \
+  --tracking-step-deg 1.8 \
+  --tracking-accel-deg-s2 900 \
+  --world-z-min-m 0.05 \
+  --world-z-max-m 1.10 \
+  --strike-arm-z-min-m 0.15 \
+  --strike-arm-z-max-m 0.62 \
+  --strike-arm-y-abs-max-m 0.38 \
+  --tracker-min-history 4 \
+  --tracker-history-max-age-s 0.15 \
+  --tracker-median-window 3 \
+  --verbose-tracking \
+  --log-period-s 0.20 \
+  --post-impact-idle-s 0.5 \
+  --shutdown-hold-s 0 \
+  --log-file auto \
+  --base-ready-x <x_from_read> \
+  --base-ready-y <y_from_read> \
+  --base-ready-yaw-deg <yaw_from_read>
+
+
 Step J8: Through-strike pickleball planner with mobile base coordination.
 
 Arm strike
