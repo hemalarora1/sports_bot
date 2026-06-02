@@ -56,12 +56,10 @@ from stepj7_strike_planner import (  # noqa: E402
     J6_IK_TOL_M,
     J6_LOCK_RELEASE_AFTER_IMPACT_S,
     J6_MAX_ORI_ERR_DEG,
-    J6_REACH_M,
     J6_STRIKE_A_X_MAX_M,
     J6_STRIKE_A_X_MIN_M,
     J6_STRIKE_A_Y_ABS_MAX_M,
     J6_STRIKE_A_Z_MAX_M,
-    J6_STRIKE_A_Z_MIN_M,
     J6_W_ORI,
     J6_WORLD_Z_MIN_M,
     J6_XML_VEL_LIMIT_RAD_S,
@@ -1084,16 +1082,16 @@ def main() -> None:
     ap.add_argument("--ready-arm-y", type=float, default=0.0)
     ap.add_argument("--ready-arm-z", type=float, default=0.35)
 
-    ap.add_argument("--reach-m", type=float, default=J6_REACH_M)
+    ap.add_argument("--reach-m", type=float, default=0.82)
     ap.add_argument("--z-min-m", type=float, default=J6_Z_MIN_M)
     ap.add_argument("--z-max-m", type=float, default=J6_Z_MAX_M)
     ap.add_argument("--world-z-min-m", type=float, default=J6_WORLD_Z_MIN_M)
     ap.add_argument("--world-z-max-m", type=float, default=1.10)
     ap.add_argument("--strike-arm-x-min-m", type=float, default=J6_STRIKE_A_X_MIN_M)
     ap.add_argument("--strike-arm-x-max-m", type=float, default=J6_STRIKE_A_X_MAX_M)
-    ap.add_argument("--strike-arm-y-abs-max-m", type=float, default=0.38)
-    ap.add_argument("--strike-arm-z-min-m", type=float, default=J6_STRIKE_A_Z_MIN_M)
-    ap.add_argument("--strike-arm-z-max-m", type=float, default=0.62)
+    ap.add_argument("--strike-arm-y-abs-max-m", type=float, default=0.70)
+    ap.add_argument("--strike-arm-z-min-m", type=float, default=0.10)
+    ap.add_argument("--strike-arm-z-max-m", type=float, default=0.75)
     ap.add_argument("--ik-tol-mm", type=float, default=J6_IK_TOL_M * 1000.0)
     ap.add_argument("--z-mode", choices=["fixed-arm", "predicted"], default="predicted")
     ap.add_argument("--fixed-arm-z-m", type=float, default=0.45)
