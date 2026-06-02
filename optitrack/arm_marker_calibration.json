@@ -1,0 +1,15 @@
+{
+  "comment": "Marker-based arm calibration for the sports_bot rig. Arm base origin T_W_A.t is the midpoint of the two markers in marker_specs. Arm base orientation: world +Z is Franka +Z (assumes upright cart); the +Y side of the Franka base is whichever marker reads larger world Y at runtime (auto-assigned by cmd_arm_world_clean.py, so marker_specs order is informational only); Franka +X = Y x Z closes the right-handed frame. T_E_P has translation = 0 after the 2026-05-26 compliantFrame fix (OpenSai tracks the sweet spot directly via picklebot.xml compliantFrame xyz='0 0 0.35'); rotation_matrix retained as the legacy P->EE axis mapping used by world_racket_to_arm_ee (verify_arm_calibration.py, test_arm_world_track.py). cmd_arm_world_clean.py does NOT use T_E_P.",
+  "marker_specs": [
+    [6, 2],
+    [6, 1]
+  ],
+  "T_E_P": {
+    "translation_m": [0.0, 0.0, 0.0],
+    "rotation_matrix": [
+      [0.0, 0.0, 1.0],
+      [1.0, 0.0, 0.0],
+      [0.0, 1.0, 0.0]
+    ]
+  }
+}

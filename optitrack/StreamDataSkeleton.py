@@ -30,6 +30,14 @@ import redis
 import signal
 import sys
 
+# Pull in the shared frame helpers (single source of truth for quat<->R math).
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_SPORTS_BOT_DIR = os.path.dirname(_THIS_DIR)
+_OPENSAI_DIR = os.path.dirname(_SPORTS_BOT_DIR)
+if _OPENSAI_DIR not in sys.path:
+    sys.path.insert(0, _OPENSAI_DIR)
+from sports_bot.utils.frames import rotate_quat  # noqa: E402
+
 is_looping = True
 def signal_handler(sig, frame):
     is_looping = False
@@ -97,10 +105,12 @@ def _opti_to_world_position(pos):
     return (R_WORLD_OPTI @ p) + T_WORLD_OPTI
 
 def _opti_to_world_quat(rot):
-    # Motive streams quaternion as (qx, qy, qz, qw). We rotate by R_WORLD_OPTI,
-    # which is q_world = q_offset * q_optitrack. For now we publish the raw
-    # quaternion alongside the rotated one; the FSM only uses position.
-    return rot
+    # Motive streams quaternion as (qx, qy, qz, qw). Rotate it into the world
+    # frame so that the published world-frame ori key is consistent with the
+    # world-frame pos key — i.e. both describe the body's pose in W.
+    # Equivalent to building R_W_B = R_WORLD_OPTI @ R_M_B(rot) and converting
+    # back to a quaternion; see sports_bot.utils.frames.rotate_quat.
+    return rotate_quat(R_WORLD_OPTI, rot)
 
 # This is a callback function that gets connected to the NatNet client
 # and called once per mocap frame.
@@ -134,6 +144,34 @@ def receive_rigid_body_frame( new_id, position, rotation ):
                      json.dumps(world_pos.tolist()))
     redis_client.set(RIGID_BODY_ORI_KEY + str(new_id),
                      json.dumps([float(x) for x in world_rot]))
+
+
+# ---------- Per-marker (labeled) streaming ------------------------------------
+#
+# NatNet decomposes every labeled marker's 32-bit ID into (model_id, marker_id):
+# `model_id` is the asset / rigid body the marker belongs to (= the rigid body's
+# Streaming ID for asset markers, 0 for standalone), and `marker_id` is the
+# per-asset marker index assigned by Motive's Builder. Each cart marker on
+# rigid body 11 streams as (11, 1) ... (11, N).
+#
+# We publish per-marker world-frame positions so downstream consumers can pick
+# a subset of markers and derive their own auxiliary frames (e.g. the Franka
+# arm-base frame from 4 specific markers; see
+# sports_bot/utils/frames.py:compute_T_W_A_from_markers).
+
+MARKER_POS_KEY     = "sai2::optitrack::marker_pos::"          # ::<model_id>::<marker_id>
+MARKER_RAW_POS_KEY = "sai2::optitrack::raw::marker_pos::"     # ::<model_id>::<marker_id>
+
+
+def receive_labeled_marker(model_id, marker_id, position, residual_mm):
+    # Drop the per-frame residual silently for now — useful for diagnostics
+    # later if marker swaps become a problem. Position is in OT room frame.
+    suffix = f"{model_id}::{marker_id}"
+    redis_client.set(MARKER_RAW_POS_KEY + suffix,
+                     json.dumps([float(x) for x in position]))
+    world_pos = _opti_to_world_position(position)
+    redis_client.set(MARKER_POS_KEY + suffix,
+                     json.dumps(world_pos.tolist()))
 
 def receive_skeleton_frame(new_id, skeleton):
     
@@ -278,8 +316,8 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
 
     optionsDict = {}
-    optionsDict["clientAddress"] = "172.24.68.64"
-    optionsDict["serverAddress"] = "172.24.68.48"
+    optionsDict["clientAddress"] = "172.24.69.172" 
+    optionsDict["serverAddress"] = "172.24.69.102"
     optionsDict["use_multicast"] = False
 
     # This will create a new NatNet client
@@ -294,6 +332,7 @@ if __name__ == "__main__":
     streaming_client.new_frame_listener = receive_new_frame
     streaming_client.rigid_body_listener = receive_rigid_body_frame
     streaming_client.skeleton_listener = receive_skeleton_frame
+    streaming_client.labeled_marker_listener = receive_labeled_marker
     
     # Set print level
     streaming_client.set_print_level(0)

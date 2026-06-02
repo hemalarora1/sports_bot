@@ -83,6 +83,13 @@ class NatNetClient:
         self.rigid_body_listener = None
         self.skeleton_listener = None
         self.new_frame_listener  = None
+        # Set this to a callback to receive per-labeled-marker data at each frame.
+        # Signature: callback(model_id: int, marker_id: int, pos: (x, y, z),
+        #                     residual_mm: float). `model_id` is the rigid-body
+        # asset the marker belongs to (0 for unlabeled / standalone markers);
+        # `marker_id` is the per-asset marker index. See sports_bot/optitrack/
+        # StreamDataSkeleton.py for an example consumer.
+        self.labeled_marker_listener = None
 
         # Set Application Name
         self.__application_name = "Not Set"
@@ -278,8 +285,19 @@ class NatNetClient:
                                   0)    # UDP
             result.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             result.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton(self.multicast_address) + socket.inet_aton(self.local_ip_address))
+            # Bind to INADDR_ANY rather than the local interface address. On
+            # macOS (and other BSD-derived stacks), binding a multicast-
+            # receiving socket to a specific interface IP can silently prevent
+            # delivery — the kernel sees the multicast on the interface but
+            # doesn't deliver to a socket bound to that interface's *unicast*
+            # IP. IP_ADD_MEMBERSHIP above still pins which interface joins the
+            # group, so we don't lose any selectivity. Linux is permissive
+            # either way, so this is portable. (Original NaturalPoint code
+            # bound to self.local_ip_address; that works on Windows but breaks
+            # silently on macOS — no data frames arrive even though NAT_CONNECT
+            # succeeds on the command port.)
             try:
-                result.bind( (self.local_ip_address, port) )
+                result.bind( ('', port) )
             except socket.error as msg:
                 print("ERROR: data socket error occurred:\n%s" %msg)
                 print("  Check Motive/Server mode requested mode agreement.  You requested Multicast ")
@@ -667,6 +685,9 @@ class NatNetClient:
 
                 labeled_marker = MoCapData.LabeledMarker(tmp_id,pos,size,param, residual)
                 labeled_marker_data.add_labeled_marker(labeled_marker)
+
+                if self.labeled_marker_listener is not None:
+                    self.labeled_marker_listener(model_id, marker_id, pos, residual)
 
         return offset, labeled_marker_data
 
