@@ -1,0 +1,95 @@
+# J9 fast-strike configuration — pickleball_j9_fast.xml required
+#
+# Launch with:
+#   cd ~/OpenSai
+#   ./scripts/launch.sh config_folder/xml_config_files/picklebot_j9_fast.xml
+#   PYTHONUNBUFFERED=1 python sports_bot/arm_control/stepj9_impact_velocity_planner.py \
+#       --config sports_bot/arm_control/configs/j9_strike_fast.yaml
+#
+# Any flag here can be overridden on the CLI, e.g.:
+#   ... --config j9_strike_fast.yaml --max-swings 1
+#
+# Key difference from "best hybrid": velocity saturation is OFF in the XML,
+# so the PD controller can actually track the faster trajectories.
+# vel_cap_rad_s targets ~FR3 soft-zone limits from home (~2.0-2.5 rad/s)
+# rather than the conservative XML defaults (1.0-1.8 rad/s).
+
+# --- Hardware / calibration ---
+skip_cal: true
+offset_link7: [0, 0, 0.39]        # paddle sweet spot 39 cm along link7 z-axis
+ball_rigid_body_id: 13             # RigidBody002 in Motive
+
+# --- Ready / home pose ---
+# Centroid of IK solutions from 2026-06-02 sessions at strike_plane_x=-0.30
+home_joints_deg: [1.045, -24.506, 1.236, -115.213, -2.248, 108.033, -44.010]
+ready_pose: home
+paddle_open_deg: 8                 # degrees of face tilt (opens paddle face slightly upward)
+
+# --- Ball tracker ---
+strike_plane_x: -0.30             # world-frame X of the strike plane (negative = in front of cart)
+z_mode: predicted                 # use tracker-predicted Z; alt: fixed-arm
+tracker_gravity: 11.0             # fitted from 2026-06-02 clean recordings (slight boost over 9.81)
+tracker_drag_coefficient: 0.10    # foam ball drag k in dv/dt = -k|v|v
+tracker_min_history: 4            # minimum OptiTrack frames before prediction accepted
+tracker_history_max_age_s: 0.15   # drop points older than this from fit window
+tracker_median_window: 3          # median filter window on incoming positions
+
+# --- Strike workspace box (arm frame, meters) ---
+# These define where the arm will accept a strike pose.
+world_z_min_m: 0.05               # ignore balls below this world-Z
+world_z_max_m: 1.10               # ignore balls above this world-Z
+strike_arm_x_min_m: 0.25          # arm-frame: closest acceptable strike
+strike_arm_x_max_m: 0.65          # arm-frame: farthest acceptable strike
+strike_arm_z_min_m: 0.15          # arm-frame: lowest acceptable strike
+strike_arm_z_max_m: 0.62          # arm-frame: highest acceptable strike
+strike_arm_y_abs_max_m: 0.38      # arm-frame: lateral reach in either direction
+max_ori_err_deg: 15               # max allowable IK orientation error
+
+# --- Impact velocity target ---
+# These define where the paddle should be moving at the moment of contact.
+# With vel_cap_rad_s raised and vel sat disabled, 1.5 m/s forward is achievable.
+forward_speed_mps: 1.50           # paddle forward (+X world) speed at contact  [was 0.75]
+up_speed_mps: 0.40                # paddle upward (+Z world) speed at contact   [was 0.15]
+impact_vel_frac: 1.00             # fraction of vel_cap used for qdot_strike     [was 0.70]
+qdot_damping: 0.03                # Jacobian damping (prevents joint vel spikes on near-singularities)
+
+# --- Joint velocity cap override ---
+# Overrides the XML velocity limits used by the trajectory planner.
+# Needed because picklebot_j9_fast.xml disables vel sat, so OpenSai won't
+# publish the velocity_saturation_limit Redis key and J9 would fall back to
+# conservative hardcoded defaults [1.2 1.4 1.6 1.8 1.0 1.1 1.2] rad/s.
+#
+# These targets are at ~FR3 soft-zone limit from the home pose (~2.0-2.1 rad/s
+# available; raw max ~3.0 rad/s minus 0.9 soft margin). q6 gets 2.5 to match
+# picklebot_j7.xml wrist limit that's been validated.
+#
+# If the arm is hitting FR3 safety violations (torque spikes, reflex aborts),
+# back these off toward [1.5 1.5 1.5 1.5 1.5 2.0 1.5].
+vel_cap_rad_s: [2.0, 2.0, 2.0, 2.0, 2.0, 2.5, 2.0]
+
+# --- Swing timing ---
+swing_vel_frac: 1.00              # fraction of vel_cap for pre-commit arm tracking  [was 0.85]
+decel_s: 0.20                     # duration of post-contact decel phase (s)         [was 0.18]
+commit_tti: 0.90                  # commit when time-to-impact falls below this (s)
+try_late_slack_s: 0.30            # allow late-try if only this many seconds over Tmin
+max_stretched_strike_s: 0.90     # cap on how long a stretched late-try can be
+contact_margin_s: 0.0             # time shift on strike moment (0 = hit at predicted contact)
+timing_guard_s: 0.025             # safety margin subtracted from available time
+
+# --- Return home after impact ---
+return_s: 4.0                     # time (s) to return home after each swing
+return_vel_frac: 0.35             # speed of return move as fraction of XML vel limits
+
+# --- Pre-commit arm tracking ---
+# How fast J9 moves the arm toward the predicted strike pose before commit.
+tracking_step_deg: 1.8            # max joint move per control tick (deg)
+tracking_accel_deg_s2: 1000       # joint acceleration limit for tracking (deg/s^2)
+
+# --- Logging & output ---
+verbose_tracking: true
+full_segment_logs: true
+log_period_s: 0.20
+post_impact_idle_s: 0.4           # wait this long after impact before accepting next throw
+shutdown_hold_s: 0
+log_file: auto                    # "auto" → sports_bot/logs/j9_<timestamp>.log
+trace_file: auto                  # "auto" → sports_bot/logs/j9_<timestamp>.trace.jsonl

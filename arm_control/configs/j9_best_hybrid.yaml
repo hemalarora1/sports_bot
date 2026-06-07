@@ -1,0 +1,72 @@
+# J9 best-hybrid configuration — conservative baseline (2026-06-07)
+#
+# This is the "best hybrid" command from the run log, captured as YAML
+# for easy reference and comparison with j9_strike_fast.yaml.
+# Uses picklebot.xml or picklebot_j7.xml (velocity saturation ON).
+#
+# Launch:
+#   cd ~/OpenSai
+#   ./scripts/launch.sh config_folder/xml_config_files/picklebot_j7.xml
+#   PYTHONUNBUFFERED=1 python sports_bot/arm_control/stepj9_impact_velocity_planner.py \
+#       --config sports_bot/arm_control/configs/j9_best_hybrid.yaml
+
+# --- Hardware / calibration ---
+skip_cal: true
+offset_link7: [0, 0, 0.39]
+ball_rigid_body_id: 13
+
+# --- Ready / home pose ---
+home_joints_deg: [1.045, -24.506, 1.236, -115.213, -2.248, 108.033, -44.010]
+ready_pose: home
+paddle_open_deg: 8
+
+# --- Ball tracker ---
+strike_plane_x: -0.30
+z_mode: predicted
+tracker_gravity: 11.0
+tracker_drag_coefficient: 0.10
+tracker_min_history: 4
+tracker_history_max_age_s: 0.15
+tracker_median_window: 3
+
+# --- Strike workspace box (arm frame, meters) ---
+world_z_min_m: 0.05
+world_z_max_m: 1.10
+strike_arm_x_min_m: 0.25
+strike_arm_x_max_m: 0.65
+strike_arm_z_min_m: 0.15
+strike_arm_z_max_m: 0.62
+strike_arm_y_abs_max_m: 0.38
+max_ori_err_deg: 15
+
+# --- Impact velocity target ---
+forward_speed_mps: 0.75
+up_speed_mps: 0.15
+impact_vel_frac: 0.70
+qdot_damping: 0.03
+
+# --- Swing timing ---
+swing_vel_frac: 0.85
+decel_s: 0.18
+commit_tti: 0.90
+try_late_slack_s: 0.30
+max_stretched_strike_s: 0.90
+contact_margin_s: 0.0
+timing_guard_s: 0.025
+
+# --- Return home after impact ---
+return_s: 4.0
+return_vel_frac: 0.35
+
+# --- Pre-commit arm tracking ---
+tracking_step_deg: 1.8
+tracking_accel_deg_s2: 1000
+
+# --- Logging & output ---
+verbose_tracking: true
+full_segment_logs: true
+log_period_s: 0.20
+post_impact_idle_s: 0.4
+shutdown_hold_s: 0
+log_file: auto
+trace_file: auto

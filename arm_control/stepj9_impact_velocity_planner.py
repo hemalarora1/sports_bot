@@ -763,14 +763,6 @@ def run_loop(
             diagnostic=_driver_diag_snapshot(r),
         )
 
-        def home_trace_cb(**fields) -> None:
-            tr(
-                "home_sample", tick=tick_i, label=label,
-                target_q_deg=np.degrees(q_home_rad),
-                diagnostic=_driver_diag_snapshot(r),
-                **fields,
-            )
-
         ok = _return_home_blocking(
             r, q_home_rad,
             move_s=return_s,
@@ -779,7 +771,6 @@ def run_loop(
             hold_s=0.35,
             publish_hz=100.0,
             full_segment_logs=full_segment_logs,
-            trace_cb=home_trace_cb if trace is not None else None,
         )
         active_cand = None
         last_q_cmd = get_vec(r, SENSOR_JOINTS, 7) if ok else _hold_current_joints(r)
@@ -1060,11 +1051,24 @@ def run_loop(
         time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
 
 
+def _load_config_yaml(path: str) -> dict:
+    try:
+        import yaml
+    except ImportError:
+        sys.exit("[J9] --config requires PyYAML: pip install pyyaml")
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    # YAML keys use underscores matching argparse dest names
+    return {str(k): v for k, v in data.items()}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="J9: high-commit impact-velocity pickleball striker.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    ap.add_argument("--config", default=None, metavar="YAML",
+                    help="YAML config file; sets argument defaults (CLI flags override).")
     ap.add_argument("--ball-rigid-body-id", type=int, default=13)  # RigidBody002
     ap.add_argument("--strike-plane-x", type=float, default=-0.55)
     ap.add_argument("--mock-intercept", nargs=3, type=float, action="append")
@@ -1084,6 +1088,11 @@ def main() -> None:
     ap.add_argument("--contact-margin-s", type=float, default=0.0)
     ap.add_argument("--timing-guard-s", type=float, default=0.025)
     ap.add_argument("--swing-vel-frac", type=float, default=0.85)
+    ap.add_argument("--vel-cap-rad-s", nargs=7, type=float, default=None,
+                    metavar=("Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7"),
+                    help="Override joint velocity caps (rad/s) used for trajectory planning. "
+                         "Required when using picklebot_j9_fast.xml (vel sat disabled) to push "
+                         "past the conservative XML defaults. Target ~2.0-2.5 rad/s from home pose.")
 
     ap.add_argument("--return-s", type=float, default=5.0)
     ap.add_argument("--return-vel-frac", type=float, default=0.30)
@@ -1152,6 +1161,13 @@ def main() -> None:
     ap.add_argument("--tracker-stale-position-eps-m", type=float, default=None)
     ap.add_argument("--tracker-stale-timeout-s", type=float, default=None)
 
+    # Load YAML defaults before full parse so explicit CLI flags still win
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument("--config", default=None)
+    _pre_args, _ = _pre.parse_known_args()
+    if _pre_args.config is not None:
+        ap.set_defaults(**_load_config_yaml(_pre_args.config))
+
     args = ap.parse_args()
     run_stamp = time.strftime("%Y%m%d_%H%M%S")
     log_dir = os.path.abspath(os.path.join(_THIS_DIR, "..", "logs"))
@@ -1181,6 +1197,12 @@ def main() -> None:
         sys.exit(f"[J9] cannot reach Redis at {args.redis_host}:{args.redis_port}: {exc}")
 
     xml_vel_limits = _read_xml_velocity_limits(r)
+    if args.vel_cap_rad_s is not None:
+        xml_vel_limits = np.asarray(args.vel_cap_rad_s, dtype=float)
+        print(
+            f"[J9] vel_cap override (--vel-cap-rad-s): "
+            f"{np.degrees(xml_vel_limits).round(1).tolist()} deg/s"
+        )
     q_start_check = get_vec(r, SENSOR_JOINTS, 7)
     if q_start_check is None or (not args.allow_zero_joint_start and np.max(np.abs(q_start_check)) < 1e-6):
         sys.exit(
