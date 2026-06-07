@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Step J9: stripped-down high-commit impact-velocity striker.
+Step J10: J9 impact-velocity striker + base lateral Y tracking.
 
-Goal: commit often, react quickly, and keep the swing primitive simple.
-A valid throw is handled as one timed impact problem:
+Extends J9 with continuous lateral (Y-axis) cart movement so the robot
+repositions itself to align with the predicted ball intercept before committing.
 
-    q_now -> q_strike at contact with qdot_strike -> short decel -> home
+Pipeline addition over J9:
+  - While waiting to commit: cart Y tracks intercept.position[1], clamped to
+    [base_y_min, base_y_max]. X and yaw stay fixed at the ready pose.
+  - On commit/post-impact: cart returns to ready pose.
+  - When the ball is lost for > base_hold_after_lost_s: cart returns to ready.
+  - All base goals are written as [x, y, yaw_rad] to base_goal_key (world frame),
+    which base_bridge.py converts to the TidyBot odometry frame.
 
-J9 continuously aims at the latest predicted strike IK before commit. At commit
-it freezes the latest q_strike and executes a cubic Hermite segment that reaches
-that pose with a joint velocity chosen to make the paddle sweet spot move mostly
-forward, with a small upward component.
+Pass --base-ready-x/y/yaw-deg, --base-y-min/max to enable base tracking.
+Without those flags, J10 behaves identically to J9.
 """
 from __future__ import annotations
 
@@ -52,12 +56,10 @@ from stepj7_strike_planner import (  # noqa: E402
     J6_IK_TOL_M,
     J6_LOCK_RELEASE_AFTER_IMPACT_S,
     J6_MAX_ORI_ERR_DEG,
-    J6_REACH_M,
     J6_STRIKE_A_X_MAX_M,
     J6_STRIKE_A_X_MIN_M,
     J6_STRIKE_A_Y_ABS_MAX_M,
     J6_STRIKE_A_Z_MAX_M,
-    J6_STRIKE_A_Z_MIN_M,
     J6_W_ORI,
     J6_WORLD_Z_MIN_M,
     J6_XML_VEL_LIMIT_RAD_S,
@@ -102,7 +104,7 @@ from stepj8_through_strike_planner import (  # noqa: E402
     _jsonable,
     _minimum_feasible_strike_time,
     _parse_raw_json,
-    _tracker_snapshot as _base_tracker_snapshot,
+    _tracker_snapshot,
     _trajectory_peak_profile,
 )
 from sports_bot.state_machine.ball_tracker import Intercept  # noqa: E402
@@ -115,14 +117,6 @@ from sports_bot.utils.frames import (  # noqa: E402
     load_arm_base_offset_calibration,
     read_rigid_body_pose_W,
 )
-
-
-# Fitted from clean new_ball recordings on 2026-06-02 at strike_plane_x=-0.30.
-# The mild gravity boost plus mild drag matched early and commit-window Z best.
-J9_TRACKER_GRAVITY_MPS2 = 11.0
-J9_TRACKER_DRAG_COEFFICIENT = 0.10
-J9_TRACKER_SIMULATION_DT_S = 0.001
-J9_TRACKER_MIN_HISTORY = 4
 
 
 @dataclass
@@ -148,38 +142,6 @@ class ImpactCandidate:
 
     def aged_tti(self) -> float:
         return self.tti_s - (time.monotonic() - self.observed_t)
-
-
-def _tracker_config_snapshot(tracker: FoamBallTracker | None) -> dict:
-    if tracker is None:
-        return {}
-    cfg = getattr(tracker, "_cfg", None)
-    if cfg is None:
-        return {}
-    return {
-        "model": "foam_drag",
-        "gravity": getattr(cfg, "gravity", None),
-        "drag_coefficient": getattr(cfg, "drag_coefficient", None),
-        "simulation_dt": getattr(cfg, "simulation_dt", None),
-        "history_size": getattr(cfg, "history_size", None),
-        "history_max_age_s": getattr(cfg, "history_max_age_s", None),
-        "min_history_for_prediction": getattr(cfg, "min_history_for_prediction", None),
-        "median_filter_window": getattr(cfg, "median_filter_window", None),
-        "min_lookahead": getattr(cfg, "min_lookahead", None),
-        "max_lookahead": getattr(cfg, "max_lookahead", None),
-        "min_incoming_speed": getattr(cfg, "min_incoming_speed", None),
-        "max_implied_speed_mps": getattr(cfg, "max_implied_speed_mps", None),
-        "max_bounces": getattr(cfg, "max_bounces", None),
-        "stale_position_epsilon_m": getattr(cfg, "stale_position_epsilon_m", None),
-        "stale_position_timeout_s": getattr(cfg, "stale_position_timeout_s", None),
-    }
-
-
-def _tracker_snapshot(tracker: FoamBallTracker | None) -> dict:
-    snap = _base_tracker_snapshot(tracker)
-    if tracker is not None:
-        snap["config"] = _tracker_config_snapshot(tracker)
-    return snap
 
 
 def _candidate_snapshot(cand: ImpactCandidate | None) -> dict | None:
@@ -212,16 +174,16 @@ def _read_xml_velocity_limits(r: redis.Redis) -> np.ndarray:
     key = f"{NS}::{JOINT_CTRL}::joint_task::velocity_saturation_limit"
     raw = r.get(key)
     if raw is None:
-        print(f"[J9] WARNING: velocity limits key not found ({key}); using hardcoded defaults")
+        print(f"[J10] WARNING: velocity limits key not found ({key}); using hardcoded defaults")
         return limits
     try:
         parsed = np.asarray(json.loads(raw), dtype=float)
         if parsed.shape == (7,):
-            print(f"[J9] velocity limits from OpenSai: {np.degrees(parsed).round(1).tolist()} deg/s")
+            print(f"[J10] velocity limits from OpenSai: {np.degrees(parsed).round(1).tolist()} deg/s")
             return parsed
     except Exception:
         pass
-    print("[J9] WARNING: could not parse velocity limits from Redis; using hardcoded defaults")
+    print("[J10] WARNING: could not parse velocity limits from Redis; using hardcoded defaults")
     return limits
 
 
@@ -544,14 +506,14 @@ def _run_impact_strike(
     tr("impact_start", candidate=_candidate_snapshot(cand), diagnostic=_driver_diag_snapshot(r))
 
     print(
-        f"[J9 impact] start: strike_s={strike_s:.3f}s decel_s={decel_s:.3f}s "
+        f"[J10 impact] start: strike_s={strike_s:.3f}s decel_s={decel_s:.3f}s "
         f"v_cmd_W=[{cand.achieved_v_W[0]:+.2f},{cand.achieved_v_W[1]:+.2f},{cand.achieved_v_W[2]:+.2f}] m/s"
     )
     if full_segment_logs:
-        print("[J9 impact] q_start:  " + _fmt_q(q_start))
-        print("[J9 impact] q_strike: " + _fmt_q(cand.q_strike))
-        print("[J9 impact] qdot_hit: " + _fmt_q(cand.qdot_strike))
-        print("[J9 impact] q_stop:   " + _fmt_q(cand.q_stop))
+        print("[J10 impact] q_start:  " + _fmt_q(q_start))
+        print("[J10 impact] q_strike: " + _fmt_q(cand.q_strike))
+        print("[J10 impact] qdot_hit: " + _fmt_q(cand.qdot_strike))
+        print("[J10 impact] q_stop:   " + _fmt_q(cand.q_stop))
 
     while True:
         now = time.perf_counter()
@@ -614,7 +576,7 @@ def _run_impact_strike(
     qdot_cmd_i = int(np.argmax(qdot_cmd_peak))
     status = "OK" if (not math.isfinite(strike_err_deg) or strike_err_deg <= 8.0) else "WARN"
     print(
-        f"[J9 segment] impact: {status} strike_err={strike_err_deg:.2f}deg "
+        f"[J10 segment] impact: {status} strike_err={strike_err_deg:.2f}deg "
         f"stop_err={stop_err_deg:.2f}deg qdot_max={qdot_peak[qdot_i]:.1f}deg/s@q{qdot_i+1} "
         f"cmd_peak={qdot_cmd_peak[qdot_cmd_i]:.1f}deg/s@q{qdot_cmd_i+1} "
         f"v_meas_W=[{measured_v_W[0]:+.2f},{measured_v_W[1]:+.2f},{measured_v_W[2]:+.2f}]"
@@ -687,6 +649,11 @@ def run_loop(
     xml_vel_limits: np.ndarray,
     trace: _TraceLogger | None,
     ball_key: str | None,
+    base_ready_pose: tuple[float, float, float] | None,
+    base_y_min: float,
+    base_y_max: float,
+    base_goal_key: str,
+    base_hold_after_lost_s: float,
 ) -> None:
     dt = 1.0 / max(1.0, rate_hz)
     using_mock = mock_intercepts is not None and len(mock_intercepts) > 0
@@ -704,6 +671,11 @@ def run_loop(
     swings_done = 0
     idle_until_t = 0.0
     tick_i = 0
+    last_base_good_t = float("-inf")
+    base_at_ready = True
+    if base_ready_pose is not None:
+        r.set(base_goal_key, json.dumps(list(base_ready_pose)))
+        print(f"[J10 base] ready_pose=({base_ready_pose[0]:+.3f},{base_ready_pose[1]:+.3f},{math.degrees(base_ready_pose[2]):+.1f}°) y=[{base_y_min:+.3f},{base_y_max:+.3f}]")
 
     def tr(event: str, **fields) -> None:
         if trace is not None:
@@ -716,7 +688,7 @@ def run_loop(
         now = time.perf_counter()
         if now - last_reject_print_t >= 0.35:
             last_reject_print_t = now
-            print(f"[J9 wait] {reason}")
+            print(f"[J10 wait] {reason}")
 
     def publish_limited_goal(target: np.ndarray, q_cur: np.ndarray, mode: str) -> None:
         nonlocal last_q_cmd, last_q_cmd_vel, last_goal_write_t
@@ -794,20 +766,20 @@ def run_loop(
 
     switch_ctrl(r, JOINT_CTRL)
     _hold_current_joints(r)
-    print(f"[J9] running at {rate_hz:.0f} Hz -- high-commit impact-velocity striker")
+    print(f"[J10] running at {rate_hz:.0f} Hz -- high-commit impact-velocity striker")
     print(
-        f"[J9] strike_plane_x={strike_plane_x_world:+.3f}m commit_tti={commit_tti:.3f}s "
+        f"[J10] strike_plane_x={strike_plane_x_world:+.3f}m commit_tti={commit_tti:.3f}s "
         f"guard={timing_guard_s:.3f}s try_late_slack={try_late_slack_s:.3f}s"
     )
     print(
-        f"[J9] impact velocity target W: forward=+{forward_speed_mps:.2f} m/s, "
+        f"[J10] impact velocity target W: forward=+{forward_speed_mps:.2f} m/s, "
         f"up=+{up_speed_mps:.2f} m/s, decel_s={decel_s:.2f}s"
     )
     print(
-        f"[J9] strike box A: x=[{strike_arm_x_min_m:+.2f},{strike_arm_x_max_m:+.2f}] "
+        f"[J10] strike box A: x=[{strike_arm_x_min_m:+.2f},{strike_arm_x_max_m:+.2f}] "
         f"|y|<={strike_arm_y_abs_max_m:.2f} z=[{strike_arm_z_min_m:+.2f},{strike_arm_z_max_m:+.2f}] z_mode={z_mode}"
     )
-    print("[J9] policy: aim immediately, commit as soon as TTI enters band, stretch small late tries safely")
+    print("[J10] policy: aim immediately, commit as soon as TTI enters band, stretch small late tries safely")
     print()
 
     while True:
@@ -869,8 +841,18 @@ def run_loop(
             tr("no_intercept_idle", tick=tick_i, home_err_deg=_home_error_deg(r, q_home_rad), q_cur_deg=np.degrees(q_cur))
             publish_limited_goal(q_home_rad, q_cur, "idle_ready")
             active_cand = None
+            if base_ready_pose is not None and not base_at_ready:
+                if loop_t - last_base_good_t > base_hold_after_lost_s:
+                    r.set(base_goal_key, json.dumps(list(base_ready_pose)))
+                    base_at_ready = True
             time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
             continue
+
+        if base_ready_pose is not None:
+            y_base = float(np.clip(float(intercept.position[1]), base_y_min, base_y_max))
+            r.set(base_goal_key, json.dumps([base_ready_pose[0], y_base, base_ready_pose[2]]))
+            last_base_good_t = loop_t
+            base_at_ready = False
 
         q_seed = active_cand.q_strike if active_cand is not None else q_cur
         cand, cand_reason = _make_impact_candidate(
@@ -961,7 +943,7 @@ def run_loop(
                 qdot_deg, qdot_joint = _max_abs_deg_with_joint(qdot)
                 qdot_txt = f" qdot={qdot_deg:.1f}deg/s@q{qdot_joint}"
             print(
-                f"[J9] {state:6s} tti={aged_tti:+.3f}s strike_W={_fmt_v3(cand.strike_W)} "
+                f"[J10] {state:6s} tti={aged_tti:+.3f}s strike_W={_fmt_v3(cand.strike_W)} "
                 f"strike_A={_fmt_v3(cand.strike_A)} Tmin={cand.min_strike_s:.3f}s "
                 f"strike_s={strike_time_now:.3f}s margin={cand.budget_margin_s:+.3f}s "
                 f"cmd={peak_frac*100:.0f}% vW=[{cand.forward_mps:+.2f},{cand.up_mps:+.2f}]"
@@ -970,7 +952,7 @@ def run_loop(
                 hard = traj_diag["fr3_worst_hard"]
                 soft = traj_diag["fr3_worst_soft"]
                 print(
-                    f"[J9]   q_to_strike={q_delta:.1f}deg@q{q_joint} "
+                    f"[J10]   q_to_strike={q_delta:.1f}deg@q{q_joint} "
                     f"peak_cmd={math.degrees(peak[peak_idx]):.1f}deg/s@q{peak_idx+1} "
                     f"ik={cand.ik_err_mm:.1f}mm ori={cand.ori_err_deg:.1f}deg "
                     f"path_dx={100*traj_diag['sweet_dx_pre_m']:+.1f}->{100*traj_diag['sweet_dx_after_m']:+.1f}cm "
@@ -991,7 +973,7 @@ def run_loop(
                 cand.cmd_peak_frac = peak_frac
                 traj_diag = _trajectory_diagnostics(chain, q_cur, cand, offset_link7)
                 print(
-                    f"[J9] TRY_STRETCH: ball_time={old_strike_s:.3f}s < Tmin={cand.min_strike_s:.3f}s; "
+                    f"[J10] TRY_STRETCH: ball_time={old_strike_s:.3f}s < Tmin={cand.min_strike_s:.3f}s; "
                     f"swinging safely over {cand.strike_time_s:.3f}s"
                 )
             active_throw_id += 1
@@ -1002,22 +984,22 @@ def run_loop(
             )
             print("\n" + "=" * 64)
             print(
-                f"[J9] COMMIT throw {active_throw_id}: tti={aged_tti:.3f}s "
+                f"[J10] COMMIT throw {active_throw_id}: tti={aged_tti:.3f}s "
                 f"strike_s={cand.strike_time_s:.3f}s Tmin={cand.min_strike_s:.3f}s "
                 f"margin={cand.budget_margin_s:+.3f}s cmd_peak={cand.cmd_peak_frac*100:.0f}%"
             )
             print(
-                f"[J9]   strike_W={_fmt_v3(cand.strike_W)} strike_A={_fmt_v3(cand.strike_A)} "
+                f"[J10]   strike_W={_fmt_v3(cand.strike_W)} strike_A={_fmt_v3(cand.strike_A)} "
                 f"v_W desired={_fmt_v3(cand.desired_v_W)} achieved={_fmt_v3(cand.achieved_v_W)}"
             )
             hard = traj_diag["fr3_worst_hard"]
             soft = traj_diag["fr3_worst_soft"]
             print(
-                f"[J9]   q_to_strike={q_delta:.1f}deg@q{q_joint} "
+                f"[J10]   q_to_strike={q_delta:.1f}deg@q{q_joint} "
                 f"bottleneck q{peak_idx+1}: cmd={math.degrees(peak[peak_idx]):.1f}deg/s"
             )
             print(
-                f"[J9]   path_A start={_fmt_v3(traj_diag['sweet_start_A'])} "
+                f"[J10]   path_A start={_fmt_v3(traj_diag['sweet_start_A'])} "
                 f"strike={_fmt_v3(traj_diag['sweet_strike_A'])} stop={_fmt_v3(traj_diag['sweet_stop_A'])} "
                 f"dx={100*traj_diag['sweet_dx_pre_m']:+.1f}->{100*traj_diag['sweet_dx_after_m']:+.1f}cm "
                 f"fr3_hard={100*hard['ratio']:.0f}%@q{hard['joint']} "
@@ -1031,12 +1013,15 @@ def run_loop(
                 trace=trace,
             )
             if _safety_tripped(r):
-                print("[J9] safety torque after impact; recovering slowly")
+                print("[J10] safety torque after impact; recovering slowly")
+            if base_ready_pose is not None:
+                r.set(base_goal_key, json.dumps(list(base_ready_pose)))
+                base_at_ready = True
             home_ok = recover_home("post-impact->home", idle_after=True)
             swings_done += 1
             outcome = "OK" if home_ok and result["strike_err_deg"] <= 8.0 else "WARN"
             print(
-                f"[J9 audit] throw={active_throw_id} outcome={outcome} "
+                f"[J10 audit] throw={active_throw_id} outcome={outcome} "
                 f"timing[tti={aged_tti:.3f}s strike_s={cand.strike_time_s:.3f}s "
                 f"Tmin={cand.min_strike_s:.3f}s margin={cand.budget_margin_s:+.3f}s] "
                 f"arm[strike_err={result['strike_err_deg']:.2f}deg stop_err={result['stop_err_deg']:.2f}deg "
@@ -1046,7 +1031,7 @@ def run_loop(
             reject_counts = {}
             active_cand = None
             if max_swings > 0 and swings_done >= max_swings:
-                print(f"[J9] --max-swings={max_swings} reached; exiting")
+                print(f"[J10] --max-swings={max_swings} reached; exiting")
                 break
             time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
             continue
@@ -1062,7 +1047,7 @@ def run_loop(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="J9: high-commit impact-velocity pickleball striker.",
+        description="J10: high-commit impact-velocity pickleball striker + base lateral tracking.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("--ball-rigid-body-id", type=int, default=13)  # RigidBody002
@@ -1097,16 +1082,16 @@ def main() -> None:
     ap.add_argument("--ready-arm-y", type=float, default=0.0)
     ap.add_argument("--ready-arm-z", type=float, default=0.35)
 
-    ap.add_argument("--reach-m", type=float, default=J6_REACH_M)
+    ap.add_argument("--reach-m", type=float, default=0.82)
     ap.add_argument("--z-min-m", type=float, default=J6_Z_MIN_M)
     ap.add_argument("--z-max-m", type=float, default=J6_Z_MAX_M)
     ap.add_argument("--world-z-min-m", type=float, default=J6_WORLD_Z_MIN_M)
     ap.add_argument("--world-z-max-m", type=float, default=1.10)
     ap.add_argument("--strike-arm-x-min-m", type=float, default=J6_STRIKE_A_X_MIN_M)
     ap.add_argument("--strike-arm-x-max-m", type=float, default=J6_STRIKE_A_X_MAX_M)
-    ap.add_argument("--strike-arm-y-abs-max-m", type=float, default=0.38)
-    ap.add_argument("--strike-arm-z-min-m", type=float, default=J6_STRIKE_A_Z_MIN_M)
-    ap.add_argument("--strike-arm-z-max-m", type=float, default=0.62)
+    ap.add_argument("--strike-arm-y-abs-max-m", type=float, default=0.70)
+    ap.add_argument("--strike-arm-z-min-m", type=float, default=0.10)
+    ap.add_argument("--strike-arm-z-max-m", type=float, default=0.75)
     ap.add_argument("--ik-tol-mm", type=float, default=J6_IK_TOL_M * 1000.0)
     ap.add_argument("--z-mode", choices=["fixed-arm", "predicted"], default="predicted")
     ap.add_argument("--fixed-arm-z-m", type=float, default=0.45)
@@ -1129,6 +1114,21 @@ def main() -> None:
     ap.add_argument("--shutdown-hold-s", type=float, default=0.0)
     ap.add_argument("--allow-zero-joint-start", action="store_true")
 
+    ap.add_argument("--base-ready-x", type=float, default=None,
+                    help="World-X of the base ready pose (m). Required to enable base tracking.")
+    ap.add_argument("--base-ready-y", type=float, default=0.0,
+                    help="World-Y of the base ready pose (m).")
+    ap.add_argument("--base-ready-yaw-deg", type=float, default=0.0,
+                    help="World yaw of the base ready pose (deg).")
+    ap.add_argument("--base-y-min", type=float, default=-1.0,
+                    help="Min world-Y the base may reach when tracking (m).")
+    ap.add_argument("--base-y-max", type=float, default=1.0,
+                    help="Max world-Y the base may reach when tracking (m).")
+    ap.add_argument("--base-goal-key", type=str, default="sports_bot::cmd::base::goal_pose",
+                    help="Redis key for world-frame base goal [x, y, theta]. Read by base_bridge.py.")
+    ap.add_argument("--base-hold-after-lost-s", type=float, default=0.6,
+                    help="Hold last base Y goal this many seconds after ball is lost before returning to ready.")
+
     ap.add_argument("--skip-cal", action="store_true")
     ap.add_argument("--offset-link7", nargs=3, type=float, default=None)
     ap.add_argument("--print-cal-only", action="store_true")
@@ -1138,15 +1138,9 @@ def main() -> None:
 
     ap.add_argument("--min-lookahead", type=float, default=None)
     ap.add_argument("--max-lookahead", type=float, default=None)
-    ap.add_argument("--tracker-gravity", type=float, default=J9_TRACKER_GRAVITY_MPS2,
-                    help="Foam-ball prediction gravity; tuned hybrid default from clean J9 recordings.")
-    ap.add_argument("--tracker-drag-coefficient", type=float, default=J9_TRACKER_DRAG_COEFFICIENT,
-                    help="Foam-ball drag coefficient k in dv/dt = -k*|v|*v.")
-    ap.add_argument("--tracker-simulation-dt", type=float, default=J9_TRACKER_SIMULATION_DT_S,
-                    help="Drag propagator integration dt in seconds.")
     ap.add_argument("--tracker-history-size", type=int, default=None)
     ap.add_argument("--tracker-history-max-age-s", type=float, default=None)
-    ap.add_argument("--tracker-min-history", type=int, default=J9_TRACKER_MIN_HISTORY)
+    ap.add_argument("--tracker-min-history", type=int, default=None)
     ap.add_argument("--tracker-median-window", type=int, default=None)
     ap.add_argument("--tracker-max-implied-speed-mps", type=float, default=None)
     ap.add_argument("--tracker-stale-position-eps-m", type=float, default=None)
@@ -1159,50 +1153,50 @@ def main() -> None:
     if args.log_file is not None:
         log_path = args.log_file
         if log_path == "auto":
-            log_path = os.path.join(log_dir, f"j9_{run_stamp}.log")
+            log_path = os.path.join(log_dir, f"j10_{run_stamp}.log")
         log_path = os.path.abspath(log_path)
         sys.stdout = _Tee(log_path)
-        print(f"[J9] logging to {log_path}")
+        print(f"[J10] logging to {log_path}")
 
     trace_path = None
     if args.trace_file.lower() != "off":
         trace_path = args.trace_file
         if trace_path == "auto":
-            trace_path = os.path.join(log_dir, f"j9_{run_stamp}.trace.jsonl")
+            trace_path = os.path.join(log_dir, f"j10_{run_stamp}.trace.jsonl")
         trace_path = os.path.abspath(trace_path)
     trace = _TraceLogger(trace_path)
     if trace_path:
-        print(f"[J9] trace logging to {trace_path}")
+        print(f"[J10] trace logging to {trace_path}")
 
     r = redis.Redis(host=args.redis_host, port=args.redis_port, decode_responses=True)
     try:
         r.ping()
     except redis.exceptions.ConnectionError as exc:
-        sys.exit(f"[J9] cannot reach Redis at {args.redis_host}:{args.redis_port}: {exc}")
+        sys.exit(f"[J10] cannot reach Redis at {args.redis_host}:{args.redis_port}: {exc}")
 
     xml_vel_limits = _read_xml_velocity_limits(r)
     q_start_check = get_vec(r, SENSOR_JOINTS, 7)
     if q_start_check is None or (not args.allow_zero_joint_start and np.max(np.abs(q_start_check)) < 1e-6):
         sys.exit(
-            "[J9] refusing to start: sensed joint state is missing or exactly zero. "
+            "[J10] refusing to start: sensed joint state is missing or exactly zero. "
             "Recover/relaunch the Franka driver/OpenSai after a reflex abort first."
         )
 
     cal_path = args.calibration or arm_base_offset_calibration_path()
     if not os.path.isfile(cal_path):
-        sys.exit(f"[J9] arm base calibration not found: {cal_path}")
+        sys.exit(f"[J10] arm base calibration not found: {cal_path}")
     cal = load_arm_base_offset_calibration(cal_path)
-    print(f"[J9] arm base calibration: {cal_path} (rigid body {cal.base_rigid_body_id})")
+    print(f"[J10] arm base calibration: {cal_path} (rigid body {cal.base_rigid_body_id})")
 
     mock_intercepts = None
     if args.mock_intercept:
         mock_intercepts = [np.asarray(p, dtype=float) for p in args.mock_intercept]
     if not (mock_intercepts and args.mock_identity_base):
         if read_rigid_body_pose_W(r, cal.base_rigid_body_id) is None:
-            sys.exit(f"[J9] cart rigid body {cal.base_rigid_body_id} not visible in Redis")
+            sys.exit(f"[J10] cart rigid body {cal.base_rigid_body_id} not visible in Redis")
 
     if not os.path.isfile(URDF_PATH):
-        sys.exit(f"[J9] URDF not found: {URDF_PATH} (run from OpenSai root)")
+        sys.exit(f"[J10] URDF not found: {URDF_PATH} (run from OpenSai root)")
     chain = build_chain()
 
     if args.skip_cal:
@@ -1212,7 +1206,7 @@ def main() -> None:
         _, offset_link7 = calibrate_offset_link7(r, chain)
 
     if args.print_cal_only:
-        print("[J9] --print-cal-only: done.")
+        print("[J10] --print-cal-only: done.")
         return
 
     q_ready_seed = Q_HOME_RAD.copy()
@@ -1220,7 +1214,7 @@ def main() -> None:
         q_ready_seed = np.radians(np.asarray(args.home_joints_deg, dtype=float))
         q_delta, q_joint = _max_abs_deg_with_joint(q_ready_seed - Q_HOME_RAD)
         print(
-            f"[J9] custom home pose: {_fmt_q(q_ready_seed)} "
+            f"[J10] custom home pose: {_fmt_q(q_ready_seed)} "
             f"(delta imported home {q_delta:.1f}deg@q{q_joint})"
         )
 
@@ -1229,9 +1223,9 @@ def main() -> None:
         R_home_nominal = _link7_R_A(chain, q_ready_seed)
         R_A_link7_home = _rot_y_rad(math.radians(-args.paddle_open_deg)) @ R_home_nominal
         face_A = R_A_link7_home @ (offset_link7 / max(np.linalg.norm(offset_link7), 1e-9))
-        print("[J9] fixed paddle orientation from ready/home pose")
+        print("[J10] fixed paddle orientation from ready/home pose")
         print(
-            f"[J9]   paddle_open={args.paddle_open_deg:+.1f}deg "
+            f"[J10]   paddle_open={args.paddle_open_deg:+.1f}deg "
             f"strike-face normal_A=[{face_A[0]:+.3f},{face_A[1]:+.3f},{face_A[2]:+.3f}]"
         )
 
@@ -1247,17 +1241,17 @@ def main() -> None:
             q_ready = q_candidate
             q_delta, q_joint = _max_abs_deg_with_joint(q_ready - Q_HOME_RAD)
             print(
-                f"[J9] strike-center ready IK: arm_A={_fmt_v3(ready_arm_A)} "
+                f"[J10] strike-center ready IK: arm_A={_fmt_v3(ready_arm_A)} "
                 f"pos={ready_err*1000:.1f}mm ori={ready_ori:.1f}deg delta_home={q_delta:.1f}deg@q{q_joint}"
             )
         else:
             print(
-                f"[J9] WARNING: strike-center ready IK failed pos={ready_err*1000:.1f}mm "
+                f"[J10] WARNING: strike-center ready IK failed pos={ready_err*1000:.1f}mm "
                 f"ori={ready_ori:.1f}deg; using home pose"
             )
             ready_arm_A = None
 
-    print(f"[J9] moving to ready pose ({args.ready_pose}) ...")
+    print(f"[J10] moving to ready pose ({args.ready_pose}) ...")
     q_home_rad = move_to_home_pose(
         r, q_ready,
         move_s=args.home_s,
@@ -1269,18 +1263,6 @@ def main() -> None:
     ball_key = None
     if mock_intercepts is None:
         cfg = FoamBallConfig()
-        if args.tracker_gravity is not None:
-            if args.tracker_gravity <= 0.0:
-                raise ValueError("--tracker-gravity must be positive")
-            cfg.gravity = args.tracker_gravity
-        if args.tracker_drag_coefficient is not None:
-            if args.tracker_drag_coefficient < 0.0:
-                raise ValueError("--tracker-drag-coefficient must be non-negative")
-            cfg.drag_coefficient = args.tracker_drag_coefficient
-        if args.tracker_simulation_dt is not None:
-            if args.tracker_simulation_dt <= 0.0:
-                raise ValueError("--tracker-simulation-dt must be positive")
-            cfg.simulation_dt = args.tracker_simulation_dt
         if args.min_lookahead is not None:
             cfg.min_lookahead = args.min_lookahead
         if args.max_lookahead is not None:
@@ -1300,9 +1282,7 @@ def main() -> None:
         if args.tracker_stale_timeout_s is not None:
             cfg.stale_position_timeout_s = args.tracker_stale_timeout_s
         print(
-            f"[J9 tracker] model=foam_drag gravity={cfg.gravity:.2f}m/s^2 "
-            f"drag_k={cfg.drag_coefficient:.3f} sim_dt={cfg.simulation_dt:.4f}s "
-            f"hist={cfg.history_size}/{cfg.history_max_age_s:.2f}s "
+            f"[J10 tracker] hist={cfg.history_size}/{cfg.history_max_age_s:.2f}s "
             f"min_hist={cfg.min_history_for_prediction} median={cfg.median_filter_window} "
             f"lookahead=[{cfg.min_lookahead:.2f},{cfg.max_lookahead:.2f}]s"
         )
@@ -1310,17 +1290,21 @@ def main() -> None:
         keys.ball.__dict__["optitrack_rigid_body_id"] = args.ball_rigid_body_id
         ball_key = keys.ball.optitrack_position
         if r.get(ball_key) is None:
-            print(f"[J9] WARNING: {ball_key} is empty")
+            print(f"[J10] WARNING: {ball_key} is empty")
         else:
-            print(f"[J9] reading ball from {ball_key}")
+            print(f"[J10] reading ball from {ball_key}")
         tracker = FoamBallTracker(r, keys, cfg)
-        if trace is not None:
-            trace.write(
-                "tracker_config",
-                ball_key=ball_key,
-                ball_rigid_body_id=args.ball_rigid_body_id,
-                tracker_config=_tracker_config_snapshot(tracker),
-            )
+
+    base_ready_pose = None
+    if args.base_ready_x is not None:
+        base_ready_pose = (args.base_ready_x, args.base_ready_y, math.radians(args.base_ready_yaw_deg))
+        print(
+            f"[J10] base lateral tracking enabled: "
+            f"ready=({base_ready_pose[0]:+.3f},{base_ready_pose[1]:+.3f},{args.base_ready_yaw_deg:+.1f}°) "
+            f"y=[{args.base_y_min:+.3f},{args.base_y_max:+.3f}] key={args.base_goal_key}"
+        )
+    else:
+        print("[J10] base lateral tracking disabled (pass --base-ready-x to enable)")
 
     try:
         run_loop(
@@ -1377,14 +1361,21 @@ def main() -> None:
             xml_vel_limits=xml_vel_limits,
             trace=trace,
             ball_key=ball_key,
+            base_ready_pose=base_ready_pose,
+            base_y_min=args.base_y_min,
+            base_y_max=args.base_y_max,
+            base_goal_key=args.base_goal_key,
+            base_hold_after_lost_s=args.base_hold_after_lost_s,
         )
     except KeyboardInterrupt:
         if args.shutdown_hold_s > 0.0:
             _hold_current_joints_for(r, args.shutdown_hold_s, publish_hz=100.0)
-            print(f"\n[J9] stopped -- refreshed current joint hold for {args.shutdown_hold_s:.1f}s.")
+            print(f"\n[J10] stopped -- refreshed current joint hold for {args.shutdown_hold_s:.1f}s.")
         else:
             _hold_current_joints(r)
-            print("\n[J9] stopped -- holding current joint position in Redis.")
+            print("\n[J10] stopped -- holding current joint position in Redis.")
+        if base_ready_pose is not None:
+            r.set(args.base_goal_key, json.dumps(list(base_ready_pose)))
     finally:
         trace.close()
 
