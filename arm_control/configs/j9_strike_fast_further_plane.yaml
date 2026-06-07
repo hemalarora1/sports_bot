@@ -26,7 +26,7 @@ ready_pose: home
 paddle_open_deg: 8                 # degrees of face tilt (opens paddle face slightly upward)
 
 # --- Ball tracker ---
-strike_plane_x: -0.30             # world-frame X of the strike plane (negative = in front of cart)
+strike_plane_x: -0.25             # world-frame X of the strike plane (negative = in front of cart)
 z_mode: predicted                 # use tracker-predicted Z; alt: fixed-arm
 tracker_gravity: 11.0             # fitted from 2026-06-02 clean recordings (slight boost over 9.81)
 tracker_drag_coefficient: 0.10    # foam ball drag k in dv/dt = -k|v|v
@@ -40,7 +40,7 @@ world_z_min_m: 0.05               # ignore balls below this world-Z
 world_z_max_m: 1.10               # ignore balls above this world-Z
 strike_arm_x_min_m: 0.25          # arm-frame: closest acceptable strike
 strike_arm_x_max_m: 0.65          # arm-frame: farthest acceptable strike
-strike_arm_z_min_m: 0.30          # arm-frame: lowest acceptable strike; below 0.30 q4 exceeds FR3 hard limits
+strike_arm_z_min_m: 0.15          # arm-frame: lowest acceptable strike
 strike_arm_z_max_m: 0.62          # arm-frame: highest acceptable strike
 strike_arm_y_abs_max_m: 0.38      # arm-frame: lateral reach in either direction
 max_ori_err_deg: 15               # max allowable IK orientation error
@@ -64,12 +64,12 @@ qdot_damping: 0.03                # Jacobian damping (prevents joint vel spikes 
 # picklebot_j7.xml wrist limit that's been validated.
 #
 # If the arm is hitting FR3 safety violations (torque spikes, reflex aborts),
-# back these off toward [1.5 1.5 1.5 1.5 1.5 1.7 1.5].
-vel_cap_rad_s: [1.7, 1.7, 1.7, 1.7, 1.7, 2.0, 1.7]
+# back these off toward [1.5 1.5 1.5 1.5 1.5 2.0 1.5].
+vel_cap_rad_s: [2.0, 2.0, 2.0, 2.0, 2.0, 2.5, 2.0]
 
 # --- Swing timing ---
 swing_vel_frac: 1.00              # fraction of vel_cap for pre-commit arm tracking  [was 0.85]
-decel_s: 0.25                     # post-contact decel phase; longer = gentler decel accel [was 0.18]
+decel_s: 0.20                     # duration of post-contact decel phase (s)         [was 0.18]
 commit_tti: 0.90                  # commit when time-to-impact falls below this (s)
 try_late_slack_s: 0.30            # allow late-try if only this many seconds over Tmin
 max_stretched_strike_s: 0.90     # cap on how long a stretched late-try can be

@@ -1,0 +1,87 @@
+# J11 preload-through configuration -- picklebot_j9_fast.xml required
+#
+# Launch with:
+#   cd ~/OpenSai
+#   ./scripts/launch.sh config_folder/xml_config_files/picklebot_j9_fast.xml
+#   PYTHONUNBUFFERED=1 python sports_bot/arm_control/stepj11_preload_through_swing.py \
+#       --config sports_bot/arm_control/configs/j11_preload_fast.yaml
+#
+# J11 tracks q_pre = q_strike - offset, then publishes q_through = q_strike + offset.
+# It intentionally commits earlier than the old J9 Hermite path; it wants a fast
+# through-swing more than a perfectly timed trajectory boundary.
+
+# --- Hardware / calibration ---
+skip_cal: true
+offset_link7: [0, 0, 0.39]
+ball_rigid_body_id: 13
+
+# --- Ready / home pose ---
+home_joints_deg: [1.045, -24.506, 1.236, -115.213, -2.248, 108.033, -44.010]
+ready_pose: strike-center
+ready_arm_x: 0.48
+ready_arm_y: 0.0
+ready_arm_z: 0.18
+paddle_open_deg: 8
+
+# --- Ball tracker ---
+strike_plane_x: -0.30
+z_mode: predicted
+tracker_gravity: 11.0
+tracker_drag_coefficient: 0.10
+tracker_min_history: 4
+tracker_history_max_age_s: 0.15
+tracker_median_window: 3
+
+# --- Strike workspace box (arm frame, meters) ---
+world_z_min_m: 0.05
+world_z_max_m: 1.10
+strike_arm_x_min_m: 0.25
+strike_arm_x_max_m: 0.65
+strike_arm_z_min_m: 0.08
+strike_arm_z_max_m: 0.62
+strike_arm_y_abs_max_m: 0.38
+max_ori_err_deg: 15
+
+# --- Impact velocity target ---
+forward_speed_mps: 1.50
+up_speed_mps: 0.40
+impact_vel_frac: 1.00
+qdot_damping: 0.03
+
+# Start conservative relative to j9_strike_fast_further_plane.yaml; the bounded through-swing goal
+# is still punchier than J9's Hermite. If the first session looks clean, try
+# [2.0, 2.0, 2.0, 2.0, 2.0, 2.5, 2.0].
+vel_cap_rad_s: [1.7, 1.7, 1.7, 1.7, 1.7, 2.0, 1.7]
+swing_vel_frac: 1.00
+
+# --- J11 preload-through swing ---
+j11_commit_tti: 0.55        # start preparing the through swing early
+j11_pre_err_deg: 12.0        # ideal q_pre tracking error before commit
+j11_max_pre_err_deg: 18.0   # do not fire big unprepared PD steps
+j11_max_through_err_deg: 28.0
+j11_swing_gain: 0.85        # scale on qdot * kv/kp preload offset
+j11_through_s: 0.24         # duration to chase q_through
+j11_swing_step_deg: 1.0     # 200 Hz rate-limit during through swing; avoids torque spikes
+j11_max_offset_deg: 10.0
+j11_joint_margin_deg: 2.0
+j11_hard_velocity_frac: 0.85
+j11_candidate_jump_hold_deg: 18.0
+j11_candidate_replace_margin_deg: 6.0
+
+# --- Return home after swing ---
+return_s: 4.0
+return_vel_frac: 0.35
+
+# --- Pre-commit tracking ---
+tracking_step_deg: 1.0
+tracking_accel_deg_s2: 0
+tracking_leash_deg: 3.0
+
+# --- Logging & output ---
+verbose_tracking: true
+full_segment_logs: true
+log_period_s: 0.20
+post_impact_idle_s: 0.4
+shutdown_hold_s: 0
+log_file: auto
+trace_file: auto

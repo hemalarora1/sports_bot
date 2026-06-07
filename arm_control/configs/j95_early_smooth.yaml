@@ -1,0 +1,82 @@
+# J9.5 early-smooth striker configuration -- picklebot_j9_fast.xml required
+#
+# Launch with:
+#   cd ~/OpenSai
+#   ./scripts/launch.sh config_folder/xml_config_files/picklebot_j9_fast.xml
+#   PYTHONUNBUFFERED=1 python sports_bot/arm_control/stepj95_early_impact_velocity_planner.py \
+#       --config sports_bot/arm_control/configs/j95_early_smooth.yaml
+#
+# J9.5 keeps J9's smooth Hermite impact trajectory, but freezes the target early
+# and executes a shorter planned swing so the paddle is moving through contact
+# instead of easing across the whole ball TTI.
+
+# --- Hardware / calibration ---
+skip_cal: true
+offset_link7: [0, 0, 0.39]
+ball_rigid_body_id: 13
+
+# --- Ready / strike geometry ---
+home_joints_deg: [1.045, -24.506, 1.236, -115.213, -2.248, 108.033, -44.010]
+ready_pose: strike-center
+ready_arm_x: 0.52
+ready_arm_y: 0.0
+ready_arm_z: 0.18   # lower than the first J9.5 ready pose so low/mid strikes are rising swings
+paddle_open_deg: 8
+
+# Robot base is around world x=-1.0; strike_plane_x=-0.28 puts the paddle
+# between the -0.30 and -0.25 planes you've been testing.
+strike_plane_x: -0.28
+z_mode: predicted
+tracker_gravity: 11.0
+tracker_drag_coefficient: 0.10
+tracker_min_history: 4
+tracker_history_max_age_s: 0.15
+tracker_median_window: 3
+
+# --- Strike workspace box ---
+world_z_min_m: 0.05
+world_z_max_m: 1.10
+strike_arm_x_min_m: 0.25
+strike_arm_x_max_m: 0.68
+strike_arm_z_min_m: 0.18  # reject very low strikes that force a downward approach
+strike_arm_z_max_m: 0.62
+strike_arm_y_abs_max_m: 0.38
+max_ori_err_deg: 15
+
+# --- Impact velocity target ---
+forward_speed_mps: 1.50
+up_speed_mps: 0.45
+impact_vel_frac: 0.90
+qdot_damping: 0.03
+
+# Keep q7 conservative; q6 can still do the main swing work.
+vel_cap_rad_s: [1.7, 1.7, 1.7, 1.7, 1.7, 1.80, 1.45]  # q6/q7 backed off after q6 hard-ratio reflex
+swing_vel_frac: 1.00
+
+# --- Early smooth swing timing ---
+commit_tti: 0.78
+early_strike_lead_s: 0.10
+min_planned_strike_s: 0.20
+max_planned_strike_s: 0.45
+try_late_slack_s: 0.20
+max_stretched_strike_s: 0.55
+contact_margin_s: 0.0
+timing_guard_s: 0.015
+decel_s: 0.20
+
+# --- Return to strike-ready after impact ---
+return_s: 4.0
+return_vel_frac: 0.25
+
+# --- Pre-commit arm tracking ---
+tracking_step_deg: 1.5
+tracking_accel_deg_s2: 700
+
+# --- Logging ---
+verbose_tracking: true
+full_segment_logs: true
+log_period_s: 0.20
+post_impact_idle_s: 0.45
+shutdown_hold_s: 0
+log_file: auto
+trace_file: auto

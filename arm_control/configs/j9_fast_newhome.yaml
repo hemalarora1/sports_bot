@@ -1,0 +1,76 @@
+# J9 fast-strike — shifted home pose test (2026-06-07)
+#
+# Same as j9_strike_fast.yaml but with a home pose derived from the centroid
+# of recent good q_strike solutions (fr3_hard < 100%, z_arm 0.30-0.40m).
+#
+# Changes vs j9_strike_fast.yaml:
+#   q2: -24.5 → -30.0  (matches typical q_strike range -32 to -36°)
+#   q4: -115.2 → -132.0  (matches typical q_strike range -130 to -145°; key change)
+#   q6: +108.0 → +120.0  (matches typical q_strike range +121 to +136°)
+#
+# Effect: arm starts closer to where it needs to be at contact → smaller
+# displacements → fewer hooked joints → more velocity components active at hit.
+
+# --- Hardware / calibration ---
+skip_cal: true
+offset_link7: [0, 0, 0.39]
+ball_rigid_body_id: 13
+
+# --- Ready / home pose ---
+home_joints_deg: [0.0, -30.0, 1.2, -132.0, -2.2, 120.0, -44.0]
+ready_pose: home
+paddle_open_deg: 8
+
+# --- Ball tracker ---
+strike_plane_x: -0.30
+z_mode: predicted
+tracker_gravity: 11.0
+tracker_drag_coefficient: 0.10
+tracker_min_history: 4
+tracker_history_max_age_s: 0.15
+tracker_median_window: 3
+
+# --- Strike workspace box ---
+world_z_min_m: 0.05
+world_z_max_m: 1.10
+strike_arm_x_min_m: 0.25
+strike_arm_x_max_m: 0.65
+strike_arm_z_min_m: 0.30
+strike_arm_z_max_m: 0.62
+strike_arm_y_abs_max_m: 0.38
+max_ori_err_deg: 15
+
+# --- Impact velocity target ---
+forward_speed_mps: 1.50
+up_speed_mps: 0.40
+impact_vel_frac: 1.00
+qdot_damping: 0.03
+
+# --- Joint velocity cap ---
+vel_cap_rad_s: [1.7, 1.7, 1.7, 1.7, 1.7, 2.0, 1.7]
+
+# --- Swing timing ---
+swing_vel_frac: 1.00
+decel_s: 0.25
+commit_tti: 0.90
+try_late_slack_s: 0.30
+max_stretched_strike_s: 0.90
+contact_margin_s: 0.0
+timing_guard_s: 0.025
+
+# --- Return home ---
+return_s: 4.0
+return_vel_frac: 0.35
+
+# --- Pre-commit arm tracking ---
+tracking_step_deg: 1.8
+tracking_accel_deg_s2: 1000
+
+# --- Logging ---
+verbose_tracking: true
+full_segment_logs: true
+log_period_s: 0.20
+post_impact_idle_s: 0.4
+shutdown_hold_s: 0
+log_file: auto
+trace_file: auto
