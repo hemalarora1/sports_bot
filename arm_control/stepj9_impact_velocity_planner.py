@@ -520,57 +520,6 @@ def _run_impact_strike(
         q_start = cand.q_strike.copy()
     strike_s = max(0.045, cand.strike_time_s)
     decel_s = max(0.05, cand.decel_s)
-
-    # --- Anti-hook clamp ---
-    # A cubic Hermite from (q_start, v=0) to (q_strike, qdot_strike) has a "hook"
-    # when sign(qdot_strike[j]) opposes sign(q_strike[j]-q_start[j]): the joint
-    # must overshoot backward first, creating velocity spikes that trigger
-    # joint_velocity_violation and large acceleration discontinuities.
-    # Fix: zero the conflicting qdot_strike components so the arm goes straight in.
-    disp = cand.q_strike - q_start
-    # Clamp only hooks ≥ 0.1 rad (5.7°). Smaller opposing displacements create
-    # backward velocity peaks well under the FR3 hard zone (e.g., 5° at 2 rad/s
-    # over 0.5s → ~0.9 rad/s; FR3 hard limit ~2.4 rad/s). The old 5e-3 threshold
-    # was clamping q6 for 1.1° conflicts, zeroing the main velocity contributor.
-    hook_mask = (disp * cand.qdot_strike < 0) & (np.abs(disp) > 0.10)
-    if np.any(hook_mask):
-        cand.qdot_strike = cand.qdot_strike.copy()
-        cand.qdot_strike[hook_mask] = 0.0
-        hook_details = ", ".join(
-            f"q{j+1}({math.degrees(disp[j]):+.1f}°)"
-            for j, h in enumerate(hook_mask) if h
-        )
-        print(f"[J9 safe] anti-hook clamp on [{hook_details}]")
-
-    # --- Initial velocity from sensors ---
-    # During the aim phase J9 is already moving the arm toward q_strike, so at
-    # commit the arm has real velocity. Using zeros as v0 throws that away and
-    # forces the Hermite to restart from rest. Instead, read actual joint vels
-    # and keep only the components already moving in the displacement direction
-    # (toward q_strike). Opposing components are zeroed so we don't start with
-    # momentum going the wrong way.
-    v_sensor = get_vec(r, SENSOR_JOINT_VELS, 7)
-    if v_sensor is not None:
-        v_start = np.where(v_sensor * disp > 0, v_sensor, 0.0)
-    else:
-        v_start = np.zeros(7)
-
-    # --- Acceleration-continuous q_stop ---
-    # The approach Hermite's terminal acceleration at t=strike_s and the decel
-    # Hermite's initial acceleration can differ sharply, triggering the
-    # joint_motion_generator_acceleration_discontinuity reflex.
-    # Choose q_stop so the decel Hermite begins with the same acceleration as
-    # the approach Hermite ends with, giving C2 continuity at the transition.
-    qddot_approach_end = (
-        -6.0 * (cand.q_strike - q_start) / strike_s**2
-        + 2.0 * v_start / strike_s
-        + 4.0 * cand.qdot_strike / strike_s
-    )
-    q_stop_cont = cand.q_strike + (
-        (qddot_approach_end + 4.0 * cand.qdot_strike / decel_s) * decel_s**2 / 6.0
-    )
-    cand.q_stop = np.clip(q_stop_cont, Q_LO + 0.02, Q_HI - 0.02)
-
     total_s = strike_s + decel_s
     period_s = 1.0 / max(1.0, publish_hz)
     sample_period_s = 0.01
@@ -600,7 +549,6 @@ def _run_impact_strike(
     )
     if full_segment_logs:
         print("[J9 impact] q_start:  " + _fmt_q(q_start))
-        print("[J9 impact] v_start:  " + _fmt_q(v_start))
         print("[J9 impact] q_strike: " + _fmt_q(cand.q_strike))
         print("[J9 impact] qdot_hit: " + _fmt_q(cand.qdot_strike))
         print("[J9 impact] q_stop:   " + _fmt_q(cand.q_stop))
@@ -609,7 +557,7 @@ def _run_impact_strike(
         now = time.perf_counter()
         elapsed = now - t0
         if elapsed <= strike_s:
-            q_goal, qdot_goal = _hermite(q_start, v_start, cand.q_strike, cand.qdot_strike, elapsed, strike_s)
+            q_goal, qdot_goal = _hermite(q_start, zeros, cand.q_strike, cand.qdot_strike, elapsed, strike_s)
         else:
             q_goal, qdot_goal = _hermite(cand.q_strike, cand.qdot_strike, cand.q_stop, zeros, elapsed - strike_s, decel_s)
         qdot_cmd_peak = np.maximum(qdot_cmd_peak, np.abs(np.degrees(qdot_goal)))
@@ -971,9 +919,7 @@ def run_loop(
         cand.cmd_peak_frac = peak_frac
         traj_diag = _trajectory_diagnostics(chain, q_cur, cand, offset_link7)
         q_delta, q_joint = _max_abs_deg_with_joint(cand.q_strike - q_cur)
-        hw_hard_ratio = traj_diag["fr3_worst_hard"]["ratio"]
-        hw_ok = hw_hard_ratio <= 1.0
-        feasible = strike_time_now > 0.045 and cand.budget_margin_s >= 0.0 and peak_frac <= 1.0 and hw_ok
+        feasible = strike_time_now > 0.045 and cand.budget_margin_s >= 0.0 and peak_frac <= 1.0
         late_by_s = cand.min_strike_s - strike_time_now
         late_try = (
             strike_time_now > 0.045
@@ -981,17 +927,10 @@ def run_loop(
             and cand.min_strike_s <= max_stretched_strike_s
             and (try_late_slack_s <= 0.0 or late_by_s <= try_late_slack_s)
         )
-        commit_now = (not no_commit) and aged_tti <= commit_tti and (feasible or late_try) and hw_ok
+        commit_now = (not no_commit) and aged_tti <= commit_tti and (feasible or late_try)
         state = "AIM"
         if aged_tti <= commit_tti:
-            if not hw_ok:
-                state = "HW_LIMIT"
-            elif feasible:
-                state = "COMMIT"
-            elif late_try:
-                state = "TRY"
-            else:
-                state = "LATE"
+            state = "COMMIT" if feasible else ("TRY" if late_try else "LATE")
 
         tr(
             "candidate_runtime", tick=tick_i, state=state, feasible=feasible, late_try=late_try,
