@@ -1,0 +1,83 @@
+# J9 fast-strike configuration — large foam ball (OptiTrack rigid body ID 1)
+# Requires picklebot_j9_fast.xml (velocity saturation OFF).
+#
+# Launch with:
+#   cd ~/OpenSai
+#   ./scripts/launch.sh config_folder/xml_config_files/picklebot_j9_fast.xml
+#   PYTHONUNBUFFERED=1 python sports_bot/arm_control/stepj9_impact_velocity_planner.py \
+#       --config sports_bot/arm_control/configs/j9_strike_fast_bigball.yaml
+
+# --- Hardware / calibration ---
+skip_cal: true
+offset_link7: [0, 0, 0.39]
+ball_rigid_body_id: 13              # big foam ball, Motive rigid body 1
+
+# --- Ready / home pose ---
+home_joints_deg: [1.045, -24.506, 1.236, -115.213, -2.248, 108.033, -44.010]
+# home_joints_deg: [-4.096, -23.526, 8.348, -98.913, 3.722, 80.180, -42.379]
+ready_pose: home
+paddle_open_deg: 8
+
+# --- Strike plane & tracker ---
+strike_plane_x: -0.25
+z_mode: predicted
+tracker_gravity: 11.0
+tracker_drag_coefficient: 0.10
+tracker_min_history: 4
+tracker_history_max_age_s: 0.15
+tracker_median_window: 3
+tracker_min_incoming_speed: 0.15    # default 0.5; lower = predictions start earlier in high-arc throws
+
+# --- Strike workspace box (arm frame, meters) ---
+world_z_min_m: 0.05
+world_z_max_m: 1.10
+strike_arm_x_min_m: 0.25
+strike_arm_x_max_m: 0.65          # singularity limit; keep arm_A.x well below this
+strike_arm_z_min_m: 0.22          # floor: real throws land at ~0.21m arm-frame z
+strike_arm_z_max_m: 0.62
+strike_arm_y_abs_max_m: 0.38
+max_ori_err_deg: 15
+
+# --- Impact velocity target ---
+forward_speed_mps: 1.50
+up_speed_mps: 0.85
+impact_vel_frac: 1.00
+qdot_damping: 0.03
+
+# --- FR3 dynamic velocity limit gate ---
+# 0.85 = 15% headroom. Two scaling passes in the planner handle cases where the first
+# pass corrects the worst joint but exposes a second joint just under the threshold.
+fr3_max_hard_ratio: 0.85
+
+# --- Joint velocity cap override ---
+# q6 lowered 2.5 -> 2.3 rad/s (143.2 -> 131.8 deg/s) to stay below the FR3 hard limit
+# of 2.4 rad/s (137.5 deg/s). Previously 2.5 rad/s triggered constant 104% scaling on
+# every q6-dominant throw, capping q6 at ~121 deg/s. Now q6 runs at 131.8 deg/s with
+# no scaling — 10 deg/s faster and no abort risk.
+vel_cap_rad_s: [2.0, 2.0, 2.0, 2.0, 2.0, 2.3, 2.0]
+
+# --- Swing timing ---
+swing_vel_frac: 1.00
+decel_s: 0.20
+commit_tti: 1.00                  # 100ms earlier than fast config; more pre-positioning time
+try_late_slack_s: 0.30
+max_stretched_strike_s: 0.90
+contact_margin_s: 0.0
+timing_guard_s: 0.025
+
+# --- Return home after impact ---
+return_s: 4.0
+return_vel_frac: 0.35
+
+# --- Pre-commit arm tracking ---
+tracking_step_deg: 2.5            # faster than 1.8; arm reaches q_strike before commit
+tracking_accel_deg_s2: 1200
+
+# --- Logging & output ---
+verbose_tracking: true
+full_segment_logs: true
+log_period_s: 0.20
+post_impact_idle_s: 0.4
+shutdown_hold_s: 0
+log_file: auto
+trace_file: auto

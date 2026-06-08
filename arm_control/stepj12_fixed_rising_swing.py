@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-Step J9: stripped-down high-commit impact-velocity striker.
+Step J12: prepositioned fixed rising swing striker.
 
 Goal: commit often, react quickly, and keep the swing primitive simple.
 A valid throw is handled as one timed impact problem:
 
     q_now -> q_strike at contact with qdot_strike -> short decel -> home
 
-J9 continuously aims at the latest predicted strike IK before commit. At commit
-it freezes the latest q_strike and executes a cubic Hermite segment that reaches
-that pose with a joint velocity chosen to make the paddle sweet spot move mostly
-forward, with a small upward component.
+J12 continuously prepositions the paddle behind and below the latest predicted contact. At commit it executes the same local rising-drive stroke: pre -> contact -> through, translated to the predicted ball position.
 """
 from __future__ import annotations
 
@@ -119,16 +116,19 @@ from sports_bot.utils.frames import (  # noqa: E402
 
 # Fitted from clean new_ball recordings on 2026-06-02 at strike_plane_x=-0.30.
 # The mild gravity boost plus mild drag matched early and commit-window Z best.
-J9_TRACKER_GRAVITY_MPS2 = 11.0
-J9_TRACKER_DRAG_COEFFICIENT = 0.10
-J9_TRACKER_SIMULATION_DT_S = 0.001
-J9_TRACKER_MIN_HISTORY = 4
+J12_TRACKER_GRAVITY_MPS2 = 11.0
+J12_TRACKER_DRAG_COEFFICIENT = 0.10
+J12_TRACKER_SIMULATION_DT_S = 0.001
+J12_TRACKER_MIN_HISTORY = 4
 
 
 @dataclass
 class ImpactCandidate:
     strike_W: np.ndarray
     strike_A: np.ndarray
+    pre_A: np.ndarray
+    through_A: np.ndarray
+    q_pre: np.ndarray
     q_strike: np.ndarray
     q_stop: np.ndarray
     qdot_strike: np.ndarray
@@ -188,6 +188,9 @@ def _candidate_snapshot(cand: ImpactCandidate | None) -> dict | None:
     return {
         "strike_W": cand.strike_W,
         "strike_A": cand.strike_A,
+        "pre_A": cand.pre_A,
+        "through_A": cand.through_A,
+        "q_pre_deg": np.degrees(cand.q_pre),
         "q_strike_deg": np.degrees(cand.q_strike),
         "q_stop_deg": np.degrees(cand.q_stop),
         "qdot_strike_deg_s": np.degrees(cand.qdot_strike),
@@ -212,16 +215,16 @@ def _read_xml_velocity_limits(r: redis.Redis) -> np.ndarray:
     key = f"{NS}::{JOINT_CTRL}::joint_task::velocity_saturation_limit"
     raw = r.get(key)
     if raw is None:
-        print(f"[J9] WARNING: velocity limits key not found ({key}); using hardcoded defaults")
+        print(f"[J12] WARNING: velocity limits key not found ({key}); using hardcoded defaults")
         return limits
     try:
         parsed = np.asarray(json.loads(raw), dtype=float)
         if parsed.shape == (7,):
-            print(f"[J9] velocity limits from OpenSai: {np.degrees(parsed).round(1).tolist()} deg/s")
+            print(f"[J12] velocity limits from OpenSai: {np.degrees(parsed).round(1).tolist()} deg/s")
             return parsed
     except Exception:
         pass
-    print("[J9] WARNING: could not parse velocity limits from Redis; using hardcoded defaults")
+    print("[J12] WARNING: could not parse velocity limits from Redis; using hardcoded defaults")
     return limits
 
 
@@ -306,6 +309,81 @@ def _driver_diag_snapshot(r: redis.Redis) -> dict:
         "tau_ext_hat_filtered": get_vec(r, f"{NS}::sensors::FrankaRobot::tau_ext_hat_filtered", 7),
     }
 
+
+
+def _approach_peak_profile(
+    q_start: np.ndarray,
+    q_strike: np.ndarray,
+    qdot_strike: np.ndarray,
+    strike_s: float,
+    vel_cap: np.ndarray,
+) -> tuple[np.ndarray, int, float]:
+    T = max(0.045, float(strike_s))
+    peak = np.zeros(7)
+    zeros = np.zeros(7)
+    for t in np.linspace(0.0, T, 160):
+        _, qdot = _hermite(q_start, zeros, q_strike, qdot_strike, float(t), T)
+        peak = np.maximum(peak, np.abs(qdot))
+    frac = peak / np.maximum(vel_cap, 1e-6)
+    idx = int(np.argmax(frac))
+    return peak, idx, float(frac[idx])
+
+
+def _approach_hard_velocity_diag(
+    q_start: np.ndarray,
+    q_strike: np.ndarray,
+    qdot_strike: np.ndarray,
+    strike_s: float,
+) -> dict:
+    T = max(0.045, float(strike_s))
+    worst_hard = {"ratio": 0.0}
+    zeros = np.zeros(7)
+    for t in np.linspace(0.0, T, 160):
+        q, qdot = _hermite(q_start, zeros, q_strike, qdot_strike, float(t), T)
+        bands = _fr3_driver_velocity_bands_rad(q)
+        hard_allowed = np.where(qdot >= 0.0, bands["hard_max"], -bands["hard_min"])
+        hard_ratio = np.abs(qdot) / np.maximum(hard_allowed, 1e-6)
+        jh = int(np.argmax(hard_ratio))
+        if float(hard_ratio[jh]) > float(worst_hard["ratio"]):
+            worst_hard = {
+                "ratio": float(hard_ratio[jh]),
+                "joint": jh + 1,
+                "phase": "approach",
+                "t_s": float(t),
+                "q_deg": float(math.degrees(q[jh])),
+                "qdot_deg_s": float(math.degrees(qdot[jh])),
+                "hard_min_deg_s": float(math.degrees(bands["hard_min"][jh])),
+                "hard_max_deg_s": float(math.degrees(bands["hard_max"][jh])),
+            }
+    return worst_hard
+
+
+def _minimum_feasible_approach_time(
+    q_start: np.ndarray,
+    q_strike: np.ndarray,
+    qdot_strike: np.ndarray,
+    vel_cap: np.ndarray,
+) -> float:
+    def ok(T: float) -> bool:
+        _, _, cmd_frac = _approach_peak_profile(q_start, q_strike, qdot_strike, T, vel_cap)
+        hard = _approach_hard_velocity_diag(q_start, q_strike, qdot_strike, T)
+        return cmd_frac <= 1.0 and float(hard.get("ratio", 999.0)) <= 1.0
+
+    lo = 0.045
+    hi = 0.90
+    if ok(lo):
+        return lo
+    while hi < 3.0 and not ok(hi):
+        hi *= 1.35
+    if not ok(hi):
+        return hi
+    for _ in range(24):
+        mid = 0.5 * (lo + hi)
+        if ok(mid):
+            hi = mid
+        else:
+            lo = mid
+    return hi
 
 def _trajectory_diagnostics(chain, q_start: np.ndarray, cand: ImpactCandidate, offset_link7: np.ndarray) -> dict:
     p_start = _sweet_spot_A(chain, q_start, offset_link7)
@@ -425,6 +503,10 @@ def _make_impact_candidate(
     w_ori: float,
     z_mode: str,
     fixed_arm_z_m: float,
+    swing_pre_x_m: float,
+    swing_pre_z_m: float,
+    swing_through_x_m: float,
+    swing_through_z_m: float,
 ) -> tuple[ImpactCandidate | None, str]:
     t_W_strike = np.asarray(intercept.position, dtype=float)
     tti = float(intercept.time_to_impact)
@@ -459,6 +541,22 @@ def _make_impact_candidate(
     if (not _joints_ok(q_strike)) or (not _ik_ok(err_st, ori_st, ik_tol_m, max_ori_err_deg, R_A_link7_home)):
         return None, f"strike IK pos={err_st*1000:.1f}mm ori={ori_st:.1f}deg"
 
+    # Fixed local stroke in arm frame. Preposition behind/below, then finish forward/up.
+    t_A_pre = t_A_strike + np.array([-abs(swing_pre_x_m), 0.0, -abs(swing_pre_z_m)], dtype=float)
+    t_A_through = t_A_strike + np.array([abs(swing_through_x_m), 0.0, abs(swing_through_z_m)], dtype=float)
+    q_pre, err_pre, ori_pre = ik_solve(
+        chain, t_A_pre, q_seed, offset_link7,
+        R_A_link7_target=R_A_link7_home, w_ori=w_ori,
+    )
+    if (not _joints_ok(q_pre)) or (not _ik_ok(err_pre, ori_pre, ik_tol_m, max_ori_err_deg, R_A_link7_home)):
+        return None, f"pre IK pos={err_pre*1000:.1f}mm ori={ori_pre:.1f}deg"
+    q_through, err_thr, ori_thr = ik_solve(
+        chain, t_A_through, q_strike, offset_link7,
+        R_A_link7_target=R_A_link7_home, w_ori=w_ori,
+    )
+    if (not _joints_ok(q_through)) or (not _ik_ok(err_thr, ori_thr, ik_tol_m, max_ori_err_deg, R_A_link7_home)):
+        return None, f"through IK pos={err_thr*1000:.1f}mm ori={ori_thr:.1f}deg"
+
     desired_v_W = np.array([forward_speed_mps, 0.0, up_speed_mps], dtype=float)
     desired_v_A = R_W_A.T @ desired_v_W
     qdot_cap = np.maximum(vel_cap * max(0.05, impact_vel_frac), 1e-6)
@@ -468,23 +566,25 @@ def _make_impact_candidate(
     )
     achieved_v_W = R_W_A @ achieved_v_A
 
-    # Short, disposable decel target. The impact velocity is the objective;
-    # q_stop exists only to bleed off the swing after contact.
-    q_stop = q_strike + 0.5 * qdot_strike * max(0.05, decel_s)
-    q_stop = np.clip(q_stop, Q_LO + 0.02, Q_HI - 0.02)
+    # Fixed through pose: this is what makes the stroke rise instead of inheriting
+    # a target-dependent arc.
+    q_stop = q_through.copy()
 
     strike_time_s = tti + contact_margin_s - timing_guard_s
     if strike_time_s <= 0.035:
         return None, f"too late: strike_time={strike_time_s:.3f}s"
 
-    min_s = _minimum_feasible_strike_time(q_cur, q_strike, q_stop, qdot_strike, decel_s, vel_cap)
-    peak, peak_idx, peak_frac = _trajectory_peak_profile(
-        q_cur, q_strike, q_stop, qdot_strike, max(0.035, strike_time_s), decel_s, vel_cap,
+    min_s = _minimum_feasible_approach_time(q_cur, q_strike, qdot_strike, vel_cap)
+    peak, peak_idx, peak_frac = _approach_peak_profile(
+        q_cur, q_strike, qdot_strike, max(0.035, strike_time_s), vel_cap,
     )
     del peak, peak_idx
     return ImpactCandidate(
         strike_W=t_W_strike.copy(),
         strike_A=t_A_strike.copy(),
+        pre_A=t_A_pre.copy(),
+        through_A=t_A_through.copy(),
+        q_pre=q_pre,
         q_strike=q_strike,
         q_stop=q_stop,
         qdot_strike=qdot_strike,
@@ -514,17 +614,53 @@ def _run_impact_strike(
     publish_hz: float,
     full_segment_logs: bool,
     trace: _TraceLogger | None = None,
-    v0: np.ndarray | None = None,
 ) -> dict:
     q_start = get_vec(r, SENSOR_JOINTS, 7)
     if q_start is None:
         q_start = cand.q_strike.copy()
-    # Use actual arm velocity at commit time as the Hermite start velocity.
-    # This avoids a discontinuous velocity command when the arm was already moving
-    # toward q_strike in AIM state, and reduces the overshoot transient.
-    v0_start = np.zeros(7) if v0 is None else v0.copy()
     strike_s = max(0.045, cand.strike_time_s)
     decel_s = max(0.05, cand.decel_s)
+
+    # --- Anti-hook clamp ---
+    # A cubic Hermite from (q_start, v=0) to (q_strike, qdot_strike) has a "hook"
+    # when sign(qdot_strike[j]) opposes sign(q_strike[j]-q_start[j]): the joint
+    # must overshoot backward first, creating velocity spikes that trigger
+    # joint_velocity_violation and large acceleration discontinuities.
+    # Fix: zero the conflicting qdot_strike components so the arm goes straight in.
+    disp = cand.q_strike - q_start
+    # Clamp only hooks ≥ 0.1 rad (5.7°). Smaller opposing displacements create
+    # backward velocity peaks well under the FR3 hard zone (e.g., 5° at 2 rad/s
+    # over 0.5s → ~0.9 rad/s; FR3 hard limit ~2.4 rad/s). The old 5e-3 threshold
+    # was clamping q6 for 1.1° conflicts, zeroing the main velocity contributor.
+    hook_mask = (disp * cand.qdot_strike < 0) & (np.abs(disp) > 0.10)
+    if np.any(hook_mask):
+        cand.qdot_strike = cand.qdot_strike.copy()
+        cand.qdot_strike[hook_mask] = 0.0
+        hook_details = ", ".join(
+            f"q{j+1}({math.degrees(disp[j]):+.1f}°)"
+            for j, h in enumerate(hook_mask) if h
+        )
+        print(f"[J12 safe] anti-hook clamp on [{hook_details}]")
+
+    # --- Initial velocity from sensors ---
+    # During the aim phase J9 is already moving the arm toward q_strike, so at
+    # commit the arm has real velocity. Using zeros as v0 throws that away and
+    # forces the Hermite to restart from rest. Instead, read actual joint vels
+    # and keep only the components already moving in the displacement direction
+    # (toward q_strike). Opposing components are zeroed so we don't start with
+    # momentum going the wrong way.
+    v_sensor = get_vec(r, SENSOR_JOINT_VELS, 7)
+    if v_sensor is not None:
+        v_start = np.where(v_sensor * disp > 0, v_sensor, 0.0)
+    else:
+        v_start = np.zeros(7)
+
+    # J12's core promise is that contact is followed by a literal fixed
+    # forward/up through pose. J9 rewrote q_stop for acceleration continuity,
+    # which is safer in isolation but can turn a rising stroke back into a
+    # target-dependent arc. Preserve the planned through pose here.
+    cand.q_stop = np.clip(cand.q_stop, Q_LO + 0.02, Q_HI - 0.02)
+
     total_s = strike_s + decel_s
     period_s = 1.0 / max(1.0, publish_hz)
     sample_period_s = 0.01
@@ -549,21 +685,21 @@ def _run_impact_strike(
     tr("impact_start", candidate=_candidate_snapshot(cand), diagnostic=_driver_diag_snapshot(r))
 
     print(
-        f"[J9 impact] start: strike_s={strike_s:.3f}s decel_s={decel_s:.3f}s "
+        f"[J12 impact] start: strike_s={strike_s:.3f}s decel_s={decel_s:.3f}s "
         f"v_cmd_W=[{cand.achieved_v_W[0]:+.2f},{cand.achieved_v_W[1]:+.2f},{cand.achieved_v_W[2]:+.2f}] m/s"
     )
     if full_segment_logs:
-        print("[J9 impact] q_start:  " + _fmt_q(q_start))
-        print("[J9 impact] v_start:  " + _fmt_q(np.degrees(v0_start)))
-        print("[J9 impact] q_strike: " + _fmt_q(cand.q_strike))
-        print("[J9 impact] qdot_hit: " + _fmt_q(cand.qdot_strike))
-        print("[J9 impact] q_stop:   " + _fmt_q(cand.q_stop))
+        print("[J12 impact] q_start:  " + _fmt_q(q_start))
+        print("[J12 impact] v_start:  " + _fmt_q(v_start))
+        print("[J12 impact] q_strike: " + _fmt_q(cand.q_strike))
+        print("[J12 impact] qdot_hit: " + _fmt_q(cand.qdot_strike))
+        print("[J12 impact] q_stop:   " + _fmt_q(cand.q_stop))
 
     while True:
         now = time.perf_counter()
         elapsed = now - t0
         if elapsed <= strike_s:
-            q_goal, qdot_goal = _hermite(q_start, v0_start, cand.q_strike, cand.qdot_strike, elapsed, strike_s)
+            q_goal, qdot_goal = _hermite(q_start, v_start, cand.q_strike, cand.qdot_strike, elapsed, strike_s)
         else:
             q_goal, qdot_goal = _hermite(cand.q_strike, cand.qdot_strike, cand.q_stop, zeros, elapsed - strike_s, decel_s)
         qdot_cmd_peak = np.maximum(qdot_cmd_peak, np.abs(np.degrees(qdot_goal)))
@@ -620,7 +756,7 @@ def _run_impact_strike(
     qdot_cmd_i = int(np.argmax(qdot_cmd_peak))
     status = "OK" if (not math.isfinite(strike_err_deg) or strike_err_deg <= 8.0) else "WARN"
     print(
-        f"[J9 segment] impact: {status} strike_err={strike_err_deg:.2f}deg "
+        f"[J12 segment] impact: {status} strike_err={strike_err_deg:.2f}deg "
         f"stop_err={stop_err_deg:.2f}deg qdot_max={qdot_peak[qdot_i]:.1f}deg/s@q{qdot_i+1} "
         f"cmd_peak={qdot_cmd_peak[qdot_cmd_i]:.1f}deg/s@q{qdot_cmd_i+1} "
         f"v_meas_W=[{measured_v_W[0]:+.2f},{measured_v_W[1]:+.2f},{measured_v_W[2]:+.2f}]"
@@ -655,6 +791,9 @@ def run_loop(
     commit_tti: float,
     contact_margin_s: float,
     timing_guard_s: float,
+    early_strike_lead_s: float,
+    min_planned_strike_s: float,
+    max_planned_strike_s: float,
     try_late_slack_s: float,
     max_stretched_strike_s: float,
     return_s: float,
@@ -673,6 +812,10 @@ def run_loop(
     ik_tol_m: float,
     z_mode: str,
     fixed_arm_z_m: float,
+    swing_pre_x_m: float,
+    swing_pre_z_m: float,
+    swing_through_x_m: float,
+    swing_through_z_m: float,
     w_ori: float,
     max_ori_err_deg: float,
     strike_arm_x_min_m: float,
@@ -692,7 +835,6 @@ def run_loop(
     lock_release_after_impact_s: float,
     xml_vel_limits: np.ndarray,
     trace: _TraceLogger | None,
-    fr3_max_hard_ratio: float,
     ball_key: str | None,
 ) -> None:
     dt = 1.0 / max(1.0, rate_hz)
@@ -723,7 +865,7 @@ def run_loop(
         now = time.perf_counter()
         if now - last_reject_print_t >= 0.35:
             last_reject_print_t = now
-            print(f"[J9 wait] {reason}")
+            print(f"[J12 wait] {reason}")
 
     def publish_limited_goal(target: np.ndarray, q_cur: np.ndarray, mode: str) -> None:
         nonlocal last_q_cmd, last_q_cmd_vel, last_goal_write_t
@@ -792,20 +934,25 @@ def run_loop(
 
     switch_ctrl(r, JOINT_CTRL)
     _hold_current_joints(r)
-    print(f"[J9] running at {rate_hz:.0f} Hz -- high-commit impact-velocity striker")
+    print(f"[J12] running at {rate_hz:.0f} Hz -- fixed rising-swing striker")
     print(
-        f"[J9] strike_plane_x={strike_plane_x_world:+.3f}m commit_tti={commit_tti:.3f}s "
-        f"guard={timing_guard_s:.3f}s try_late_slack={try_late_slack_s:.3f}s"
+        f"[J12] strike_plane_x={strike_plane_x_world:+.3f}m commit_tti={commit_tti:.3f}s "
+        f"lead={early_strike_lead_s:.3f}s planned_s=[{min_planned_strike_s:.3f},{max_planned_strike_s:.3f}] "
+        f"guard={timing_guard_s:.3f}s"
     )
     print(
-        f"[J9] impact velocity target W: forward=+{forward_speed_mps:.2f} m/s, "
+        f"[J12] impact velocity target W: forward=+{forward_speed_mps:.2f} m/s, "
         f"up=+{up_speed_mps:.2f} m/s, decel_s={decel_s:.2f}s"
     )
     print(
-        f"[J9] strike box A: x=[{strike_arm_x_min_m:+.2f},{strike_arm_x_max_m:+.2f}] "
+        f"[J12] strike box A: x=[{strike_arm_x_min_m:+.2f},{strike_arm_x_max_m:+.2f}] "
         f"|y|<={strike_arm_y_abs_max_m:.2f} z=[{strike_arm_z_min_m:+.2f},{strike_arm_z_max_m:+.2f}] z_mode={z_mode}"
     )
-    print("[J9] policy: aim immediately, commit as soon as TTI enters band, stretch small late tries safely")
+    print(
+        f"[J12] fixed stroke A: pre=[-{abs(swing_pre_x_m):.2f},0,-{abs(swing_pre_z_m):.2f}]m "
+        f"through=[+{abs(swing_through_x_m):.2f},0,+{abs(swing_through_z_m):.2f}]m"
+    )
+    print("[J12] policy: preposition behind/below, then fire a fixed rising stroke at most plausible balls")
     print()
 
     while True:
@@ -870,7 +1017,7 @@ def run_loop(
             time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
             continue
 
-        q_seed = active_cand.q_strike if active_cand is not None else q_cur
+        q_seed = active_cand.q_pre if active_cand is not None else q_cur
         cand, cand_reason = _make_impact_candidate(
             chain=chain,
             q_cur=q_cur,
@@ -903,6 +1050,10 @@ def run_loop(
             w_ori=w_ori,
             z_mode=z_mode,
             fixed_arm_z_m=fixed_arm_z_m,
+            swing_pre_x_m=swing_pre_x_m,
+            swing_pre_z_m=swing_pre_z_m,
+            swing_through_x_m=swing_through_x_m,
+            swing_through_z_m=swing_through_z_m,
         )
         tr("candidate", tick=tick_i, reason=cand_reason, candidate=_candidate_snapshot(cand), intercept=_intercept_snapshot(intercept))
         if cand is None:
@@ -913,63 +1064,30 @@ def run_loop(
 
         active_cand = cand
         aged_tti = cand.aged_tti()
-        strike_time_now = aged_tti + contact_margin_s - timing_guard_s
+        ball_strike_time_now = aged_tti + contact_margin_s - timing_guard_s
+        strike_time_now = ball_strike_time_now - max(0.0, early_strike_lead_s)
+        if max_planned_strike_s > 0.0:
+            strike_time_now = min(strike_time_now, max_planned_strike_s)
+        strike_time_now = max(max(0.045, min_planned_strike_s), strike_time_now)
         cand.strike_time_s = strike_time_now
-        cand.min_strike_s = _minimum_feasible_strike_time(
-            q_cur, cand.q_strike, cand.q_stop, cand.qdot_strike, cand.decel_s, vel_cap,
+        cand.min_strike_s = _minimum_feasible_approach_time(
+            q_cur, cand.q_strike, cand.qdot_strike, vel_cap,
         )
         cand.budget_margin_s = strike_time_now - cand.min_strike_s
-        peak, peak_idx, peak_frac = _trajectory_peak_profile(
-            q_cur, cand.q_strike, cand.q_stop, cand.qdot_strike,
-            max(0.035, strike_time_now), cand.decel_s, vel_cap,
+        peak, peak_idx, peak_frac = _approach_peak_profile(
+            q_cur, cand.q_strike, cand.qdot_strike,
+            max(0.035, strike_time_now), vel_cap,
         )
         cand.cmd_peak_frac = peak_frac
         traj_diag = _trajectory_diagnostics(chain, q_cur, cand, offset_link7)
-        # Scale qdot_strike down if the planned Hermite trajectory exceeds the FR3
-        # position-dependent hard velocity zone. Run up to 2 passes: a second pass is
-        # needed when the first scaling corrects the worst joint but exposes a second joint
-        # that was just under the threshold.
-        for _fr3_pass in range(2):
-            _fr3_worst = traj_diag["fr3_worst_hard"]
-            _fr3_ratio = _fr3_worst.get("ratio", 0.0)
-            if _fr3_ratio <= fr3_max_hard_ratio or _fr3_ratio <= 0.01:
-                break
-            _fr3_scale = fr3_max_hard_ratio / _fr3_ratio
-            _fr3_qdot_sign = math.copysign(1.0, _fr3_worst.get("qdot_deg_s", 1.0))
-            _fr3_lim_key = "hard_min_deg_s" if _fr3_qdot_sign < 0 else "hard_max_deg_s"
-            _fr3_lim_val = _fr3_worst.get(_fr3_lim_key, 0.0)
-            if aged_tti <= commit_tti + 0.1:
-                print(
-                    f"[J9 FR3] scale {_fr3_scale:.2f}x qdot_strike pass={_fr3_pass+1} "
-                    f"(hard={_fr3_ratio:.2f}×lim @ q{_fr3_worst.get('joint','?')} "
-                    f"{_fr3_worst.get('phase','?')} t={_fr3_worst.get('t_s',0):.3f}s "
-                    f"pos={_fr3_worst.get('q_deg',0):.1f}° "
-                    f"vel={_fr3_worst.get('qdot_deg_s',0):.1f}°/s "
-                    f"lim={_fr3_lim_val:.1f}°/s)"
-                )
-            tr("fr3_scale", tick=tick_i, fr3_pass=_fr3_pass+1, ratio=_fr3_ratio, scale=_fr3_scale,
-               joint=_fr3_worst.get("joint"), phase=_fr3_worst.get("phase"),
-               t_s=_fr3_worst.get("t_s"), q_deg=_fr3_worst.get("q_deg"),
-               qdot_deg_s=_fr3_worst.get("qdot_deg_s"), lim_deg_s=_fr3_lim_val)
-            cand.qdot_strike = cand.qdot_strike * _fr3_scale
-            cand.q_stop = cand.q_strike + 0.5 * cand.qdot_strike * max(0.05, cand.decel_s)
-            cand.q_stop = np.clip(cand.q_stop, Q_LO + 0.02, Q_HI - 0.02)
-            _fr3_J_A = _sweet_spot_jacobian_A(chain, cand.q_strike, offset_link7)
-            cand.achieved_v_W = R_W_A @ (_fr3_J_A @ cand.qdot_strike)
-            cand.forward_mps = float(cand.achieved_v_W[0])
-            cand.up_mps = float(cand.achieved_v_W[2])
-            cand.min_strike_s = _minimum_feasible_strike_time(
-                q_cur, cand.q_strike, cand.q_stop, cand.qdot_strike, cand.decel_s, vel_cap,
-            )
-            cand.budget_margin_s = strike_time_now - cand.min_strike_s
-            peak, peak_idx, peak_frac = _trajectory_peak_profile(
-                q_cur, cand.q_strike, cand.q_stop, cand.qdot_strike,
-                max(0.035, strike_time_now), cand.decel_s, vel_cap,
-            )
-            cand.cmd_peak_frac = peak_frac
-            traj_diag = _trajectory_diagnostics(chain, q_cur, cand, offset_link7)
         q_delta, q_joint = _max_abs_deg_with_joint(cand.q_strike - q_cur)
-        feasible = strike_time_now > 0.045 and cand.budget_margin_s >= 0.0 and peak_frac <= 1.0
+        q_pre_delta, q_pre_joint = _max_abs_deg_with_joint(cand.q_pre - q_cur)
+        approach_hard = _approach_hard_velocity_diag(
+            q_cur, cand.q_strike, cand.qdot_strike, max(0.035, strike_time_now)
+        )
+        hw_hard_ratio = approach_hard["ratio"]
+        hw_ok = hw_hard_ratio <= 1.0
+        feasible = strike_time_now > 0.045 and cand.budget_margin_s >= 0.0 and peak_frac <= 1.0 and hw_ok
         late_by_s = cand.min_strike_s - strike_time_now
         late_try = (
             strike_time_now > 0.045
@@ -977,20 +1095,28 @@ def run_loop(
             and cand.min_strike_s <= max_stretched_strike_s
             and (try_late_slack_s <= 0.0 or late_by_s <= try_late_slack_s)
         )
-        commit_now = (not no_commit) and aged_tti <= commit_tti and (feasible or late_try)
+        commit_now = (not no_commit) and aged_tti <= commit_tti and (feasible or late_try) and hw_ok
         state = "AIM"
         if aged_tti <= commit_tti:
-            state = "COMMIT" if feasible else ("TRY" if late_try else "LATE")
+            if not hw_ok:
+                state = "HW_LIMIT"
+            elif feasible:
+                state = "COMMIT"
+            elif late_try:
+                state = "TRY"
+            else:
+                state = "LATE"
 
         tr(
             "candidate_runtime", tick=tick_i, state=state, feasible=feasible, late_try=late_try,
-            aged_tti_s=aged_tti, strike_time_s=strike_time_now,
-            min_strike_s=cand.min_strike_s, margin_s=cand.budget_margin_s,
+            aged_tti_s=aged_tti, ball_strike_time_s=ball_strike_time_now, strike_time_s=strike_time_now,
+            early_strike_lead_s=early_strike_lead_s, min_strike_s=cand.min_strike_s, margin_s=cand.budget_margin_s,
             late_by_s=late_by_s,
             cmd_peak_frac=peak_frac, bottleneck_joint=peak_idx + 1,
             bottleneck_cmd_deg_s=math.degrees(peak[peak_idx]), q_to_strike_deg=q_delta,
-            q_to_strike_joint=q_joint, q_cur_deg=np.degrees(q_cur),
+            q_to_strike_joint=q_joint, q_to_pre_deg=q_pre_delta, q_to_pre_joint=q_pre_joint, q_cur_deg=np.degrees(q_cur),
             trajectory_diagnostics=traj_diag,
+            approach_hard_velocity=approach_hard,
             candidate=_candidate_snapshot(cand),
         )
 
@@ -1001,27 +1127,23 @@ def run_loop(
             if verbose_tracking and qdot is not None:
                 qdot_deg, qdot_joint = _max_abs_deg_with_joint(qdot)
                 qdot_txt = f" qdot={qdot_deg:.1f}deg/s@q{qdot_joint}"
-            _diag_hard = traj_diag["fr3_worst_hard"]
-            _hard_pct = _diag_hard.get("ratio", 0.0) * 100
-            _hard_flag = " ABORT-RISK" if _hard_pct > 100 else ""
             print(
-                f"[J9] {state:6s} tti={aged_tti:+.3f}s strike_W={_fmt_v3(cand.strike_W)} "
-                f"strike_A={_fmt_v3(cand.strike_A)} Tmin={cand.min_strike_s:.3f}s "
-                f"strike_s={strike_time_now:.3f}s margin={cand.budget_margin_s:+.3f}s "
-                f"cmd={peak_frac*100:.0f}% vW=[{cand.forward_mps:+.2f},{cand.up_mps:+.2f}] "
-                f"fr3={_hard_pct:.0f}%@q{_diag_hard.get('joint','?')}{_hard_flag}"
+                f"[J12] {state:6s} tti={aged_tti:+.3f}s strike_W={_fmt_v3(cand.strike_W)} "
+                f"strike_A={_fmt_v3(cand.strike_A)} ball_s={ball_strike_time_now:.3f}s Tmin={cand.min_strike_s:.3f}s "
+                f"swing_s={strike_time_now:.3f}s margin={cand.budget_margin_s:+.3f}s "
+                f"cmd={peak_frac*100:.0f}% vW=[{cand.forward_mps:+.2f},{cand.up_mps:+.2f}]"
             )
             if verbose_tracking:
-                hard = traj_diag["fr3_worst_hard"]
+                hard = approach_hard
+                through_hard = traj_diag["fr3_worst_hard"]
                 soft = traj_diag["fr3_worst_soft"]
                 print(
-                    f"[J9]   q_to_strike={q_delta:.1f}deg@q{q_joint} "
+                    f"[J12]   q_to_pre={q_pre_delta:.1f}deg@q{q_pre_joint} q_to_strike={q_delta:.1f}deg@q{q_joint} "
                     f"peak_cmd={math.degrees(peak[peak_idx]):.1f}deg/s@q{peak_idx+1} "
                     f"ik={cand.ik_err_mm:.1f}mm ori={cand.ori_err_deg:.1f}deg "
                     f"path_dx={100*traj_diag['sweet_dx_pre_m']:+.1f}->{100*traj_diag['sweet_dx_after_m']:+.1f}cm "
-                    f"fr3_hard={100*hard['ratio']:.0f}%@q{hard['joint']} "
-                    f"({hard.get('phase','?')} t={hard.get('t_s',0):.3f}s "
-                    f"pos={hard.get('q_deg',0):.1f}° vel={hard.get('qdot_deg_s',0):.1f}°/s) "
+                    f"approach_hard={100*hard['ratio']:.0f}%@q{hard['joint']} "
+                    f"full_hard={100*through_hard['ratio']:.0f}%@q{through_hard['joint']} "
                     f"soft={100*soft['ratio']:.0f}%@q{soft['joint']} "
                     f"rejects={_fmt_counts(reject_counts)}{qdot_txt}"
                 )
@@ -1031,14 +1153,14 @@ def run_loop(
                 old_strike_s = strike_time_now
                 cand.strike_time_s = cand.min_strike_s
                 cand.budget_margin_s = 0.0
-                peak, peak_idx, peak_frac = _trajectory_peak_profile(
-                    q_cur, cand.q_strike, cand.q_stop, cand.qdot_strike,
-                    cand.strike_time_s, cand.decel_s, vel_cap,
+                peak, peak_idx, peak_frac = _approach_peak_profile(
+                    q_cur, cand.q_strike, cand.qdot_strike,
+                    cand.strike_time_s, vel_cap,
                 )
                 cand.cmd_peak_frac = peak_frac
                 traj_diag = _trajectory_diagnostics(chain, q_cur, cand, offset_link7)
                 print(
-                    f"[J9] TRY_STRETCH: ball_time={old_strike_s:.3f}s < Tmin={cand.min_strike_s:.3f}s; "
+                    f"[J12] TRY_STRETCH: planned_s={old_strike_s:.3f}s < Tmin={cand.min_strike_s:.3f}s; "
                     f"swinging safely over {cand.strike_time_s:.3f}s"
                 )
             active_throw_id += 1
@@ -1049,52 +1171,43 @@ def run_loop(
             )
             print("\n" + "=" * 64)
             print(
-                f"[J9] COMMIT throw {active_throw_id}: tti={aged_tti:.3f}s "
-                f"strike_s={cand.strike_time_s:.3f}s Tmin={cand.min_strike_s:.3f}s "
+                f"[J12] COMMIT throw {active_throw_id}: tti={aged_tti:.3f}s "
+                f"ball_s={ball_strike_time_now:.3f}s swing_s={cand.strike_time_s:.3f}s Tmin={cand.min_strike_s:.3f}s "
                 f"margin={cand.budget_margin_s:+.3f}s cmd_peak={cand.cmd_peak_frac*100:.0f}%"
             )
             print(
-                f"[J9]   strike_W={_fmt_v3(cand.strike_W)} strike_A={_fmt_v3(cand.strike_A)} "
+                f"[J12]   strike_W={_fmt_v3(cand.strike_W)} pre_A={_fmt_v3(cand.pre_A)} "
+                f"strike_A={_fmt_v3(cand.strike_A)} through_A={_fmt_v3(cand.through_A)} "
                 f"v_W desired={_fmt_v3(cand.desired_v_W)} achieved={_fmt_v3(cand.achieved_v_W)}"
             )
             hard = traj_diag["fr3_worst_hard"]
             soft = traj_diag["fr3_worst_soft"]
             print(
-                f"[J9]   q_to_strike={q_delta:.1f}deg@q{q_joint} "
+                f"[J12]   q_to_strike={q_delta:.1f}deg@q{q_joint} "
                 f"bottleneck q{peak_idx+1}: cmd={math.degrees(peak[peak_idx]):.1f}deg/s"
             )
             print(
-                f"[J9]   path_A start={_fmt_v3(traj_diag['sweet_start_A'])} "
+                f"[J12]   path_A start={_fmt_v3(traj_diag['sweet_start_A'])} "
                 f"strike={_fmt_v3(traj_diag['sweet_strike_A'])} stop={_fmt_v3(traj_diag['sweet_stop_A'])} "
                 f"dx={100*traj_diag['sweet_dx_pre_m']:+.1f}->{100*traj_diag['sweet_dx_after_m']:+.1f}cm "
                 f"fr3_hard={100*hard['ratio']:.0f}%@q{hard['joint']} "
                 f"soft={100*soft['ratio']:.0f}%@q{soft['joint']}"
             )
             print("=" * 64 + "\n")
-            if traj_diag["fr3_worst_hard"].get("ratio", 0.0) > 1.0:
-                _h = traj_diag["fr3_worst_hard"]
-                print(
-                    f"[J9 FR3] WARNING: hard limit still {_h['ratio']*100:.0f}%@q{_h.get('joint','?')} "
-                    f"post-scaling — abort risk! "
-                    f"({_h.get('phase','?')} pos={_h.get('q_deg',0):.1f}° "
-                    f"vel={_h.get('qdot_deg_s',0):.1f}°/s)"
-                )
-            dq_commit = get_vec(r, SENSOR_JOINT_VELS, 7)
             result = _run_impact_strike(
                 r, chain, cand, offset_link7, R_W_A,
                 publish_hz=200.0,
                 full_segment_logs=full_segment_logs,
                 trace=trace,
-                v0=dq_commit,
             )
             if _safety_tripped(r):
-                print("[J9] safety torque after impact; recovering slowly")
+                print("[J12] safety torque after impact; recovering slowly")
             home_ok = recover_home("post-impact->home", idle_after=True)
             swings_done += 1
             outcome = "OK" if home_ok and result["strike_err_deg"] <= 8.0 else "WARN"
             print(
-                f"[J9 audit] throw={active_throw_id} outcome={outcome} "
-                f"timing[tti={aged_tti:.3f}s strike_s={cand.strike_time_s:.3f}s "
+                f"[J12 audit] throw={active_throw_id} outcome={outcome} "
+                f"timing[tti={aged_tti:.3f}s ball_s={ball_strike_time_now:.3f}s swing_s={cand.strike_time_s:.3f}s "
                 f"Tmin={cand.min_strike_s:.3f}s margin={cand.budget_margin_s:+.3f}s] "
                 f"arm[strike_err={result['strike_err_deg']:.2f}deg stop_err={result['stop_err_deg']:.2f}deg "
                 f"home_ok={home_ok}] tracker_rejects={_fmt_counts(reject_counts)}"
@@ -1103,13 +1216,13 @@ def run_loop(
             reject_counts = {}
             active_cand = None
             if max_swings > 0 and swings_done >= max_swings:
-                print(f"[J9] --max-swings={max_swings} reached; exiting")
+                print(f"[J12] --max-swings={max_swings} reached; exiting")
                 break
             time.sleep(max(0.0, dt - (time.perf_counter() - loop_t)))
             continue
 
-        # High-commit J9: always aim directly at the latest strike pose. No pre-pose.
-        publish_limited_goal(cand.q_strike, q_cur, "aim_strike")
+        # J12: keep moving to the fixed-stroke pre pose until launch.
+        publish_limited_goal(cand.q_pre, q_cur, "aim_pre")
         if aged_tti < -lock_release_after_impact_s:
             tr("missed_window", tick=tick_i, aged_tti_s=aged_tti, candidate=_candidate_snapshot(cand))
             active_cand = None
@@ -1121,7 +1234,7 @@ def _load_config_yaml(path: str) -> dict:
     try:
         import yaml
     except ImportError:
-        sys.exit("[J9] --config requires PyYAML: pip install pyyaml")
+        sys.exit("[J12] --config requires PyYAML: pip install pyyaml")
     with open(path) as f:
         data = yaml.safe_load(f) or {}
     # YAML keys use underscores matching argparse dest names
@@ -1130,39 +1243,41 @@ def _load_config_yaml(path: str) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="J9: high-commit impact-velocity pickleball striker.",
+        description="J12: prepositioned fixed rising swing pickleball striker.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("--config", default=None, metavar="YAML",
                     help="YAML config file; sets argument defaults (CLI flags override).")
     ap.add_argument("--ball-rigid-body-id", type=int, default=13)  # RigidBody002
-    ap.add_argument("--strike-plane-x", type=float, default=-0.55)
+    ap.add_argument("--strike-plane-x", type=float, default=-0.28)
     ap.add_argument("--mock-intercept", nargs=3, type=float, action="append")
     ap.add_argument("--mock-tti", type=float, default=0.60)
     ap.add_argument("--mock-cycle-s", type=float, default=0.0)
     ap.add_argument("--mock-identity-base", action="store_true")
 
     ap.add_argument("--paddle-open-deg", type=float, default=8.0)
-    ap.add_argument("--forward-speed-mps", type=float, default=0.75)
-    ap.add_argument("--up-speed-mps", type=float, default=0.15)
-    ap.add_argument("--impact-vel-frac", type=float, default=0.70)
+    ap.add_argument("--forward-speed-mps", type=float, default=1.50)
+    ap.add_argument("--up-speed-mps", type=float, default=0.45)
+    ap.add_argument("--impact-vel-frac", type=float, default=0.95)
     ap.add_argument("--qdot-damping", type=float, default=0.03)
     ap.add_argument("--decel-s", type=float, default=0.18)
     ap.add_argument("--commit-tti", type=float, default=0.75)
     ap.add_argument("--try-late-slack-s", type=float, default=999.0)
     ap.add_argument("--max-stretched-strike-s", type=float, default=0.90)
     ap.add_argument("--contact-margin-s", type=float, default=0.0)
-    ap.add_argument("--timing-guard-s", type=float, default=0.025)
-    ap.add_argument("--swing-vel-frac", type=float, default=0.85)
+    ap.add_argument("--timing-guard-s", type=float, default=0.015)
+    ap.add_argument("--early-strike-lead-s", type=float, default=0.10,
+                    help="Plan the smooth swing to pass q_strike this much before predicted plane time.")
+    ap.add_argument("--min-planned-strike-s", type=float, default=0.20,
+                    help="Minimum approach duration for the committed smooth swing.")
+    ap.add_argument("--max-planned-strike-s", type=float, default=0.42,
+                    help="Maximum approach duration; shorter than ball TTI makes the swing faster once frozen.")
+    ap.add_argument("--swing-vel-frac", type=float, default=1.00)
     ap.add_argument("--vel-cap-rad-s", nargs=7, type=float, default=None,
                     metavar=("Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7"),
                     help="Override joint velocity caps (rad/s) used for trajectory planning. "
                          "Required when using picklebot_j9_fast.xml (vel sat disabled) to push "
                          "past the conservative XML defaults. Target ~2.0-2.5 rad/s from home pose.")
-    ap.add_argument("--fr3-max-hard-ratio", type=float, default=0.90,
-                    help="Scale qdot_strike if the planned Hermite's FR3 hard-zone ratio exceeds "
-                         "this value. 0.90 = 10%% headroom below the hard limit. "
-                         "1.0 = log only, no scaling. Lower values are safer but reduce peak speed.")
 
     ap.add_argument("--return-s", type=float, default=5.0)
     ap.add_argument("--return-vel-frac", type=float, default=0.30)
@@ -1171,10 +1286,10 @@ def main() -> None:
     ap.add_argument("--home-vel-frac", type=float, default=J6_HOME_VEL_FRAC)
     ap.add_argument("--home-joints-deg", nargs=7, type=float, default=None,
                     help="Override the imported J7 home/ready pose with seven joint angles in degrees.")
-    ap.add_argument("--ready-pose", choices=["home", "strike-center"], default="home")
-    ap.add_argument("--ready-arm-x", type=float, default=0.28)
+    ap.add_argument("--ready-pose", choices=["home", "strike-center"], default="strike-center")
+    ap.add_argument("--ready-arm-x", type=float, default=0.52)
     ap.add_argument("--ready-arm-y", type=float, default=0.0)
-    ap.add_argument("--ready-arm-z", type=float, default=0.35)
+    ap.add_argument("--ready-arm-z", type=float, default=0.24)
 
     ap.add_argument("--reach-m", type=float, default=J6_REACH_M)
     ap.add_argument("--z-min-m", type=float, default=J6_Z_MIN_M)
@@ -1189,12 +1304,16 @@ def main() -> None:
     ap.add_argument("--ik-tol-mm", type=float, default=J6_IK_TOL_M * 1000.0)
     ap.add_argument("--z-mode", choices=["fixed-arm", "predicted"], default="predicted")
     ap.add_argument("--fixed-arm-z-m", type=float, default=0.45)
+    ap.add_argument("--swing-pre-x-m", type=float, default=0.04)
+    ap.add_argument("--swing-pre-z-m", type=float, default=0.07)
+    ap.add_argument("--swing-through-x-m", type=float, default=0.10)
+    ap.add_argument("--swing-through-z-m", type=float, default=0.07)
     ap.add_argument("--no-fixed-paddle-ori", action="store_true")
     ap.add_argument("--w-ori", type=float, default=J6_W_ORI)
     ap.add_argument("--max-ori-err-deg", type=float, default=15.0)
 
-    ap.add_argument("--tracking-step-deg", type=float, default=1.8)
-    ap.add_argument("--tracking-accel-deg-s2", type=float, default=1000.0)
+    ap.add_argument("--tracking-step-deg", type=float, default=1.5)
+    ap.add_argument("--tracking-accel-deg-s2", type=float, default=700.0)
     ap.add_argument("--rate-hz", type=float, default=100.0)
     ap.add_argument("--post-impact-idle-s", type=float, default=0.4)
     ap.add_argument("--lock-release-after-impact-s", type=float, default=J6_LOCK_RELEASE_AFTER_IMPACT_S)
@@ -1217,22 +1336,19 @@ def main() -> None:
 
     ap.add_argument("--min-lookahead", type=float, default=None)
     ap.add_argument("--max-lookahead", type=float, default=None)
-    ap.add_argument("--tracker-gravity", type=float, default=J9_TRACKER_GRAVITY_MPS2,
+    ap.add_argument("--tracker-gravity", type=float, default=J12_TRACKER_GRAVITY_MPS2,
                     help="Foam-ball prediction gravity; tuned hybrid default from clean J9 recordings.")
-    ap.add_argument("--tracker-drag-coefficient", type=float, default=J9_TRACKER_DRAG_COEFFICIENT,
+    ap.add_argument("--tracker-drag-coefficient", type=float, default=J12_TRACKER_DRAG_COEFFICIENT,
                     help="Foam-ball drag coefficient k in dv/dt = -k*|v|*v.")
-    ap.add_argument("--tracker-simulation-dt", type=float, default=J9_TRACKER_SIMULATION_DT_S,
+    ap.add_argument("--tracker-simulation-dt", type=float, default=J12_TRACKER_SIMULATION_DT_S,
                     help="Drag propagator integration dt in seconds.")
     ap.add_argument("--tracker-history-size", type=int, default=None)
     ap.add_argument("--tracker-history-max-age-s", type=float, default=None)
-    ap.add_argument("--tracker-min-history", type=int, default=J9_TRACKER_MIN_HISTORY)
+    ap.add_argument("--tracker-min-history", type=int, default=J12_TRACKER_MIN_HISTORY)
     ap.add_argument("--tracker-median-window", type=int, default=None)
     ap.add_argument("--tracker-max-implied-speed-mps", type=float, default=None)
     ap.add_argument("--tracker-stale-position-eps-m", type=float, default=None)
     ap.add_argument("--tracker-stale-timeout-s", type=float, default=None)
-    ap.add_argument("--tracker-min-incoming-speed", type=float, default=None,
-                    help="Min x-speed toward robot (m/s) before a prediction is emitted. "
-                         "Default 0.5; lower to start tracking earlier in a high-arc throw.")
 
     # Load YAML defaults before full parse so explicit CLI flags still win
     _pre = argparse.ArgumentParser(add_help=False)
@@ -1248,56 +1364,56 @@ def main() -> None:
     if args.log_file is not None:
         log_path = args.log_file
         if log_path == "auto":
-            log_path = os.path.join(log_dir, f"j9_{run_stamp}.log")
+            log_path = os.path.join(log_dir, f"j12_{run_stamp}.log")
         log_path = os.path.abspath(log_path)
         sys.stdout = _Tee(log_path)
-        print(f"[J9] logging to {log_path}")
+        print(f"[J12] logging to {log_path}")
 
     trace_path = None
     if args.trace_file.lower() != "off":
         trace_path = args.trace_file
         if trace_path == "auto":
-            trace_path = os.path.join(log_dir, f"j9_{run_stamp}.trace.jsonl")
+            trace_path = os.path.join(log_dir, f"j12_{run_stamp}.trace.jsonl")
         trace_path = os.path.abspath(trace_path)
     trace = _TraceLogger(trace_path)
     if trace_path:
-        print(f"[J9] trace logging to {trace_path}")
+        print(f"[J12] trace logging to {trace_path}")
 
     r = redis.Redis(host=args.redis_host, port=args.redis_port, decode_responses=True)
     try:
         r.ping()
     except redis.exceptions.ConnectionError as exc:
-        sys.exit(f"[J9] cannot reach Redis at {args.redis_host}:{args.redis_port}: {exc}")
+        sys.exit(f"[J12] cannot reach Redis at {args.redis_host}:{args.redis_port}: {exc}")
 
     xml_vel_limits = _read_xml_velocity_limits(r)
     if args.vel_cap_rad_s is not None:
         xml_vel_limits = np.asarray(args.vel_cap_rad_s, dtype=float)
         print(
-            f"[J9] vel_cap override (--vel-cap-rad-s): "
+            f"[J12] vel_cap override (--vel-cap-rad-s): "
             f"{np.degrees(xml_vel_limits).round(1).tolist()} deg/s"
         )
     q_start_check = get_vec(r, SENSOR_JOINTS, 7)
     if q_start_check is None or (not args.allow_zero_joint_start and np.max(np.abs(q_start_check)) < 1e-6):
         sys.exit(
-            "[J9] refusing to start: sensed joint state is missing or exactly zero. "
+            "[J12] refusing to start: sensed joint state is missing or exactly zero. "
             "Recover/relaunch the Franka driver/OpenSai after a reflex abort first."
         )
 
     cal_path = args.calibration or arm_base_offset_calibration_path()
     if not os.path.isfile(cal_path):
-        sys.exit(f"[J9] arm base calibration not found: {cal_path}")
+        sys.exit(f"[J12] arm base calibration not found: {cal_path}")
     cal = load_arm_base_offset_calibration(cal_path)
-    print(f"[J9] arm base calibration: {cal_path} (rigid body {cal.base_rigid_body_id})")
+    print(f"[J12] arm base calibration: {cal_path} (rigid body {cal.base_rigid_body_id})")
 
     mock_intercepts = None
     if args.mock_intercept:
         mock_intercepts = [np.asarray(p, dtype=float) for p in args.mock_intercept]
     if not (mock_intercepts and args.mock_identity_base):
         if read_rigid_body_pose_W(r, cal.base_rigid_body_id) is None:
-            sys.exit(f"[J9] cart rigid body {cal.base_rigid_body_id} not visible in Redis")
+            sys.exit(f"[J12] cart rigid body {cal.base_rigid_body_id} not visible in Redis")
 
     if not os.path.isfile(URDF_PATH):
-        sys.exit(f"[J9] URDF not found: {URDF_PATH} (run from OpenSai root)")
+        sys.exit(f"[J12] URDF not found: {URDF_PATH} (run from OpenSai root)")
     chain = build_chain()
 
     if args.skip_cal:
@@ -1307,7 +1423,7 @@ def main() -> None:
         _, offset_link7 = calibrate_offset_link7(r, chain)
 
     if args.print_cal_only:
-        print("[J9] --print-cal-only: done.")
+        print("[J12] --print-cal-only: done.")
         return
 
     q_ready_seed = Q_HOME_RAD.copy()
@@ -1315,7 +1431,7 @@ def main() -> None:
         q_ready_seed = np.radians(np.asarray(args.home_joints_deg, dtype=float))
         q_delta, q_joint = _max_abs_deg_with_joint(q_ready_seed - Q_HOME_RAD)
         print(
-            f"[J9] custom home pose: {_fmt_q(q_ready_seed)} "
+            f"[J12] custom home pose: {_fmt_q(q_ready_seed)} "
             f"(delta imported home {q_delta:.1f}deg@q{q_joint})"
         )
 
@@ -1324,9 +1440,9 @@ def main() -> None:
         R_home_nominal = _link7_R_A(chain, q_ready_seed)
         R_A_link7_home = _rot_y_rad(math.radians(-args.paddle_open_deg)) @ R_home_nominal
         face_A = R_A_link7_home @ (offset_link7 / max(np.linalg.norm(offset_link7), 1e-9))
-        print("[J9] fixed paddle orientation from ready/home pose")
+        print("[J12] fixed paddle orientation from ready/home pose")
         print(
-            f"[J9]   paddle_open={args.paddle_open_deg:+.1f}deg "
+            f"[J12]   paddle_open={args.paddle_open_deg:+.1f}deg "
             f"strike-face normal_A=[{face_A[0]:+.3f},{face_A[1]:+.3f},{face_A[2]:+.3f}]"
         )
 
@@ -1342,17 +1458,17 @@ def main() -> None:
             q_ready = q_candidate
             q_delta, q_joint = _max_abs_deg_with_joint(q_ready - Q_HOME_RAD)
             print(
-                f"[J9] strike-center ready IK: arm_A={_fmt_v3(ready_arm_A)} "
+                f"[J12] strike-center ready IK: arm_A={_fmt_v3(ready_arm_A)} "
                 f"pos={ready_err*1000:.1f}mm ori={ready_ori:.1f}deg delta_home={q_delta:.1f}deg@q{q_joint}"
             )
         else:
             print(
-                f"[J9] WARNING: strike-center ready IK failed pos={ready_err*1000:.1f}mm "
+                f"[J12] WARNING: strike-center ready IK failed pos={ready_err*1000:.1f}mm "
                 f"ori={ready_ori:.1f}deg; using home pose"
             )
             ready_arm_A = None
 
-    print(f"[J9] moving to ready pose ({args.ready_pose}) ...")
+    print(f"[J12] moving to ready pose ({args.ready_pose}) ...")
     q_home_rad = move_to_home_pose(
         r, q_ready,
         move_s=args.home_s,
@@ -1394,10 +1510,8 @@ def main() -> None:
             cfg.stale_position_epsilon_m = args.tracker_stale_position_eps_m
         if args.tracker_stale_timeout_s is not None:
             cfg.stale_position_timeout_s = args.tracker_stale_timeout_s
-        if args.tracker_min_incoming_speed is not None:
-            cfg.min_incoming_speed = args.tracker_min_incoming_speed
         print(
-            f"[J9 tracker] model=foam_drag gravity={cfg.gravity:.2f}m/s^2 "
+            f"[J12 tracker] model=foam_drag gravity={cfg.gravity:.2f}m/s^2 "
             f"drag_k={cfg.drag_coefficient:.3f} sim_dt={cfg.simulation_dt:.4f}s "
             f"hist={cfg.history_size}/{cfg.history_max_age_s:.2f}s "
             f"min_hist={cfg.min_history_for_prediction} median={cfg.median_filter_window} "
@@ -1407,9 +1521,9 @@ def main() -> None:
         keys.ball.__dict__["optitrack_rigid_body_id"] = args.ball_rigid_body_id
         ball_key = keys.ball.optitrack_position
         if r.get(ball_key) is None:
-            print(f"[J9] WARNING: {ball_key} is empty")
+            print(f"[J12] WARNING: {ball_key} is empty")
         else:
-            print(f"[J9] reading ball from {ball_key}")
+            print(f"[J12] reading ball from {ball_key}")
         tracker = FoamBallTracker(r, keys, cfg)
         if trace is not None:
             trace.write(
@@ -1436,6 +1550,9 @@ def main() -> None:
             commit_tti=args.commit_tti,
             contact_margin_s=args.contact_margin_s,
             timing_guard_s=args.timing_guard_s,
+            early_strike_lead_s=args.early_strike_lead_s,
+            min_planned_strike_s=args.min_planned_strike_s,
+            max_planned_strike_s=args.max_planned_strike_s,
             try_late_slack_s=args.try_late_slack_s,
             max_stretched_strike_s=args.max_stretched_strike_s,
             return_s=args.return_s,
@@ -1454,6 +1571,10 @@ def main() -> None:
             ik_tol_m=args.ik_tol_mm / 1000.0,
             z_mode=args.z_mode,
             fixed_arm_z_m=args.fixed_arm_z_m,
+            swing_pre_x_m=args.swing_pre_x_m,
+            swing_pre_z_m=args.swing_pre_z_m,
+            swing_through_x_m=args.swing_through_x_m,
+            swing_through_z_m=args.swing_through_z_m,
             w_ori=args.w_ori,
             max_ori_err_deg=args.max_ori_err_deg,
             strike_arm_x_min_m=args.strike_arm_x_min_m,
@@ -1473,16 +1594,15 @@ def main() -> None:
             lock_release_after_impact_s=args.lock_release_after_impact_s,
             xml_vel_limits=xml_vel_limits,
             trace=trace,
-            fr3_max_hard_ratio=args.fr3_max_hard_ratio,
             ball_key=ball_key,
         )
     except KeyboardInterrupt:
         if args.shutdown_hold_s > 0.0:
             _hold_current_joints_for(r, args.shutdown_hold_s, publish_hz=100.0)
-            print(f"\n[J9] stopped -- refreshed current joint hold for {args.shutdown_hold_s:.1f}s.")
+            print(f"\n[J12] stopped -- refreshed current joint hold for {args.shutdown_hold_s:.1f}s.")
         else:
             _hold_current_joints(r)
-            print("\n[J9] stopped -- holding current joint position in Redis.")
+            print("\n[J12] stopped -- holding current joint position in Redis.")
     finally:
         trace.close()
 

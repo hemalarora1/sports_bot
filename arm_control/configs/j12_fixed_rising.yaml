@@ -1,0 +1,90 @@
+# J12 fixed-rising striker configuration -- picklebot_j9_fast.xml required
+#
+# Launch with:
+#   cd ~/OpenSai
+#   ./scripts/launch.sh config_folder/xml_config_files/picklebot_j9_fast.xml
+#   PYTHONUNBUFFERED=1 python sports_bot/arm_control/stepj12_fixed_rising_swing.py \
+#       --config sports_bot/arm_control/configs/j12_fixed_rising.yaml
+#
+# J12 is intentionally less selective than J9/J9.5. It prepositions behind/below
+# the predicted contact point, then fires a fixed local forward/up stroke through
+# the ball. The goal is to swing at most plausible throws, even when the setup is
+# not pretty, while still respecting the predicted FR3 hard velocity envelope.
+
+# --- Hardware / calibration ---
+skip_cal: true
+offset_link7: [0, 0, 0.39]
+ball_rigid_body_id: 13
+
+# --- Ready / strike geometry ---
+home_joints_deg: [1.045, -24.506, 1.236, -115.213, -2.248, 108.033, -44.010]
+ready_pose: strike-center
+ready_arm_x: 0.52
+ready_arm_y: 0.0
+ready_arm_z: 0.18
+paddle_open_deg: 8
+
+# Robot base is around world x=-1.0. This sits between your -0.30 and -0.25 tests.
+strike_plane_x: -0.28
+z_mode: predicted
+tracker_gravity: 11.0
+tracker_drag_coefficient: 0.10
+tracker_min_history: 4
+tracker_history_max_age_s: 0.15
+tracker_median_window: 3
+
+# --- Strike workspace box: deliberately permissive ---
+world_z_min_m: 0.05
+world_z_max_m: 1.10
+strike_arm_x_min_m: 0.24
+strike_arm_x_max_m: 0.70
+strike_arm_z_min_m: 0.12
+strike_arm_z_max_m: 0.64
+strike_arm_y_abs_max_m: 0.46
+max_ori_err_deg: 18
+
+# --- Fixed local rising stroke geometry in arm frame ---
+# Contact is q_strike. Tracking aims at q_pre = behind/below contact, then the
+# committed stroke passes through contact and finishes at q_through = forward/up.
+swing_pre_x_m: 0.03
+swing_pre_z_m: 0.04
+swing_through_x_m: 0.07
+swing_through_z_m: 0.06
+
+# --- Impact velocity target ---
+forward_speed_mps: 1.45
+up_speed_mps: 0.65
+impact_vel_frac: 0.85
+qdot_damping: 0.03
+
+# Keep q6/q7 slightly backed off; J12's fixed through pose should supply the upstroke.
+vel_cap_rad_s: [1.70, 1.70, 1.70, 1.70, 1.70, 1.78, 1.38]
+swing_vel_frac: 1.00
+
+# --- Commit early and swing often ---
+commit_tti: 0.82
+early_strike_lead_s: 0.10
+min_planned_strike_s: 0.19
+max_planned_strike_s: 0.42
+try_late_slack_s: 999.0
+max_stretched_strike_s: 0.95
+contact_margin_s: 0.0
+timing_guard_s: 0.015
+decel_s: 0.24
+
+# --- Return to strike-ready after impact ---
+return_s: 4.0
+return_vel_frac: 0.25
+
+# --- Pre-commit arm tracking ---
+tracking_step_deg: 1.7
+tracking_accel_deg_s2: 850
+
+# --- Logging ---
+verbose_tracking: true
+full_segment_logs: true
+log_period_s: 0.20
+post_impact_idle_s: 0.45
+shutdown_hold_s: 0
+log_file: auto
+trace_file: auto
