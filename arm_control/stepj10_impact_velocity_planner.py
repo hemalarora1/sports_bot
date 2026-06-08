@@ -735,14 +735,6 @@ def run_loop(
             diagnostic=_driver_diag_snapshot(r),
         )
 
-        def home_trace_cb(**fields) -> None:
-            tr(
-                "home_sample", tick=tick_i, label=label,
-                target_q_deg=np.degrees(q_home_rad),
-                diagnostic=_driver_diag_snapshot(r),
-                **fields,
-            )
-
         ok = _return_home_blocking(
             r, q_home_rad,
             move_s=return_s,
@@ -751,7 +743,6 @@ def run_loop(
             hold_s=0.35,
             publish_hz=100.0,
             full_segment_logs=full_segment_logs,
-            trace_cb=home_trace_cb if trace is not None else None,
         )
         active_cand = None
         last_q_cmd = get_vec(r, SENSOR_JOINTS, 7) if ok else _hold_current_joints(r)
