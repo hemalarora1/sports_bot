@@ -38,6 +38,7 @@ _OFFSET_L7 = np.array([0.0, 0.0, 0.39])
 # Colours match ball_tracker_test.py
 _REJECT_COLORS: dict[str, tuple] = {
     "":                     (0,   220,  60),   # prediction OK → green
+    "preposition":          (255, 140,   0),   # orange — relaxed bounce, commit blocked
     "insufficient_history": (130, 130, 130),   # grey
     "not_incoming":         (200, 140,   0),   # amber
     "would_bounce":         (210,  30,  30),   # red
@@ -58,6 +59,7 @@ class BallTick:
     intercept_pos_W: Optional[np.ndarray] = None
     tti_s: Optional[float] = None
     q_arm_deg: Optional[np.ndarray] = None  # interpolated from goal_write
+    is_preposition: bool = False
 
 
 @dataclass
@@ -82,6 +84,9 @@ class ThrowData:
 
 
 # ── trace parser ─────────────────────────────────────────────────────────────
+_PRE_COMMIT_WINDOW_S = 2.0   # only show ball/arm data this many seconds before commit
+
+
 def _parse_trace(path: Path) -> List[ThrowData]:
     events: List[dict] = []
     with open(path) as f:
@@ -127,11 +132,16 @@ def _parse_trace(path: Path) -> List[ThrowData]:
                 track_start = j + 1
                 break
 
+        window_start_t = throw.commit_t - _PRE_COMMIT_WINDOW_S
+
         for j in range(track_start, commit_idx):
             ev = events[j]
             event = ev.get("event", "")
+            ev_t = float(ev.get("t_mono", 0.0))
 
             if event == "tracker_tick":
+                if ev_t < window_start_t:
+                    continue
                 pos = ev.get("raw_ball") or ev.get("sample_pos_W")
                 if pos is None:
                     continue
@@ -139,6 +149,11 @@ def _parse_trace(path: Path) -> List[ThrowData]:
                 if pos.shape != (3,) or not np.all(np.isfinite(pos)):
                     continue
                 reject = ev.get("reject_reason") or ""
+                is_prepos = bool(ev.get("is_preposition", False))
+                # Preposition ticks have an intercept but commit is blocked —
+                # show them orange so they're distinct from green (clean) ticks.
+                if is_prepos and reject == "":
+                    reject = "preposition"
                 intercept_pos = None
                 tti = None
                 intercept = ev.get("intercept")
@@ -153,9 +168,12 @@ def _parse_trace(path: Path) -> List[ThrowData]:
                     reject_reason=reject,
                     intercept_pos_W=intercept_pos,
                     tti_s=float(tti) if tti is not None else None,
+                    is_preposition=is_prepos,
                 ))
 
             elif event == "goal_write":
+                if ev_t < window_start_t:
+                    continue
                 q = ev.get("q_cmd_deg")
                 if q is not None:
                     throw.arm_tracking.append((float(ev["t_mono"]), np.array(q, dtype=float)))
@@ -308,21 +326,23 @@ def _run_viser(throws: List[ThrowData], chain, port: int) -> None:
         )
 
     with server.gui.add_folder("Display"):
-        cb_ball       = server.gui.add_checkbox("Ball trajectory",               True)
-        cb_reject_col = server.gui.add_checkbox("Rejection-reason colours",      True)
-        cb_tracking   = server.gui.add_checkbox("Arm tracking path (pre-commit)", True)
-        cb_swing      = server.gui.add_checkbox("Arm actual swing path",          True)
-        cb_planned    = server.gui.add_checkbox("Planned Hermite path",           True)
-        cb_intercepts = server.gui.add_checkbox("Intercept cloud (all ticks)",    False)
+        cb_ball          = server.gui.add_checkbox("Ball trajectory",                True)
+        cb_reject_col    = server.gui.add_checkbox("Rejection-reason colours",       True)
+        cb_not_incoming  = server.gui.add_checkbox("Show not-incoming ticks",        False)
+        cb_tracking      = server.gui.add_checkbox("Arm tracking path (pre-commit)", True)
+        cb_swing         = server.gui.add_checkbox("Arm actual swing path",          True)
+        cb_planned       = server.gui.add_checkbox("Planned Hermite path",           True)
+        cb_intercepts    = server.gui.add_checkbox("Intercept cloud (all ticks)",    False)
 
     with server.gui.add_folder("Rejection legend"):
-        server.gui.add_text("● green",   "prediction OK",        disabled=True)
-        server.gui.add_text("● grey",    "insufficient_history", disabled=True)
-        server.gui.add_text("● amber",   "not_incoming",         disabled=True)
-        server.gui.add_text("● red",     "would_bounce",         disabled=True)
-        server.gui.add_text("● blue",    "tti_too_long",         disabled=True)
-        server.gui.add_text("● magenta", "tti_too_short",        disabled=True)
-        server.gui.add_text("● purple",  "past_plane",           disabled=True)
+        server.gui.add_text("● green",   "prediction OK",                        disabled=True)
+        server.gui.add_text("● orange",  "preposition (bounce ok, no commit)",   disabled=True)
+        server.gui.add_text("● grey",    "insufficient_history",                 disabled=True)
+        server.gui.add_text("● amber",   "not_incoming",                         disabled=True)
+        server.gui.add_text("● red",     "would_bounce",                         disabled=True)
+        server.gui.add_text("● blue",    "tti_too_long",                         disabled=True)
+        server.gui.add_text("● magenta", "tti_too_short",                        disabled=True)
+        server.gui.add_text("● purple",  "past_plane",                           disabled=True)
 
     with server.gui.add_folder("Commit / Impact"):
         ui_commit_tti  = server.gui.add_text("Commit TTI",       "—", disabled=True)
@@ -382,12 +402,15 @@ def _run_viser(throws: List[ThrowData], chain, port: int) -> None:
                 ui_v_measured.value = f"[{mv[0]:+.2f}, {mv[1]:+.2f}, {mv[2]:+.2f}] m/s"
 
         # ── ball trajectory ───────────────────────────────────────────────────
-        if cb_ball.value and throw.ball_ticks:
-            positions = np.array([tk.ball_pos for tk in throw.ball_ticks], dtype=np.float32)
+        _ball_ticks = throw.ball_ticks
+        if not cb_not_incoming.value:
+            _ball_ticks = [tk for tk in _ball_ticks if tk.reject_reason != "not_incoming"]
+        if cb_ball.value and _ball_ticks:
+            positions = np.array([tk.ball_pos for tk in _ball_ticks], dtype=np.float32)
             if cb_reject_col.value:
                 n = len(positions)
                 colors = np.zeros((n, 3), dtype=np.uint8)
-                for j, tk in enumerate(throw.ball_ticks):
+                for j, tk in enumerate(_ball_ticks):
                     colors[j] = _REJECT_COLORS.get(tk.reject_reason, _DEFAULT_REJECT_COLOR)
             else:
                 colors = np.tile(np.uint8([160, 160, 160]), (len(positions), 1))
@@ -401,8 +424,8 @@ def _run_viser(throws: List[ThrowData], chain, port: int) -> None:
                 )
 
         # ── current ball tick ──────────────────────────────────────────────────
-        if throw.ball_ticks:
-            tick = throw.ball_ticks[ti]
+        if _ball_ticks:
+            tick = _ball_ticks[ti] if ti < len(_ball_ticks) else _ball_ticks[-1]
             _handles["ball_cur"] = server.scene.add_icosphere(
                 "/throw/ball_cur", radius=0.055, color=(255, 60, 60),
                 position=tuple(tick.ball_pos.tolist()),
@@ -555,7 +578,7 @@ def _run_viser(throws: List[ThrowData], chain, port: int) -> None:
         _state["tick_idx"] = int(tick_slider.value)
         _redraw()
 
-    for _cb in (cb_ball, cb_reject_col, cb_tracking, cb_swing, cb_planned, cb_intercepts):
+    for _cb in (cb_ball, cb_reject_col, cb_not_incoming, cb_tracking, cb_swing, cb_planned, cb_intercepts):
         @_cb.on_update
         def _(_): _redraw()
 
@@ -570,6 +593,7 @@ def _run_viser(throws: List[ThrowData], chain, port: int) -> None:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def main() -> int:
+    global _PRE_COMMIT_WINDOW_S
     parser = argparse.ArgumentParser(
         description="Visualize J9 throw trace (.trace.jsonl) in Viser.",
     )
@@ -578,12 +602,16 @@ def main() -> int:
                         help="Viser web port (default 8081, avoids clash with foam-ball viz at 8080).")
     parser.add_argument("--no-viser", action="store_true",
                         help="Print throw summary and exit without launching Viser.")
+    parser.add_argument("--pre-commit-window-s", type=float, default=_PRE_COMMIT_WINDOW_S,
+                        help="Only show ball/arm ticks within this many seconds before commit (default %(default)s).")
     args = parser.parse_args()
 
     path = Path(args.trace)
     if not path.exists():
         print(f"[j9-viz] not found: {path}", file=sys.stderr)
         return 1
+
+    _PRE_COMMIT_WINDOW_S = args.pre_commit_window_s
 
     print(f"[j9-viz] parsing {path.name} ...")
     throws = _parse_trace(path)

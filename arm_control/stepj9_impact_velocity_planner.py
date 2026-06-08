@@ -815,6 +815,7 @@ def run_loop(
         raw_ball_parsed = _parse_raw_json(raw_ball)
         switch_ctrl(r, JOINT_CTRL)
 
+        is_preposition = False
         if using_mock:
             idx = 0
             if mock_cycle_s > 0.0 and len(mock_intercepts or []) > 1:
@@ -828,6 +829,15 @@ def run_loop(
             sample = tracker.update()
             intercept = tracker.predict_intercept(strike_plane_x_world)
             reason = getattr(tracker, "last_reject_reason", "") or "no_prediction"
+            # When the accurate prediction is blocked by would_bounce, fall back to a
+            # relaxed preposition prediction so the arm moves toward the strike zone
+            # early. Commit is suppressed while this fallback is active.
+            is_preposition = False
+            if intercept is None and reason == "would_bounce":
+                prepos = tracker.predict_intercept_preposition(strike_plane_x_world)
+                if prepos is not None:
+                    intercept = prepos
+                    is_preposition = True
 
         tr(
             "tracker_tick", tick=tick_i, raw_ball=raw_ball_parsed,
@@ -837,6 +847,7 @@ def run_loop(
             reject_reason=None if intercept is not None else reason,
             intercept=_intercept_snapshot(intercept),
             active_candidate=_candidate_snapshot(active_cand),
+            is_preposition=is_preposition,
         )
 
         if mock_identity_base:
@@ -977,10 +988,12 @@ def run_loop(
             and cand.min_strike_s <= max_stretched_strike_s
             and (try_late_slack_s <= 0.0 or late_by_s <= try_late_slack_s)
         )
-        commit_now = (not no_commit) and aged_tti <= commit_tti and (feasible or late_try)
+        commit_now = (not no_commit) and aged_tti <= commit_tti and (feasible or late_try) and not is_preposition
         state = "AIM"
-        if aged_tti <= commit_tti:
+        if aged_tti <= commit_tti and not is_preposition:
             state = "COMMIT" if feasible else ("TRY" if late_try else "LATE")
+        elif is_preposition:
+            state = "PREPOS"
 
         tr(
             "candidate_runtime", tick=tick_i, state=state, feasible=feasible, late_try=late_try,
@@ -1228,11 +1241,19 @@ def main() -> None:
     ap.add_argument("--tracker-min-history", type=int, default=J9_TRACKER_MIN_HISTORY)
     ap.add_argument("--tracker-median-window", type=int, default=None)
     ap.add_argument("--tracker-max-implied-speed-mps", type=float, default=None)
+    ap.add_argument("--tracker-max-position-jump", type=float, default=None,
+                    help="Max ball position jump (m) between samples before rejecting. Default 0.5m. "
+                         "Raise to ~1.5 to survive OptiTrack dropouts mid-throw.")
     ap.add_argument("--tracker-stale-position-eps-m", type=float, default=None)
     ap.add_argument("--tracker-stale-timeout-s", type=float, default=None)
     ap.add_argument("--tracker-min-incoming-speed", type=float, default=None,
                     help="Min x-speed toward robot (m/s) before a prediction is emitted. "
                          "Default 0.5; lower to start tracking earlier in a high-arc throw.")
+    ap.add_argument("--tracker-preposition-max-bounces", type=int, default=None,
+                    help="When predict_intercept rejects with would_bounce, retry with this "
+                         "relaxed bounce limit for arm pre-positioning. Default 0 (disabled). "
+                         "Set to 1 to allow pre-positioning from ~1s earlier on long throws. "
+                         "Commit is blocked while the preposition fallback is active.")
 
     # Load YAML defaults before full parse so explicit CLI flags still win
     _pre = argparse.ArgumentParser(add_help=False)
@@ -1390,12 +1411,16 @@ def main() -> None:
             cfg.median_filter_window = args.tracker_median_window
         if args.tracker_max_implied_speed_mps is not None:
             cfg.max_implied_speed_mps = args.tracker_max_implied_speed_mps
+        if args.tracker_max_position_jump is not None:
+            cfg.max_position_jump = args.tracker_max_position_jump
         if args.tracker_stale_position_eps_m is not None:
             cfg.stale_position_epsilon_m = args.tracker_stale_position_eps_m
         if args.tracker_stale_timeout_s is not None:
             cfg.stale_position_timeout_s = args.tracker_stale_timeout_s
         if args.tracker_min_incoming_speed is not None:
             cfg.min_incoming_speed = args.tracker_min_incoming_speed
+        if args.tracker_preposition_max_bounces is not None:
+            cfg.preposition_max_bounces = args.tracker_preposition_max_bounces
         print(
             f"[J9 tracker] model=foam_drag gravity={cfg.gravity:.2f}m/s^2 "
             f"drag_k={cfg.drag_coefficient:.3f} sim_dt={cfg.simulation_dt:.4f}s "

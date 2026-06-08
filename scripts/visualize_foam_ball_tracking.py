@@ -11,7 +11,7 @@ Example:
         sports_bot/recordings/new_ball_20260601_083510.npz \
         --strike-plane-x -0.30 \
         --gravity 11.0 \
-        --drag-coefficient 0.10
+        --drag-coefficient 0.14
 """
 
 from __future__ import annotations
@@ -142,6 +142,13 @@ def _replay_foam(
                 rec.is_incoming = bool(v0[0] < -tracker._cfg.min_incoming_speed)
             intercept = tracker.predict_intercept(strike_plane_x)
             rec.reject_reason = getattr(tracker, "last_reject_reason", REJECT_NONE)
+            if intercept is None and rec.reject_reason == "would_bounce":
+                # Try relaxed preposition prediction so the arc shows orange
+                # instead of a gap — matches J9 planner fallback behaviour.
+                prepos = tracker.predict_intercept_preposition(strike_plane_x)
+                if prepos is not None:
+                    intercept = prepos
+                    rec.reject_reason = "preposition"
             if intercept is not None:
                 rec.intercept_pos = intercept.position
                 rec.intercept_vel = intercept.velocity
@@ -245,6 +252,7 @@ def _build_cfg(args: argparse.Namespace) -> PickleballConfig:
     cfg.tracker.min_history_for_prediction = args.min_history_for_prediction
     cfg.tracker.median_filter_window = args.median_filter_window
     cfg.tracker.max_bounces = args.max_bounces
+    cfg.tracker.preposition_max_bounces = args.preposition_max_bounces
     cfg.tracker.online_bounce_pruning = not args.no_online_bounce_pruning
     cfg.tracker.min_incoming_speed = args.min_incoming_speed
     cfg.tracker.max_implied_speed_mps = args.max_implied_speed_mps
@@ -263,13 +271,16 @@ def main() -> int:
     parser.add_argument("--no-viser", action="store_true")
     parser.add_argument("--strike-plane-x", type=float, default=-0.30)
     parser.add_argument("--gravity", "--tracker-gravity", dest="gravity", type=float, default=11.0)
-    parser.add_argument("--drag-coefficient", "--tracker-drag-coefficient", dest="drag_coefficient", type=float, default=0.10)
+    parser.add_argument("--drag-coefficient", "--tracker-drag-coefficient", dest="drag_coefficient", type=float, default=0.14)
     parser.add_argument("--simulation-dt", "--tracker-simulation-dt", dest="simulation_dt", type=float, default=0.001)
     parser.add_argument("--history-size", "--tracker-history-size", dest="history_size", type=int, default=12)
     parser.add_argument("--history-max-age-s", "--tracker-history-max-age-s", dest="history_max_age_s", type=float, default=0.15)
     parser.add_argument("--min-history-for-prediction", "--tracker-min-history", dest="min_history_for_prediction", type=int, default=4)
     parser.add_argument("--median-filter-window", "--tracker-median-window", dest="median_filter_window", type=int, default=3)
     parser.add_argument("--max-bounces", type=int, default=0)
+    parser.add_argument("--preposition-max-bounces", dest="preposition_max_bounces", type=int, default=1,
+                        help="Relaxed bounce limit for arm pre-positioning fallback (default 1, matches YAML). "
+                             "Set to 0 to disable orange preposition overlay.")
     parser.add_argument("--no-online-bounce-pruning", action="store_true")
     parser.add_argument("--min-incoming-speed", type=float, default=0.5)
     parser.add_argument("--max-implied-speed-mps", "--tracker-max-implied-speed-mps", dest="max_implied_speed_mps", type=float, default=15.0)

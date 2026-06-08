@@ -280,6 +280,11 @@ class BallTrackerConfig:
     bounce_restitution: float = 0.70         # e = -v_z_after / v_z_before
     bounce_tangential_damping: float = 0.62  # μ_t = ||v_xy_after|| / ||v_xy_before||
     max_bounces: int = 0                     # volley-only by default; flip to 1 for bounces
+    # When predict_intercept returns REJECT_WOULD_BOUNCE, predict_intercept_preposition
+    # retries with this relaxed bounce limit so the arm can pre-position toward a rough
+    # intercept before the accurate prediction arrives. Set to 1 to allow one bounce.
+    # Commit is blocked while the preposition fallback is active.
+    preposition_max_bounces: int = 0
     # Treat the ball as "at/below floor" (model breaks down) below this z.
     floor_epsilon: float = 1e-3
 

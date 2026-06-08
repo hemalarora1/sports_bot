@@ -78,6 +78,7 @@ REJECT_COLORS: dict = {
     REJECT_WOULD_BOUNCE: (220, 60, 60),           # red — volley filter fired
     REJECT_TTI_TOO_LONG: (60, 100, 220),          # blue — too far ahead
     REJECT_TTI_TOO_SHORT: (200, 60, 200),         # magenta — basically at plane
+    "preposition": (255, 140, 0),                 # orange — relaxed bounce prediction (arm pre-positions, commit blocked)
 }
 
 
@@ -970,14 +971,15 @@ def _run_viser(throws: List[Throw], cfg: PickleballConfig, port: int) -> None:
     with server.gui.add_folder("Rejection legend"):
         # Static reference for the colored trajectory overlay. Keep in sync
         # with REJECT_COLORS at module top.
-        server.gui.add_text("● green",   "prediction OK",        disabled=True)
-        server.gui.add_text("● grey",    "insufficient_history", disabled=True)
-        server.gui.add_text("● amber",   "not_incoming",         disabled=True)
-        server.gui.add_text("● red",     "would_bounce",         disabled=True)
-        server.gui.add_text("● blue",    "tti_too_long",         disabled=True)
-        server.gui.add_text("● magenta", "tti_too_short",        disabled=True)
-        server.gui.add_text("● purple",  "past_plane",           disabled=True)
-        server.gui.add_text("● brown",   "on_floor",             disabled=True)
+        server.gui.add_text("● green",   "prediction OK",                       disabled=True)
+        server.gui.add_text("● orange",  "preposition (bounce allowed, no commit)", disabled=True)
+        server.gui.add_text("● grey",    "insufficient_history",                disabled=True)
+        server.gui.add_text("● amber",   "not_incoming",                        disabled=True)
+        server.gui.add_text("● red",     "would_bounce",                        disabled=True)
+        server.gui.add_text("● blue",    "tti_too_long",                        disabled=True)
+        server.gui.add_text("● magenta", "tti_too_short",                       disabled=True)
+        server.gui.add_text("● purple",  "past_plane",                          disabled=True)
+        server.gui.add_text("● brown",   "on_floor",                            disabled=True)
 
     with server.gui.add_folder("Tick info"):
         info_t = server.gui.add_text("t (s)", "—", disabled=True)

@@ -72,6 +72,8 @@ def _propagate_drag_to_plane(
     v0: np.ndarray,
     target_x: float,
     cfg: FoamBallConfig,
+    *,
+    max_bounces_override: Optional[int] = None,
 ):
     """Propagate a foam ball trajectory to x = target_x using drag physics.
 
@@ -92,6 +94,7 @@ def _propagate_drag_to_plane(
     dt = cfg.simulation_dt
     t_total = 0.0
     n_bounces = 0
+    max_bounces = cfg.max_bounces if max_bounces_override is None else max_bounces_override
 
     # Initial sanity checks (mirror _propagate_to_plane)
     if v[0] >= 0:
@@ -131,7 +134,7 @@ def _propagate_drag_to_plane(
 
         # --- Did ball cross the floor (z = 0) this step? ---
         if p[2] > cfg.floor_epsilon and p_new[2] <= cfg.floor_epsilon and v_new[2] <= 0:
-            if n_bounces >= cfg.max_bounces:
+            if n_bounces >= max_bounces:
                 return REJECT_WOULD_BOUNCE
             # Linear interpolation to the exact floor-crossing instant
             denom = max(p[2] - p_new[2], 1e-12)
@@ -191,11 +194,26 @@ class FoamBallTracker(BallTracker):
         super().__init__(redis_client, keys, cfg)
 
     def predict_intercept(self, strike_plane_x: float) -> Optional[Intercept]:
-        """Solve for ball state at x = strike_plane_x using drag physics.
+        """Solve for ball state at x = strike_plane_x using drag physics."""
+        return self._predict_impl(strike_plane_x, self._cfg.max_bounces)
 
-        Identical logic to BallTracker.predict_intercept but substitutes
-        _propagate_drag_to_plane for _propagate_to_plane.
+    def predict_intercept_preposition(self, strike_plane_x: float) -> Optional[Intercept]:
+        """Rough intercept for arm pre-positioning using relaxed bounce limit.
+
+        Called when predict_intercept returns None due to REJECT_WOULD_BOUNCE.
+        Uses preposition_max_bounces (typically 1) so the arm can start moving
+        toward the approximate strike zone 0.5–1.5 s before the accurate
+        prediction arrives. The caller must block commit while this is active.
+        Does not overwrite last_reject_reason.
         """
+        if self._cfg.preposition_max_bounces <= self._cfg.max_bounces:
+            return None
+        saved_reason = self.last_reject_reason
+        result = self._predict_impl(strike_plane_x, self._cfg.preposition_max_bounces)
+        self.last_reject_reason = saved_reason  # keep original rejection visible to caller
+        return result
+
+    def _predict_impl(self, strike_plane_x: float, max_bounces: int) -> Optional[Intercept]:
         self.last_reject_reason = REJECT_NONE
         min_hist = max(3, self._cfg.min_history_for_prediction)
         if len(self._history) < min_hist:
@@ -212,7 +230,9 @@ class FoamBallTracker(BallTracker):
             self.last_reject_reason = REJECT_NOT_INCOMING
             return None
 
-        result = _propagate_drag_to_plane(p0, v0, strike_plane_x, self._cfg)
+        result = _propagate_drag_to_plane(
+            p0, v0, strike_plane_x, self._cfg, max_bounces_override=max_bounces
+        )
         if isinstance(result, str):
             self.last_reject_reason = result
             return None

@@ -22,15 +22,18 @@ paddle_open_deg: 8
 strike_plane_x: -0.25
 z_mode: predicted
 tracker_gravity: 11.0
-tracker_drag_coefficient: 0.10
-tracker_min_history: 4
+tracker_drag_coefficient: 0.14      # fitted from new_ball_20260608 recordings; best all-TTI error (13.4cm vs 16.1cm at 0.10)
+tracker_min_history: 3                  # at 240Hz, 3 samples = 12ms to first prediction vs 16ms for 4
 tracker_history_max_age_s: 0.15
 tracker_median_window: 3
-tracker_min_incoming_speed: 0.15    # default 0.5; lower = predictions start earlier in high-arc throws
+tracker_min_incoming_speed: 0.50
+max_lookahead: 3.0                  # default 1.5; raise so arm pre-positions during early arc
+tracker_max_position_jump: 1.5      # default 0.5; raise to survive OptiTrack dropouts mid-throw
+preposition_max_bounces: 1          # retry with 1 bounce when would_bounce fires; lets arm pre-position from ~1s earlier; commit blocked until accurate prediction arrives
 
 # --- Strike workspace box (arm frame, meters) ---
 world_z_min_m: 0.05
-world_z_max_m: 1.10
+world_z_max_m: 1.40                 # raised from 1.10; ball arrives z=1.1-1.4m at plane on high-arc throws
 strike_arm_x_min_m: 0.25
 strike_arm_x_max_m: 0.65          # singularity limit; keep arm_A.x well below this
 strike_arm_z_min_m: 0.22          # floor: real throws land at ~0.21m arm-frame z
