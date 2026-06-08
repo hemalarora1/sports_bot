@@ -1,0 +1,88 @@
+# J10 fast-strike configuration — picklebot_j9_fast.xml required.
+# J10 = J9 + base lateral Y tracking while waiting to commit.
+#
+# Launch with:
+#   cd ~/OpenSai
+#   ./scripts/launch.sh config_folder/xml_config_files/picklebot_j9_fast.xml
+#   PYTHONUNBUFFERED=1 python sports_bot/arm_control/stepj10_impact_velocity_planner.py \
+#       --config sports_bot/arm_control/configs/j10_strike_fast.yaml
+#
+# Any flag here can be overridden on the CLI, e.g.:
+#   ... --config j10_strike_fast.yaml --max-swings 1
+#
+# Base tracking is optional; enable by setting base_ready_x here or passing
+# --base-ready-x on the CLI. Without it, J10 behaves identically to J9.
+
+# --- Hardware / calibration ---
+skip_cal: true
+offset_link7: [0, 0, 0.39]
+ball_rigid_body_id: 13
+
+# --- Ready / home pose ---
+home_joints_deg: [1.045, -24.506, 1.236, -115.213, -2.248, 108.033, -44.010]
+ready_pose: home
+paddle_open_deg: 8
+
+# --- Ball tracker ---
+strike_plane_x: -0.30
+z_mode: predicted
+tracker_gravity: 11.0
+tracker_drag_coefficient: 0.10
+tracker_min_history: 4
+tracker_history_max_age_s: 0.15
+tracker_median_window: 3
+
+# --- Strike workspace box (arm frame, meters) ---
+# J10 uses wider Y since the cart tracks laterally.
+world_z_min_m: 0.05
+world_z_max_m: 1.40
+strike_arm_x_min_m: 0.3
+strike_arm_x_max_m: 0.6
+strike_arm_z_min_m: 0.3
+strike_arm_z_max_m: 0.5
+strike_arm_y_abs_max_m: 0.70      # wider than J9 (0.38) — cart compensates laterally
+max_ori_err_deg: 15
+
+# --- Impact velocity target ---
+forward_speed_mps: 1.50
+up_speed_mps: 0.80
+impact_vel_frac: 1.00
+qdot_damping: 0.03
+
+# --- Joint velocity cap override (rad/s) ---
+vel_cap_rad_s: [2.0, 2.0, 2.0, 2.0, 2.0, 2.5, 2.0]
+
+# --- Swing timing ---
+swing_vel_frac: 1.00
+decel_s: 0.20
+commit_tti: 0.90
+try_late_slack_s: 0.30
+max_stretched_strike_s: 0.90
+contact_margin_s: 0.0
+timing_guard_s: 0.025
+
+# --- Return home after impact ---
+return_s: 4.0
+return_vel_frac: 0.35
+
+# --- Pre-commit arm tracking ---
+tracking_step_deg: 1.8
+tracking_accel_deg_s2: 1000
+
+# --- Base lateral tracking ---
+# Uncomment and set base_ready_x to enable. X/yaw stay fixed; only Y tracks.
+base_ready_x: -1.0
+base_ready_y: 0.0
+base_ready_yaw_deg: 0.0
+base_y_min: -0.5
+base_y_max: 0.5
+base_hold_after_lost_s: 0.6
+
+# --- Logging & output ---
+verbose_tracking: true
+full_segment_logs: true
+log_period_s: 0.20
+post_impact_idle_s: 0.4
+shutdown_hold_s: 0
+log_file: auto
+trace_file: auto

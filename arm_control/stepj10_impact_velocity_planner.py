@@ -169,6 +169,17 @@ def _candidate_snapshot(cand: ImpactCandidate | None) -> dict | None:
     }
 
 
+def _load_yaml_defaults(path: str) -> dict:
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError(
+            f"pyyaml is required to use --config; install with: pip install pyyaml"
+        ) from exc
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
 def _read_xml_velocity_limits(r: redis.Redis) -> np.ndarray:
     limits = J6_XML_VEL_LIMIT_RAD_S.copy()
     key = f"{NS}::{JOINT_CTRL}::joint_task::velocity_saturation_limit"
@@ -428,12 +439,19 @@ def _make_impact_candidate(
     qdot_strike, achieved_v_A, _raw_peak = _solve_qdot_for_velocity(
         J_A, desired_v_A, qdot_cap, qdot_damping,
     )
+    # Clip qdot_strike to 92% of position-dependent FR3 hard limits at q_strike.
+    # Prevents Franka reflex aborts when q_strike is near a joint range endpoint.
+    _fr3 = _fr3_driver_velocity_bands_rad(q_strike)
+    _fr3_cap = np.where(qdot_strike >= 0.0, _fr3["hard_max"] * 0.92, _fr3["hard_min"] * 0.92)
+    qdot_strike = np.clip(qdot_strike, np.minimum(_fr3_cap, 0.0), np.maximum(_fr3_cap, 0.0))
+    achieved_v_A = J_A @ qdot_strike
     achieved_v_W = R_W_A @ achieved_v_A
 
-    # Short, disposable decel target. The impact velocity is the objective;
-    # q_stop exists only to bleed off the swing after contact.
-    q_stop = q_strike + 0.5 * qdot_strike * max(0.05, decel_s)
-    q_stop = np.clip(q_stop, Q_LO + 0.02, Q_HI - 0.02)
+    # Decel target: limit per-joint excursion to 8 deg past q_strike so the arm
+    # doesn't land in a weird extended config before returning home.
+    _decel_delta = np.clip(0.5 * qdot_strike * max(0.05, decel_s),
+                           -np.radians(8.0), np.radians(8.0))
+    q_stop = np.clip(q_strike + _decel_delta, Q_LO + 0.15, Q_HI - 0.15)
 
     strike_time_s = tti + contact_margin_s - timing_guard_s
     if strike_time_s <= 0.035:
@@ -1005,6 +1023,7 @@ def run_loop(
             )
             if _safety_tripped(r):
                 print("[J10] safety torque after impact; recovering slowly")
+            _hold_current_joints_for(r, 0.75, publish_hz=100.0)
             if base_ready_pose is not None:
                 r.set(base_goal_key, json.dumps(list(base_ready_pose)))
                 base_at_ready = True
@@ -1041,6 +1060,8 @@ def main() -> None:
         description="J10: high-commit impact-velocity pickleball striker + base lateral tracking.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    ap.add_argument("--config", type=str, default=None, metavar="FILE",
+                    help="YAML config file; values become defaults that CLI flags override.")
     ap.add_argument("--ball-rigid-body-id", type=int, default=13)  # RigidBody002
     ap.add_argument("--strike-plane-x", type=float, default=-0.55)
     ap.add_argument("--mock-intercept", nargs=3, type=float, action="append")
@@ -1060,6 +1081,8 @@ def main() -> None:
     ap.add_argument("--contact-margin-s", type=float, default=0.0)
     ap.add_argument("--timing-guard-s", type=float, default=0.025)
     ap.add_argument("--swing-vel-frac", type=float, default=0.85)
+    ap.add_argument("--vel-cap-rad-s", nargs=7, type=float, default=None, metavar="RAD_S",
+                    help="Per-joint velocity cap (rad/s) for the trajectory planner; overrides XML limits.")
 
     ap.add_argument("--return-s", type=float, default=5.0)
     ap.add_argument("--return-vel-frac", type=float, default=0.30)
@@ -1129,6 +1152,12 @@ def main() -> None:
 
     ap.add_argument("--min-lookahead", type=float, default=None)
     ap.add_argument("--max-lookahead", type=float, default=None)
+    ap.add_argument("--tracker-gravity", type=float, default=None,
+                    help="Foam-ball prediction gravity (m/s^2); default uses FoamBallConfig value.")
+    ap.add_argument("--tracker-drag-coefficient", type=float, default=None,
+                    help="Foam-ball drag coefficient k in dv/dt = -k*|v|*v.")
+    ap.add_argument("--tracker-simulation-dt", type=float, default=None,
+                    help="Drag propagator integration dt (s).")
     ap.add_argument("--tracker-history-size", type=int, default=None)
     ap.add_argument("--tracker-history-max-age-s", type=float, default=None)
     ap.add_argument("--tracker-min-history", type=int, default=None)
@@ -1136,6 +1165,16 @@ def main() -> None:
     ap.add_argument("--tracker-max-implied-speed-mps", type=float, default=None)
     ap.add_argument("--tracker-stale-position-eps-m", type=float, default=None)
     ap.add_argument("--tracker-stale-timeout-s", type=float, default=None)
+
+    # Two-pass YAML loading: extract --config with a minimal parser, apply as defaults,
+    # then re-parse so CLI flags win over YAML values.
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument("--config", type=str, default=None)
+    _pre_ns, _ = _pre.parse_known_args()
+    if _pre_ns.config is not None:
+        _yaml_cfg = _load_yaml_defaults(_pre_ns.config)
+        _known = {a.dest for a in ap._actions}
+        ap.set_defaults(**{k: v for k, v in _yaml_cfg.items() if k in _known})
 
     args = ap.parse_args()
     run_stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1166,6 +1205,10 @@ def main() -> None:
         sys.exit(f"[J10] cannot reach Redis at {args.redis_host}:{args.redis_port}: {exc}")
 
     xml_vel_limits = _read_xml_velocity_limits(r)
+    if args.vel_cap_rad_s is not None:
+        xml_vel_limits = np.asarray(args.vel_cap_rad_s, dtype=float)
+        print(f"[J10] vel_cap_rad_s override: {xml_vel_limits.tolist()} rad/s "
+              f"({np.degrees(xml_vel_limits).round(1).tolist()} deg/s)")
     q_start_check = get_vec(r, SENSOR_JOINTS, 7)
     if q_start_check is None or (not args.allow_zero_joint_start and np.max(np.abs(q_start_check)) < 1e-6):
         sys.exit(
@@ -1254,6 +1297,12 @@ def main() -> None:
     ball_key = None
     if mock_intercepts is None:
         cfg = FoamBallConfig()
+        if args.tracker_gravity is not None:
+            cfg.gravity = args.tracker_gravity
+        if args.tracker_drag_coefficient is not None:
+            cfg.drag_coefficient = args.tracker_drag_coefficient
+        if args.tracker_simulation_dt is not None:
+            cfg.simulation_dt = args.tracker_simulation_dt
         if args.min_lookahead is not None:
             cfg.min_lookahead = args.min_lookahead
         if args.max_lookahead is not None:
@@ -1273,7 +1322,9 @@ def main() -> None:
         if args.tracker_stale_timeout_s is not None:
             cfg.stale_position_timeout_s = args.tracker_stale_timeout_s
         print(
-            f"[J10 tracker] hist={cfg.history_size}/{cfg.history_max_age_s:.2f}s "
+            f"[J10 tracker] model=foam_drag gravity={cfg.gravity:.2f}m/s^2 "
+            f"drag_k={cfg.drag_coefficient:.3f} sim_dt={cfg.simulation_dt:.4f}s "
+            f"hist={cfg.history_size}/{cfg.history_max_age_s:.2f}s "
             f"min_hist={cfg.min_history_for_prediction} median={cfg.median_filter_window} "
             f"lookahead=[{cfg.min_lookahead:.2f},{cfg.max_lookahead:.2f}]s"
         )

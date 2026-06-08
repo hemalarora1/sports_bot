@@ -1,0 +1,84 @@
+# J11 fast-strike configuration — picklebot_j9_fast.xml required.
+#
+# J11 = J9 with monotonic qdot_strike: each joint drives at vel_cap in the
+# direction from home toward q_strike. No Jacobian whip, no backwards-bending
+# Hermite. Designed for the 0.6-0.7s commit window.
+#
+# Launch with:
+#   cd ~/OpenSai
+#   ./scripts/launch.sh config_folder/xml_config_files/picklebot_j9_fast.xml
+#   PYTHONUNBUFFERED=1 python sports_bot/arm_control/stepj11_monotonic_planner.py \
+#       --config sports_bot/arm_control/configs/j11_strike_fast.yaml
+#
+# Any flag here can be overridden on the CLI, e.g.:
+#   ... --config j11_strike_fast.yaml --max-swings 1
+
+# --- Hardware / calibration ---
+skip_cal: true
+offset_link7: [0, 0, 0.39]
+ball_rigid_body_id: 13
+
+# --- Ready / home pose ---
+home_joints_deg: [1.045, -24.506, 1.236, -115.213, -2.248, 108.033, -44.010]
+ready_pose: home
+paddle_open_deg: 8
+
+# --- Ball tracker ---
+strike_plane_x: -0.30
+z_mode: predicted
+tracker_gravity: 11.0
+tracker_drag_coefficient: 0.10
+tracker_min_history: 4
+tracker_history_max_age_s: 0.15
+tracker_median_window: 3
+
+# --- Strike workspace box (arm frame, meters) ---
+# Wider Z window than J9 (0.4-0.6) since monotonic qdot tracks reliably
+# across a broader range of arm configurations.
+world_z_min_m: 0.05
+world_z_max_m: 1.40
+strike_arm_x_min_m: 0.25
+strike_arm_x_max_m: 0.70
+strike_arm_z_min_m: 0.25      # was 0.4 in J9 — widened for more accepted throws
+strike_arm_z_max_m: 0.65      # was 0.6 in J9
+strike_arm_y_abs_max_m: 0.38
+max_ori_err_deg: 15
+
+# --- Impact velocity target ---
+# forward/up values are logged for reference but do NOT drive qdot in J11.
+# J11 uses vel_cap * sign(delta_q) per joint — these are kept for audit logging.
+forward_speed_mps: 1.50
+up_speed_mps: 0.40
+impact_vel_frac: 1.00         # drives the magnitude: qdot_strike = vel_cap * impact_vel_frac * sign(delta_q)
+qdot_damping: 0.03            # unused in J11 qdot solve but kept for compatibility
+
+# --- Joint velocity cap override (rad/s) ---
+# q6 lowered from 2.5 → 2.35 to stay within FR3 hard limit (2.4 rad/s from home).
+# The previous 2.5 was causing fr3_hard=104%@q6 in every commit.
+vel_cap_rad_s: [2.0, 2.0, 2.0, 2.0, 2.0, 2.35, 2.0]
+
+# --- Swing timing ---
+swing_vel_frac: 1.00
+decel_s: 0.20
+commit_tti: 0.90              # commit when TTI ≤ 0.90s; first valid pred typically at 0.55-0.76s
+try_late_slack_s: 0.30
+max_stretched_strike_s: 0.90
+contact_margin_s: 0.0
+timing_guard_s: 0.025
+
+# --- Return home after impact ---
+return_s: 4.0
+return_vel_frac: 0.35
+
+# --- Pre-commit arm tracking ---
+tracking_step_deg: 1.8
+tracking_accel_deg_s2: 1000
+
+# --- Logging & output ---
+verbose_tracking: true
+full_segment_logs: true
+log_period_s: 0.20
+post_impact_idle_s: 0.4
+shutdown_hold_s: 0
+log_file: auto
+trace_file: auto
